@@ -52,3 +52,6 @@ LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "https://us.cloud.langfuse.com")
 
 # 管理中心地址
 MNG_URL = os.getenv("MNG_URL", "")
+
+# 外部技能目录
+EXTERNAL_SKILLS_DIR = os.getenv("EXTERNAL_SKILLS_DIR", "")
