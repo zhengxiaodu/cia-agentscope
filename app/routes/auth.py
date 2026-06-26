@@ -54,10 +54,12 @@ async def login(request: Request, login_req: LoginRequest):
         "role": user_info.get("role", ""),
     }
     token = create_access_token(token_payload)
-
     return success_response({
+        "verification": True,
         "token": token,
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
+        "agent_access": [{"id": d["code"], "name": d["name"]} for d in permissions["agent_whitelist"]],
+        "skills_blacklist": permissions["skills_blacklist"]
     })

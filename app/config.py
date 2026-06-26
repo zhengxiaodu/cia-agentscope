@@ -17,16 +17,13 @@ JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "8"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 REDIS_SESSION_TTL = int(os.getenv("REDIS_SESSION_TTL", "86400"))
 
-# PostgreSQL 配置（会话持久化）
-PG_HOST = os.getenv("PG_HOST", "localhost")
-PG_PORT = int(os.getenv("PG_PORT", "5432"))
-PG_USER = os.getenv("PG_USER", "postgres")
-PG_PASSWORD = os.getenv("PG_PASSWORD", "zxdzxd.123")
-PG_DATABASE = os.getenv("PG_DATABASE", "agentscope")
-PG_DSN = os.getenv(
-    "PG_DSN",
-    f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DATABASE}",
-)
+# MySQL 配置（会话持久化）
+MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "agentscope")
+MYSQL_DSN = os.getenv("MYSQL_DSN", "")
 
 # 文件上传配置
 UPLOAD_MAX_SIZE_MB = int(os.getenv("UPLOAD_MAX_SIZE_MB", "10"))
