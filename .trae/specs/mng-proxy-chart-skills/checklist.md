@@ -1,0 +1,11 @@
+- [x] `.env` / `.env.example` 添加 `MNG_URL`
+- [x] `app/config.py` 添加 `MNG_URL` 读取
+- [x] `app/routes/mng_proxy.py` 实现两个代理端点，使用 `httpx.AsyncClient`
+- [x] `app/main.py` 注册 mng_proxy 路由
+- [x] `requirements.txt` 添加 `httpx`
+- [x] `config/skill_config.yml` 包含 `chart_renderer` 和 `card_interaction` 技能路径
+- [x] 不需要的工具已从 `tools/chart_tools.py` 或 `tools/card_config_tools.py` 中清理
+- [x] Agent 能正确加载图表/卡片工具（Toolkit 中包含对应工具）
+- [x] `generate_response` 在工具结果出现时 yield `CUSTOM_COMPONENT` 事件
+- [x] `CUSTOM_COMPONENT` 事件格式为 `{"type": "custom_component", "component": {...}}`
+- [x] `TRACE_READY` 事件仍在 SSE 流末尾正常发出

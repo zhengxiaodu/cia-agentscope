@@ -1,0 +1,24 @@
+{
+    "code": 200,
+    "msg": "success",
+    "data": {
+        "sessions": [
+            {
+                "session_id": "63ddfce4f39841d4b1166b37006cb186",
+                "user_id": "123",
+                "name": "明天深圳还是会下雨么?",
+                "created_at": "2026-06-18 05:52:54.011",
+                "updated_at": "2026-06-18 05:52:54.011",
+                "message_count": 2
+            },
+            {
+                "session_id": "cf7cc5e449444d12b3b7fa4f455b66a9",
+                "user_id": "123",
+                "name": "今年生猪价格怎么样？",
+                "created_at": "2026-06-18 03:48:56.920",
+                "updated_at": "2026-06-18 03:48:56.920",
+                "message_count": 2
+            },
+        ]
+    }
+}

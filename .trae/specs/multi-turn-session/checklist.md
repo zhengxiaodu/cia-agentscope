@@ -1,0 +1,16 @@
+- [x] Redis 配置项（`REDIS_URL`, `REDIS_SESSION_TTL`）写入 `.env` 和 `.env.example`
+- [x] `app/config.py` 正确加载 Redis 配置常量
+- [x] `app/models/session.py` 包含 SessionMeta、SessionMessage、SessionListResponse、SessionDetailResponse 模型
+- [x] `app/dao/session_dao.py` 实现 `save_agent_state()`、`load_agent_state()`、`list_user_sessions()`、`get_session_meta()`、`extract_messages_from_state()` 方法
+- [x] `app/services/session_service.py` 实现 `get_or_create_session()`、`load_agent()`、`save_agent()`、`get_session_detail()` 方法
+- [x] `app/main.py` lifespan 中正确初始化 `SessionService`（含 async Redis 连接）并存入 `app.state`
+- [x] `POST /chat` 无 session_id 时自动生成新 UUID 并返回 `SESSION_READY` SSE 事件
+- [x] `POST /chat` session_id 已存在时从 Redis 恢复 Agent 状态实现续聊
+- [x] `POST /chat` 流结束后自动将更新后的 Agent 状态持久化回 Redis
+- [x] `POST /chat` 仍保持 JWT 校验
+- [x] `GET /sessions` 需 JWT 校验
+- [x] `GET /sessions` 返回当前用户最近 15 条会话列表
+- [x] `GET /sessions/{session_id}` 需 JWT 校验
+- [x] `GET /sessions/{session_id}` 返回完整对话历史（用户提问 + 助手回复）
+- [x] `GET /sessions/{session_id}` session_id 不存在时返回 404
+- [x] `GET /sessions/{session_id}` session_id 不属于当前用户时返回 403

@@ -1,0 +1,9 @@
+- [x] `.env` / `.env.example` 添加 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY`、`LANGFUSE_HOST`
+- [x] `app/config.py` 添加对应读取逻辑
+- [x] `requirements.txt` 添加 `langfuse`
+- [x] `app/services/langfuse_service.py` 实现 LangfuseService（含启用/禁用判断、安全调用封装）
+- [x] `app/services/chat_service.py` 集成 trace 创建、输入/输出/工具调用/token 信息收集
+- [x] `app/routes/chat.py` / `app/main.py` 传递 LangfuseService、SSE 流末尾追加 `TRACE_READY` 事件
+- [x] Langfuse 配置完整时，/chat 返回有效的 trace_id（通过 TRACE_READY 事件）
+- [x] Langfuse 配置缺失时，/chat 正常运行，trace_id 为 null
+- [x] Langfuse 服务不可达时系统不崩溃（所有 Langfuse 交互均被 try/except 包裹）

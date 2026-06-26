@@ -1,0 +1,109 @@
+# 大模型配置文件
+# 所有模型配置从这里读取，不通过 API 接口配置
+
+models:
+  # 业务对话默认模型（各业务智能体使用）
+  default:
+    provider: "openai"
+    model_name: "deepseek-chat"
+    base_url:
+    api_key:
+    parameters:
+      temperature: 0.3
+      max_tokens: 4096
+
+  # 意图识别专用模型
+  # 低温度保证 JSON 输出稳定；可单独配置更便宜/更快的模型
+  intent_recognizer:
+    provider: "openai"
+    model_name: "deepseek-chat"
+    base_url:
+    api_key: 
+    parameters:
+      temperature: 0.1
+      max_tokens: 1024
+
+# 兼容旧版：单智能体时代的 Agent 配置（保留作为 general_agent 的默认值来源）
+agent:
+  name: "AI问答助手"
+  system_prompt: |
+    你是一个智能助手，能够理解用户意图并调用相应的工具来完成任务。
+    
+    请根据用户的问题，判断是否需要调用工具：
+    - 如果问题需要最新信息或实时数据，请调用搜索工具
+    - 如果问题是常识性问题或不需要外部信息，可以直接回答
+    
+    请用自然、友好的语言回答用户的问题。
+
+# ==================== Prompt 模板 ====================
+# 意图识别与查询改写使用的 prompt，支持 {{变量}} 占位符
+prompts:
+  # 查询改写 prompt：把口语化输入结合上下文改写为语义完整的规范查询
+  rewrite: |
+    你是查询改写助手。请根据【历史对话上下文】把用户的口语化、省略、指代输入，改写为语义完整、可独立理解的标准查询。
+
+    要求：
+    1. 补全省略的主语、宾语、时间、对象（结合上下文中的实体）
+    2. 消解代词指代（"它/这个/那个" → 具体指代对象）
+    3. 保持原意，不要扩展或新增用户未表达的需求
+    4. 仅输出改写后的查询文本，不要任何解释
+
+  # 意图识别 prompt：输出严格 JSON
+  # 占位符：{{intents}} 可识别意图列表，{{history}} 历史上下文摘要
+  intent_recognition: |
+    你是多意图识别引擎。请分析【用户输入】，联系【历史上下文】，识别其中包含的意图。
+
+    【可识别的意图清单】
+    {{intents}}
+
+    【识别规则】
+    1. 一条用户输入可能包含多个独立意图（如"查一下新闻，再画个图"），需全部识别
+    2. 每个意图必须从清单中选择一个 id，不可臆造
+    3. 若用户输入含义模糊无法匹配任何意图，归为 general_chat
+    4. 判断意图间的关系：
+       - independent: 各意图互不依赖，可独立并行执行
+       - related_fixed: 意图间有固定先后依赖（如必须先查数据才能画图），顺序确定
+       - related_dynamic: 意图间依赖需根据中间结果动态决策下一步
+    5. 每个意图提取对应的子查询 query（针对该意图的具体执行输入）
+
+    【输出格式】严格输出如下 JSON，不要包含 markdown 代码块标记、不要任何解释文字：
+    {
+      "intents": [
+        {"id": "意图id", "query": "该意图对应的子查询"}
+      ],
+      "relation": "independent | related_fixed | related_dynamic"
+    }
+
+  # ReAct 推理 prompt：思维链每一步的决策
+  # 占位符：{{task}} 任务描述，{{scratch}} 已有的推理链，{{available_actions}} 可用动作
+  react_think: |
+    你是 ReAct 推理引擎。请基于【任务目标】和【已有推理链与观察】，决定下一步动作。
+
+    【任务目标】
+    {{task}}
+
+    【已有推理链与观察】
+    {{scratch}}
+
+    【可用动作】
+    {{available_actions}}
+
+    【决策规则】
+    1. 若已有足够信息得出最终结论，输出 final=true 和 conclusion
+    2. 否则选择一个 next_action（动作名+参数）继续推进
+    3. 每一步给出 thought（推理依据，说明为什么选这个动作）
+
+    【输出格式】严格 JSON，不要 markdown 标记：
+    {
+      "thought": "推理依据",
+      "is_final": false,
+      "next_action": {"name": "动作名", "args": {}},
+      "conclusion": ""
+    }
+    或最终步：
+    {
+      "thought": "已获得足够信息",
+      "is_final": true,
+      "next_action": null,
+      "conclusion": "最终结论"
+    }

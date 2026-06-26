@@ -1,0 +1,39 @@
+# 意图配置文件
+# 定义意图分类、意图→智能体绑定关系、默认编排策略。
+# 意图识别引擎（LLM）的输出会被约束在这些 intent id 范围内。
+
+# ==================== 显式意图定义 ====================
+# 用户主动表达的需求类型，每个意图绑定一个负责处理的智能体
+intents:
+  - id: render_chart
+    name: 数据可视化
+    description: 用户需要图表、表格、指标卡片、可视化展示
+    agent: chart_agent
+
+  - id: general_chat
+    name: 通用问答
+    description: 常识性问题、闲聊、不需要外部工具的对话，作为兜底意图
+    agent: general_agent
+
+
+# ==================== 默认编排策略映射 ====================
+# LLM 意图识别结果中的 relation 字段决定走哪个编排器
+# relation 取值：
+#   - independent:      多意图无关联，可并行执行
+#   - related_fixed:    多意图有关联，顺序固定，走写死流水线
+#   - related_dynamic:  多意图有关联，顺序需动态决策，走 ReAct
+# 单意图统一走 parallel（直接执行，无汇总开销）
+default_orchestration:
+  single_intent: parallel
+  multi_independent: parallel
+  multi_related_fixed: pipeline
+  multi_related_dynamic: react
+
+# ==================== 编排器参数 ====================
+orchestrator:
+  # ReAct 循环最大步数，防止死循环
+  react_max_steps: 8
+  # 并行执行单个智能体的超时时间（秒）
+  parallel_timeout: 60
+  # 流水线任一步骤超时时间（秒）
+  pipeline_step_timeout: 60

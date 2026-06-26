@@ -1,0 +1,13 @@
+- [x] `.env` / `.env.example` 添加 `UPLOAD_MAX_SIZE_MB=10`
+- [x] `app/config.py` 添加 `UPLOAD_MAX_SIZE_MB` 常量和 `UPLOAD_ALLOWED_MEDIA_TYPES` 白名单
+- [x] `app/models/upload.py` 包含上传响应模型
+- [x] `app/services/file_service.py` 实现 `save_upload()`、`validate_file_size()`、`validate_media_type()`
+- [x] `app/routes/upload.py` 实现 `POST /upload` 路由，需 JWT 校验，按 session_id 隔离存储
+- [x] `POST /upload` 返回 `{code, msg, data: {datablock: DataBlock}}` 格式
+- [x] `POST /upload` 无 session_id 时正常上传，存到共享 data 目录
+- [x] `POST /upload` 无 token 返回 401（通过 JWT 依赖实现）
+- [x] `POST /upload` 文件超大返回 413（`validate_file_size` 校验）
+- [x] `POST /upload` 文件类型不支持返回 415（`validate_media_type` 校验）
+- [x] `POST /chat` 纯文本消息正常流式回复（content 为字符串时行为不变）
+- [x] `POST /chat` content 为 list 时正确解析 TextBlock + DataBlock，构造多模态 UserMsg
+- [x] `app/main.py` 注册 upload 路由
