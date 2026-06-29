@@ -2,8 +2,8 @@
 from fastapi import APIRouter, HTTPException, Request
 from typing import Any, Dict
 
-from app.dao.user_dao import verify_login
-from app.models.auth import LoginRequest
+from app.dao.user_dao import verify_login, register as register_user
+from app.models.auth import LoginRequest, RegisterRequest
 from app.services.auth_service import (
     create_access_token,
     save_user_permissions,
@@ -21,12 +21,11 @@ def error_response(code: int, msg: str) -> Dict[str, Any]:
     return {"code": code, "msg": msg, "data": {}}
 
 
-@router.post("/login")
-async def login(request: Request, login_req: LoginRequest):
-    result = await verify_login(login_req.username, login_req.password)
-    if not result.get("verification"):
-        return error_response(401, "用户名或密码错误")
+async def _build_auth_success(result: dict, request: Request) -> dict:
+    """登录/注册成功后的统一处理：存 Redis 权限 → 生成 JWT → 构造前端响应。
 
+    login 与 register 共用此函数，保证返回前端的字段结构逐字段一致。
+    """
     user_info = result.get("user_info", {}) or {}
     user_id = user_info.get("user_id")
     access_token = result.get("access_token", "")
@@ -40,7 +39,7 @@ async def login(request: Request, login_req: LoginRequest):
             try:
                 await save_user_permissions(redis_client, user_id, access_token, permissions)
             except Exception:
-                # Redis 写入失败不阻断登录主流程
+                # Redis 写入失败不阻断主流程
                 import logging
                 logging.getLogger(__name__).exception(
                     f"[auth] 保存用户 {user_id} 权限到 Redis 失败"
@@ -61,5 +60,21 @@ async def login(request: Request, login_req: LoginRequest):
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
         "agent_access": [{"id": d["code"], "name": d["name"]} for d in permissions["agent_whitelist"]],
-        "skills_blacklist": permissions["skills_blacklist"]
+        "skills_blacklist": permissions["skills_blacklist"],
     })
+
+
+@router.post("/login")
+async def login(request: Request, login_req: LoginRequest):
+    result = await verify_login(login_req.username, login_req.password)
+    if not result.get("verification"):
+        return error_response(401, "用户名或密码错误")
+    return await _build_auth_success(result, request)
+
+
+@router.post("/register")
+async def register(request: Request, register_req: RegisterRequest):
+    result = await register_user(register_req.username, register_req.password)
+    if not result.get("verification"):
+        return error_response(400, result.get("message", "注册失败"))
+    return await _build_auth_success(result, request)
