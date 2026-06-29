@@ -7,6 +7,11 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
 class UserInfo(BaseModel):
     user_id: str
     user_name: str

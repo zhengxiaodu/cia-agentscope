@@ -124,3 +124,62 @@ async def verify_login(username: str, password: str) -> dict:
         return {"verification": False}
 
     return await verify_login_via_mng(username, password)
+
+
+async def register_via_mng(username: str, password: str) -> dict:
+    """调用 mng 管理中心注册。
+
+    请求 POST {MNG_URL}/api/auth/register, body: {"username", "password"}
+    成功时把 mng 返回标准化为与登录一致的内部结构。
+    失败时返回 {"verification": False, "message": <mng message 或默认>}。
+    """
+    if not MNG_URL:
+        logger.error("[user_dao] MNG_URL 未配置，无法调用 mng 注册")
+        return {"verification": False, "message": "MNG_URL 未配置"}
+
+    url = f"{MNG_URL}/api/auth/register"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                url,
+                json={"username": username, "password": password},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[user_dao] mng 注册返回非 200: {resp.status_code}")
+                return {"verification": False, "message": "注册失败"}
+
+            body = resp.json()
+            # mng 返回: {"code":200, "message":"注册成功", "data":{...}}
+            if body.get("code") != 200:
+                msg = body.get("message", "注册失败")
+                logger.warning(f"[user_dao] mng 注册业务失败: {msg}")
+                return {"verification": False, "message": msg}
+
+            data = body.get("data", {}) or {}
+            return {
+                "verification": True,
+                "user_info": data.get("user_info", {}),
+                "access_token": data.get("access_token", ""),
+                "permissions": data.get("permissions", {}),
+            }
+    except Exception as e:
+        logger.exception(f"[user_dao] 调用 mng 注册服务失败: {e}")
+        return {"verification": False, "message": "注册服务异常"}
+
+
+async def register(username: str, password: str) -> dict:
+    """注册用户。AUTH_MOCK=true 时返回模拟新用户；否则调用 mng 注册。"""
+    if os.getenv("AUTH_MOCK", "true").lower() == "true":
+        # 模拟注册成功：返回新账号结构（空权限）
+        return {
+            "verification": True,
+            "user_info": {
+                "user_id": username,
+                "user_name": username,
+                "department": "",
+                "role": "普通用户",
+            },
+            "access_token": f"mock-access-token-{username}",
+            "permissions": {"agent_whitelist": [], "skills_blacklist": []},
+        }
+    return await register_via_mng(username, password)
