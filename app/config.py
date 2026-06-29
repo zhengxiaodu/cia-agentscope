@@ -52,3 +52,5 @@ MNG_URL = os.getenv("MNG_URL", "")
 
 # 外部技能目录
 EXTERNAL_SKILLS_DIR = os.getenv("EXTERNAL_SKILLS_DIR", "")
+RAGFLOW_API_KEY = os.getenv("RAGFLOW_API_KEY", "")
+RAGFLOW_BASE_URL = os.getenv("RAGFLOW_BASE_URL", "")

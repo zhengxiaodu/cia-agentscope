@@ -15,6 +15,11 @@ intents:
     description: 常识性问题、闲聊、不需要外部工具的对话，作为兜底意图
     agent: general_agent
 
+  - id: regulations_qa
+      name: 制度问答
+      description: 涉及公司内部制度知识的问答，需要调用知识库
+      agent: regulations_agent
+
 
 # ==================== 默认编排策略映射 ====================
 # LLM 意图识别结果中的 relation 字段决定走哪个编排器
