@@ -17,7 +17,8 @@ import yaml
 from agentscope.credential import OpenAICredential
 from agentscope.model import OpenAIChatModel
 
-from app.config import MODEL_CONFIG_PATH
+from app.config import MODEL_CONFIG_PATH, WORKSPACE_BASEDIR
+from app.services.file_change_detector import snapshot, diff, build_file_meta
 from app.services.langfuse_service import LangfuseService
 from fastapi import HTTPException
 
@@ -151,6 +152,14 @@ async def generate_response(
     # 收集最终输出（用于持久化和 langfuse）
     final_output_parts: List[str] = []
 
+    # ---- 本轮开始前快照 session 工作目录（用于结束后检测新文件） ----
+    before_files: set = set()
+    if session_id:
+        try:
+            before_files = snapshot(os.path.join(WORKSPACE_BASEDIR, session_id))
+        except Exception:
+            logger.warning("[chat_service] 快照 session 工作目录失败", exc_info=True)
+
     # 执行编排主流程（携带 agent_id，若不为空则走单 agent 直接问答）
     async for event_str in orchestrator_service.run(
         full_messages,
@@ -214,6 +223,21 @@ async def generate_response(
                 )
         except Exception:
             logger.exception("[chat_service] 持久化对话历史失败")
+
+    # ---- 检测本轮新文件并 yield files_generated 事件 ----
+    files_payload = []
+    try:
+        after_files = snapshot(os.path.join(WORKSPACE_BASEDIR, session_id)) if session_id else set()
+        new_files = diff(before_files, after_files)
+        for rel_path in new_files:
+            meta = build_file_meta(
+                os.path.join(WORKSPACE_BASEDIR, session_id), rel_path, session_id
+            )
+            if meta is not None:
+                files_payload.append(meta)
+    except Exception:
+        logger.warning("[chat_service] 检测新文件失败", exc_info=True)
+    yield f"data: {json.dumps({'type': 'files_generated', 'files': files_payload}, ensure_ascii=False)}\n\n"
 
     # 更新 Langfuse observation 并发送 TRACE_READY 事件
     trace_id = None

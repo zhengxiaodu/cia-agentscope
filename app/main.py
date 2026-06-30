@@ -24,7 +24,7 @@ from app.dao.mysql_session_dao import SessionDAO
 from app.dao.init_mysql import init_mysql_tables
 from app.services.session_service import SessionService
 from app.services.langfuse_service import LangfuseService
-from app.routes import auth, chat, feedback, health, mng_proxy, sessions, upload
+from app.routes import auth, chat, feedback, files, health, mng_proxy, sessions, upload
 
 
 @asynccontextmanager
@@ -110,6 +110,7 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(auth.router, tags=["auth"])
 app.include_router(chat.router, tags=["chat"])
 app.include_router(feedback.router, tags=["feedback"])
+app.include_router(files.router, tags=["files"])
 app.include_router(health.router, tags=["health"])
 app.include_router(sessions.router, tags=["sessions"])
 app.include_router(upload.router, tags=["upload"])
