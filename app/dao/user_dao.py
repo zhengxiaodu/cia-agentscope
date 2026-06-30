@@ -68,6 +68,23 @@ _MOCK_USERS = {
 }
 
 
+def _normalize_user_info(raw: dict) -> dict:
+    """标准化 mng 返回的 user_info，确保包含内部统一的 user_id 字段。
+
+    mng 真实返回的 user_info 主键字段名为 `id`（非 `user_id`），
+    这里映射为内部统一键 `user_id`，下游（auth 存 Redis / JWT payload /
+    chat 路由 / orchestrator）一律按 `user_id` 消费。
+    """
+    if not raw:
+        return {}
+    normalized = dict(raw)
+    if not normalized.get("user_id"):
+        uid = normalized.get("id") or normalized.get("userId") or normalized.get("uid")
+        if uid is not None:
+            normalized["user_id"] = str(uid)
+    return normalized
+
+
 async def verify_login_via_mng(username: str, password: str) -> dict:
     """调用 mng 管理中心进行登录校验。
 
@@ -98,7 +115,7 @@ async def verify_login_via_mng(username: str, password: str) -> dict:
             data = body.get("data", {}) or {}
             return {
                 "verification": True,
-                "user_info": data.get("user_info", {}),
+                "user_info": _normalize_user_info(data.get("user_info", {})),
                 "access_token": data.get("access_token", ""),
                 "permissions": data.get("permissions", {}),
             }
@@ -158,7 +175,7 @@ async def register_via_mng(username: str, password: str) -> dict:
             data = body.get("data", {}) or {}
             return {
                 "verification": True,
-                "user_info": data.get("user_info", {}),
+                "user_info": _normalize_user_info(data.get("user_info", {})),
                 "access_token": data.get("access_token", ""),
                 "permissions": data.get("permissions", {}),
             }
