@@ -7,7 +7,7 @@ from typing import List, Optional
 
 import httpx
 
-from app.config import MNG_URL
+from app.config import MNG_INTENT_URL
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ _MNG_INTENTS_PATH = "/api/intents"
 async def fetch_external_intents(access_token: str) -> List[dict]:
     """从 mng 系统获取外部意图配置列表。
 
-    请求 GET {MNG_URL}/api/intents，Header 中携带 access_token。
+    请求 GET {MNG_INTENT_URL}/api/intents，Header 中携带 access_token。
     失败不影响主流程，返回空列表。
 
     Args:
@@ -42,14 +42,14 @@ async def fetch_external_intents(access_token: str) -> List[dict]:
             }
         ]
     """
-    if not MNG_URL:
-        logger.warning("[mng_service] MNG_URL 未配置，跳过获取外部意图")
+    if not MNG_INTENT_URL:
+        logger.warning("[mng_service] MNG_INTENT_URL 未配置，跳过获取外部意图")
         return []
     if not access_token:
         logger.warning("[mng_service] access_token 为空，跳过获取外部意图")
         return []
 
-    url = f"{MNG_URL}{_MNG_INTENTS_PATH}"
+    url = f"{MNG_INTENT_URL}{_MNG_INTENTS_PATH}"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(

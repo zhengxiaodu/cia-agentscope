@@ -1,55 +1,51 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 import httpx
 
-from app.config import MNG_URL
+from app.config import MNG_INTENT_URL
+from app.dependencies import current_user
+from app.services.auth_service import get_user_permissions
 
 router = APIRouter()
 
 
+async def _get_access_token(request: Request, user: dict) -> str:
+    """从 redis 按 user_id 取 mng access_token；取不到则抛 401。"""
+    user_id = user.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="token 中缺少 user_id")
+    redis_client = getattr(request.app.state, "redis_client", None)
+    if redis_client is None:
+        raise HTTPException(status_code=500, detail="Redis 未就绪")
+    perms_data = await get_user_permissions(redis_client, user_id)
+    if not perms_data:
+        raise HTTPException(status_code=401, detail="用户登录态已过期，请重新登录")
+    access_token = perms_data.get("access_token", "")
+    if not access_token:
+        raise HTTPException(status_code=401, detail="未找到 mng access_token，请重新登录")
+    return access_token
+
+
 @router.get("/api/ui/presentation/cards")
-async def proxy_card_configs():
-    return {
-              "success": True,
-              "message": None,
-              "data": [
-                {
-                  "id": 1,
-                  "appId": "default",
-                  "cardType": "metric",
-                  "cardName": "指标卡",
-                  "cardDesc": "展示股票关键指标",
-                  "schemaFields": """{"stock_name":"贵州茅台","stock_code":"600519.SH","current_price":1856.50,"change_pct":1.20,"pe_ratio":32.5,"market_cap":"2.33万亿","turnover_rate":8.2,"support_level":1845,"resistance_level":1920,"rating":"买入评级"}""",
-                  "triggerRule": "true",
-                  "fallbackType": "text",
-                  "renderTemplate": """var sn=schema.stock_name||"贵州茅台";
-                    var cp=schema.current_price||1856.50;
-                    var chg=schema.change_pct||1.20;
-                    var pe=schema.pe_ratio||32.5;
-                    var mc=schema.market_cap||"2.33万亿";
-                    var tr=schema.turnover_rate||8.2;
-                    var sl=schema.support_level||1845;
-                    var rl=schema.resistance_level||1920;
-                    var rt=schema.rating||"买入评级";
-                    return ''<div class="preview-card-demo"><div class="preview-card-header" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><div style="display:flex;align-items:center;gap:8px;font-weight:600"><svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg> 核心指标 - ''+sn+''</div><span style="background:rgba(16,185,129,0.2);color:var(--accent-success);padding:2px 8px;border-radius:4px;font-size:11px">''+rt+''</span></div><div style="padding:10px 0"><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px"><div style="text-align:center;padding:12px;background:var(--bg-elevated);border-radius:8px;border:1px solid rgba(16,185,129,0.2)"><div style="font-size:18px;font-weight:700;color:var(--accent-success);font-family:var(--font-display)">''+cp.toFixed(2)+''</div><div style="font-size:10px;color:var(--text-muted)">当前价</div><div style="font-size:9px;color:var(--accent-success)">+''+chg.toFixed(2)+''%</div></div><div style="text-align:center;padding:12px;background:var(--bg-elevated);border-radius:8px;border:1px solid rgba(96,165,250,0.2)"><div style="font-size:18px;font-weight:700;color:var(--accent-primary);font-family:var(--font-display)">''+pe+''x</div><div style="font-size:10px;color:var(--text-muted)">市盈率(PE)</div><div style="font-size:9px;color:var(--text-muted)">行业均值28x</div></div><div style="text-align:center;padding:12px;background:var(--bg-elevated);border-radius:8px;border:1px solid rgba(139,92,246,0.2)"><div style="font-size:18px;font-weight:700;color:var(--accent-tertiary);font-family:var(--font-display)">''+mc+''</div><div style="font-size:10px;color:var(--text-muted)">总市值</div><div style="font-size:9px;color:var(--text-muted)">A股第1</div></div></div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px"><div style="text-align:center;padding:10px;background:var(--bg-elevated);border-radius:8px"><div style="font-size:14px;font-weight:600;color:var(--text-primary)">''+tr+''%</div><div style="font-size:9px;color:var(--text-muted)">换手率</div></div><div style="text-align:center;padding:10px;background:var(--bg-elevated);border-radius:8px"><div style="font-size:14px;font-weight:600;color:var(--text-primary)">''+sl+''</div><div style="font-size:9px;color:var(--text-muted)">支撑位</div></div><div style="text-align:center;padding:10px;background:var(--bg-elevated);border-radius:8px"><div style="font-size:14px;font-weight:600;color:var(--text-primary)">''+rl+''</div><div style="font-size:9px;color:var(--text-muted)">压力位</div></div></div></div></div>'';""",
-                  "isEnabled": 1,
-                  "sortOrder": 1,
-                  "createTime": "2024-01-01T10:00:00",
-                  "updateTime": "2024-01-01T10:00:00"
-                }
-              ]
-            }
-    if not MNG_URL:
-        raise HTTPException(status_code=500, detail="MNG_URL not configured")
+async def proxy_card_configs(request: Request, user: dict = Depends(current_user)):
+    if not MNG_INTENT_URL:
+        raise HTTPException(status_code=500, detail="MNG_INTENT_URL not configured")
+    access_token = await _get_access_token(request, user)
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(f"{MNG_URL}/ui/presentation/cards")
+        resp = await client.get(
+            f"{MNG_INTENT_URL}/ui/presentation/cards",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
         return resp.json()
 
 
 @router.get("/api/ui/presentation/custom-components")
-async def proxy_custom_component_configs():
-    return {"success": True, "message": None, "data": []}
-    if not MNG_URL:
-        raise HTTPException(status_code=500, detail="MNG_URL not configured")
+async def proxy_custom_component_configs(request: Request, user: dict = Depends(current_user)):
+    if not MNG_INTENT_URL:
+        raise HTTPException(status_code=500, detail="MNG_INTENT_URL not configured")
+    access_token = await _get_access_token(request, user)
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(f"{MNG_URL}/ui/presentation/custom-components")
+        resp = await client.get(
+            f"{MNG_INTENT_URL}/ui/presentation/custom-components",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
         return resp.json()
