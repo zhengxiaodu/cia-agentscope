@@ -27,7 +27,7 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
     login 与 register 共用此函数，保证返回前端的字段结构逐字段一致。
     """
     user_info = result.get("user_info", {}) or {}
-    user_id = user_info.get("user_id")
+    user_id = user_info.get("id")
     access_token = result.get("access_token", "")
     permissions = result.get("permissions", {}) or {}
 
@@ -59,15 +59,8 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
-        "agent_access": [
-            {"id": d.get("code"), "name": d.get("name")}
-            for d in permissions.get("agent_whitelist", [])
-        ],
-        "skills_blacklist": (
-            permissions.get("skill_blacklist")
-            or permissions.get("skills_blacklist")
-            or []
-        ),
+        "agent_access": [{"id": d["code"], "name": d["name"]} for d in permissions["agent_whitelist"]],
+        "skills_blacklist": permissions["skills_blacklist"],
     })
 
 
