@@ -35,6 +35,7 @@ async def chat(request: Request, body: ChatRequest, user: dict = Depends(current
             session_service=session_service,
             langfuse_service=request.app.state.langfuse_service,
             agent_id=body.agent_id,
+            request=request,
         ):
             yield event
 

@@ -1,15 +1,23 @@
 import os
 import uvicorn
 import redis.asyncio as aioredis
-import asyncpg
+import aiomysql
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
-from app.config import MODEL_CONFIG_PATH, REDIS_URL, PG_DSN
+from app.config import (
+    MODEL_CONFIG_PATH,
+    REDIS_URL,
+    MYSQL_HOST,
+    MYSQL_PORT,
+    MYSQL_USER,
+    MYSQL_PASSWORD,
+    MYSQL_DATABASE,
+)
 from app.services.chat_service import load_model_config
 from app.services.orchestrator_service import OrchestratorService
-from app.dao.pg_session_dao import SessionDAO
-from app.dao.init_pg import init_pg_tables
+from app.dao.mysql_session_dao import SessionDAO
+from app.dao.init_mysql import init_mysql_tables
 from app.services.session_service import SessionService
 from app.services.langfuse_service import LangfuseService
 from app.routes import auth, chat, feedback, health, mng_proxy, sessions, upload
@@ -33,18 +41,26 @@ async def lifespan(app: FastAPI):
     app.state.redis_client = redis_client
     print(f"Redis client initialized ({REDIS_URL})")
 
-    # ---- PostgreSQL 连接池（会话持久化） ----
-    pg_pool = await asyncpg.create_pool(
-        dsn=PG_DSN,
-        min_size=2,
-        max_size=10,
+    # ---- MySQL 连接池（会话持久化） ----
+    mysql_pool = await aiomysql.create_pool(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        db=MYSQL_DATABASE,
+        minsize=2,
+        maxsize=10,
+        autocommit=False,
     )
-    await init_pg_tables(pg_pool)  # 自动建表
-    app.state.pg_pool = pg_pool
-    session_dao = SessionDAO(pg_pool)
+    await init_mysql_tables(mysql_pool)  # 自动建表
+    app.state.mysql_pool = mysql_pool
+    session_dao = SessionDAO(mysql_pool)
     app.state.session_dao = session_dao
     app.state.session_service = SessionService(session_dao)
-    print(f"Session service initialized (PostgreSQL: {PG_DSN})")
+    print(
+        f"Session service initialized "
+        f"(MySQL: {MYSQL_USER}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE})"
+    )
 
     # 初始化 Langfuse 追踪服务（非强依赖）
     app.state.langfuse_service = LangfuseService()
@@ -55,9 +71,10 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # 关闭 PostgreSQL 连接池
-    await pg_pool.close()
-    print("PostgreSQL pool closed")
+    # 关闭 MySQL 连接池
+    mysql_pool.close()
+    await mysql_pool.wait_closed()
+    print("MySQL pool closed")
 
     # 关闭 Redis 连接
     await redis_client.close()

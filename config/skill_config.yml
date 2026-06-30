@@ -8,3 +8,6 @@ skills:
   - name: card_interaction
     directory: ../skills/card_interaction
     description: "个性化交互卡片技能，用于展示需要用户交互的个性化卡片组件。"
+  - name: ragflow_retrieval
+    directory: ../skills/ragflow_retrieval
+    description: "使用ragflow知识库检索公司内部制度知识"

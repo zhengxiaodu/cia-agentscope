@@ -53,6 +53,34 @@ async def load_all_skills(skill_config_path: str, workdir: str = "./my-workspace
     return workspace, all_tools, all_skills_meta
 
 
+async def load_skills_from_directories(
+    directories: list,
+    workdir: str = "./my-workspace",
+) -> tuple:
+    """从目录路径列表加载技能（用于运行时动态追加外部技能）。
+
+    与 load_all_skills 的区别：不依赖 skill_config.yml，
+    直接接收 Skill 目录路径列表。
+
+    Args:
+        directories: Skill 目录路径列表，如 ["./external_skills/skill_ppt"]
+        workdir: LocalWorkspace 工作目录
+
+    Returns:
+        (workspace, all_tools, all_skills_meta) 三元组
+    """
+    workspace = LocalWorkspace(
+        workdir=workdir,
+        default_mcps=[],
+        skill_paths=directories,
+    )
+    await workspace.initialize()
+
+    all_tools = await workspace.list_tools()
+    all_skills_meta = await workspace.list_skills()
+    return workspace, all_tools, all_skills_meta
+
+
 class AgentRegistry:
     """智能体注册表：管理智能体定义、模型实例、按需创建带 skill 子集的 Agent。
 
