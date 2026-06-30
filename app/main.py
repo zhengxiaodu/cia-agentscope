@@ -13,9 +13,13 @@ from app.config import (
     MYSQL_USER,
     MYSQL_PASSWORD,
     MYSQL_DATABASE,
+    WORKSPACE_BASE_IMAGE,
+    WORKSPACE_BASEDIR,
+    WORKSPACE_TTL,
 )
 from app.services.chat_service import load_model_config
 from app.services.orchestrator_service import OrchestratorService
+from app.services.workspace_manager import DockerWorkspaceManager
 from app.dao.mysql_session_dao import SessionDAO
 from app.dao.init_mysql import init_mysql_tables
 from app.services.session_service import SessionService
@@ -29,8 +33,23 @@ async def lifespan(app: FastAPI):
     model_config = load_model_config(MODEL_CONFIG_PATH)
     app.state.model_config = model_config
 
+    # ---- Docker 工作区管理器 ----
+    workspace_manager = DockerWorkspaceManager(
+        base_image=WORKSPACE_BASE_IMAGE,
+        basedir=WORKSPACE_BASEDIR,
+        ttl=WORKSPACE_TTL,
+    )
+    app.state.workspace_manager = workspace_manager
+    await workspace_manager.start_sweeper()
+    print(
+        f"Workspace manager initialized "
+        f"(image={WORKSPACE_BASE_IMAGE}, basedir={WORKSPACE_BASEDIR}, ttl={WORKSPACE_TTL})"
+    )
+
     # 初始化多智能体编排服务（加载智能体定义 + skill + 意图识别器）
-    app.state.orchestrator_service = await OrchestratorService.create(model_config)
+    app.state.orchestrator_service = await OrchestratorService.create(
+        model_config, workspace_manager
+    )
     print("Orchestrator service initialized (multi-agent + multi-intent)")
 
     # ---- Redis（保留，用于其他需求） ----
@@ -70,6 +89,11 @@ async def lifespan(app: FastAPI):
         print("Langfuse service disabled (credentials not configured)")
 
     yield
+
+    # 关闭工作区管理器（停清扫 + 销毁全部容器）
+    await workspace_manager.stop_sweeper()
+    await workspace_manager.close_all()
+    print("Workspace manager closed")
 
     # 关闭 MySQL 连接池
     mysql_pool.close()

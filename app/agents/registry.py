@@ -1,13 +1,13 @@
 """智能体注册表：加载配置，按智能体绑定的 skill 子集组装独立 Toolkit 并缓存。
 
 设计要点：
-- 系统启动时一次性加载所有可用 skill（复用 LocalWorkspace 机制）
+- 系统启动时一次性加载所有可用 skill（按工作区机制装载）
 - 每个智能体按其 skills 配置，从全量 skill 中筛选出子集，组装独立 Toolkit
 - 这样不同智能体只能看到自己绑定的工具，实现职责隔离
 """
 import logging
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 from agentscope.agent import Agent
@@ -15,7 +15,6 @@ from agentscope.model import OpenAIChatModel
 from agentscope.permission import PermissionContext, PermissionMode
 from agentscope.state import AgentState
 from agentscope.tool import Toolkit
-from agentscope.workspace import LocalWorkspace
 
 from app.agents.base import AgentDefinition
 
@@ -30,57 +29,6 @@ def load_agent_definitions(config_path: str) -> List[AgentDefinition]:
     return [AgentDefinition(**a) for a in raw_agents]
 
 
-async def load_all_skills(skill_config_path: str, workdir: str = "./my-workspace"):
-    """加载所有可用 skill，返回 (workspace, all_tools, all_skills_meta)。
-
-    复用 chat_service 中的 LocalWorkspace 加载机制，一次性把所有 skill 装入工作区，
-    后续按智能体配置筛选子集。
-    """
-    with open(skill_config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    skill_loaders = [s["directory"] for s in config.get("skills", [])]
-
-    workspace = LocalWorkspace(
-        workdir=workdir,
-        default_mcps=[],
-        skill_paths=skill_loaders,
-    )
-    await workspace.initialize()
-
-    all_tools = await workspace.list_tools()
-    all_skills_meta = await workspace.list_skills()
-    return workspace, all_tools, all_skills_meta
-
-
-async def load_skills_from_directories(
-    directories: list,
-    workdir: str = "./my-workspace",
-) -> tuple:
-    """从目录路径列表加载技能（用于运行时动态追加外部技能）。
-
-    与 load_all_skills 的区别：不依赖 skill_config.yml，
-    直接接收 Skill 目录路径列表。
-
-    Args:
-        directories: Skill 目录路径列表，如 ["./external_skills/skill_ppt"]
-        workdir: LocalWorkspace 工作目录
-
-    Returns:
-        (workspace, all_tools, all_skills_meta) 三元组
-    """
-    workspace = LocalWorkspace(
-        workdir=workdir,
-        default_mcps=[],
-        skill_paths=directories,
-    )
-    await workspace.initialize()
-
-    all_tools = await workspace.list_tools()
-    all_skills_meta = await workspace.list_skills()
-    return workspace, all_tools, all_skills_meta
-
-
 class AgentRegistry:
     """智能体注册表：管理智能体定义、模型实例、按需创建带 skill 子集的 Agent。
 
@@ -90,7 +38,7 @@ class AgentRegistry:
     def __init__(
         self,
         definitions: List[AgentDefinition],
-        workspace: LocalWorkspace,
+        workspace: Any,
         all_tools: list,
         all_skills_meta: list,
         create_model_fn,
@@ -98,7 +46,7 @@ class AgentRegistry:
         """
         Args:
             definitions: 全部智能体定义
-            workspace: 已初始化的 LocalWorkspace
+            workspace: 已初始化的工作区实例
             all_tools: 工作区内全部工具
             all_skills_meta: 工作区内全部 skill 元信息
             create_model_fn: 工厂函数，签名 create_model_fn() -> OpenAIChatModel，

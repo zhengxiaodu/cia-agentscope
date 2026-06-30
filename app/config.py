@@ -52,6 +52,11 @@ MNG_AUTH_URL = os.getenv("MNG_AUTH_URL", "")
 # 管理中心 - 意图与卡片地址
 MNG_INTENT_URL = os.getenv("MNG_INTENT_URL", "")
 
+# Docker 工作区管理器配置
+WORKSPACE_BASE_IMAGE = os.getenv("WORKSPACE_BASE_IMAGE", "python:3.13-slim")
+WORKSPACE_BASEDIR = os.getenv("WORKSPACE_BASEDIR", "/data/docker-workspaces")
+WORKSPACE_TTL = float(os.getenv("WORKSPACE_TTL", "3600"))
+
 # 外部技能目录
 EXTERNAL_SKILLS_DIR = os.getenv("EXTERNAL_SKILLS_DIR", "")
 RAGFLOW_API_KEY = os.getenv("RAGFLOW_API_KEY", "")

@@ -35,8 +35,8 @@ from app.agents.factory import AgentFactory
 from app.agents.registry import (
     AgentRegistry,
     load_agent_definitions,
-    load_skills_from_directories,
 )
+from app.services.workspace_manager import DockerWorkspaceManager
 from app.intent.models import Intent, IntentConfig, IntentResult
 from app.intent.rewriter import QueryRewriter
 from app.intent.recognizer import IntentRecognizer, load_intent_config
@@ -65,6 +65,7 @@ class OrchestratorService:
         intent_client: AsyncOpenAI,
         intent_model_cfg: dict,
         think_prompt: str,
+        workspace_manager: DockerWorkspaceManager,
     ):
         self._model_config = model_config
         self._prompts = prompts
@@ -72,12 +73,17 @@ class OrchestratorService:
         self._intent_client = intent_client
         self._intent_model_cfg = intent_model_cfg
         self._think_prompt = think_prompt
+        self._workspace_manager = workspace_manager
 
         # 最近一次编排结果引用（供外部提取 agent states）
         self._last_orchestrator: Optional[Any] = None
 
     @classmethod
-    async def create(cls, model_config: dict) -> "OrchestratorService":
+    async def create(
+        cls,
+        model_config: dict,
+        workspace_manager: DockerWorkspaceManager,
+    ) -> "OrchestratorService":
         """工厂方法：从配置创建编排服务（仅持有不可变资源）。
 
         不再在启动时加载智能体/skill/意图配置；
@@ -108,6 +114,7 @@ class OrchestratorService:
             intent_client=intent_client,
             intent_model_cfg=intent_model_cfg,
             think_prompt=think_prompt,
+            workspace_manager=workspace_manager,
         )
 
     def _create_model_fn(self):
@@ -193,6 +200,7 @@ class OrchestratorService:
         self,
         user_id: str,
         redis_client,
+        session_id: Optional[str] = None,
     ) -> tuple:
         """每次 /chat 请求时动态构建临时组件。
 
@@ -201,7 +209,7 @@ class OrchestratorService:
         2. 从 Redis 获取当前用户权限 + access_token
         3. 从 mng 获取外部意图（失败不影响主流程）
         4. 权限过滤 + 合并配置
-        5. 加载外部技能到临时 workspace
+        5. 通过 DockerWorkspaceManager 获取/创建工作区
         6. 构建 AgentRegistry / AgentFactory / IntentRecognizer / QueryRewriter
 
         Returns:
@@ -243,14 +251,19 @@ class OrchestratorService:
             external_skills_dir=EXTERNAL_SKILLS_DIR,
         )
 
-        # ---- 5. 加载所有技能（基础 + 外部）到临时 workspace ----
-        all_skill_dirs = [
-            s["directory"] for s in merged_skills
-        ]
-        workspace, all_tools, all_skills_meta = await load_skills_from_directories(
-            directories=all_skill_dirs,
-            workdir="./my-workspace",
-        )
+        # ---- 5. 通过 DockerWorkspaceManager 获取/创建工作区 ----
+        all_skill_dirs = [s["directory"] for s in merged_skills]
+        user_id_safe = user_id or "anonymous"
+        session_id_safe = session_id or f"ephemeral-{user_id_safe}"
+        workspace = await self._workspace_manager.get_workspace(user_id_safe, session_id_safe)
+        if workspace is None:
+            workspace = await self._workspace_manager.create_workspace(
+                user_id=user_id_safe,
+                session_id=session_id_safe,
+                skill_dirs=all_skill_dirs,
+            )
+        all_tools = await workspace.list_tools()
+        all_skills_meta = await workspace.list_skills()
 
         # ---- 6. 构建临时注册表 ----
         agent_defs = [AgentDefinition(**a) for a in merged_agents]
@@ -327,6 +340,7 @@ class OrchestratorService:
             await self._build_request_components(
                 user_id=user_id,
                 redis_client=redis_client,
+                session_id=session_id,
             )
         )
 

@@ -1,8 +1,10 @@
+import os
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 
 from app.dependencies import current_user
 from app.services.file_service import FileService
-from app.config import UPLOAD_MAX_SIZE_MB, UPLOAD_ALLOWED_MEDIA_TYPES
+from app.config import UPLOAD_MAX_SIZE_MB, UPLOAD_ALLOWED_MEDIA_TYPES, WORKSPACE_BASEDIR
 from app.models.upload import UploadResponse, UploadErrorResponse
 
 router = APIRouter()
@@ -37,7 +39,8 @@ async def upload_file(
         )
 
     # Save file and return DataBlock
-    file_service = FileService(workdir="./my-workspace")
+    workdir = os.path.join(WORKSPACE_BASEDIR, session_id) if session_id else WORKSPACE_BASEDIR
+    file_service = FileService(workdir=workdir)
     datablock = await file_service.save_upload(
         session_id=session_id,
         filename=file.filename or "unknown",

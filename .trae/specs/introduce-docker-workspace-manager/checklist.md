@@ -1,0 +1,15 @@
+- [x] 已核实 agentscope SDK 的 `DockerWorkspace` 导入路径、构造签名与 `initialize/list_tools/list_skills/close` 方法，并据此调整实现
+- [x] `app/config.py`、`.env`、`.env.example` 新增 `WORKSPACE_BASE_IMAGE`（默认 `python:3.13-slim`）、`WORKSPACE_BASEDIR`（默认 `/data/docker-workspaces`）、`WORKSPACE_TTL`（默认 `3600`）三项
+- [x] 新增 `app/services/workspace_manager.py`，实现 `DockerWorkspaceManager`：`create_workspace` / `get_workspace` / `close` / `close_all`，内存缓存以 `workspace_id=session_id` 为键
+- [x] `create_workspace` 仅 bind-mount 宿主上真实存在的技能目录，缺失目录跳过并记录警告
+- [x] `create_workspace` 确保 `{basedir}/{session_id}` 存在，并将其 bind-mount 为容器 workdir（同路径对齐）
+- [x] 同一 `session_id` 并发创建通过 per-key 锁去重，不重复启动容器
+- [x] 实现 TTL 双机制：后台周期清扫 + `get_workspace` 懒淘汰，超时条目销毁底层容器/MCP 资源
+- [x] `main.py` lifespan 启动时构造 manager 存入 `app.state`、注入 `OrchestratorService.create`、启动清扫任务；关闭时停止清扫并 `close_all()`
+- [x] `OrchestratorService.create` 接收并持有 `workspace_manager`
+- [x] `_build_request_components` 签名增加 `session_id`，`run()` 透传 `session_id`
+- [x] chat 路径改为 `get_workspace` 未命中则 `create_workspace`，再 `list_tools`/`list_skills` 喂给 `AgentRegistry`；移除 `load_skills_from_directories` 与 `workdir="./my-workspace"`
+- [x] 首轮创建后定型技能集，同 session 后续轮次复用同一 workspace，不重新应用技能
+- [x] `app/agents/registry.py` 移除 `load_skills_from_directories`、`load_all_skills` 及 `LocalWorkspace` 导入，保留 `AgentRegistry`
+- [x] `app/routes/upload.py` 与 `file_service.py` 将文件写入 `{WORKSPACE_BASEDIR}/{session_id}`，写入前确保目录存在
+- [ ] 端到端：首轮建容器、同 session 复用、跨 session 隔离、上传文件容器内可读、TTL 淘汰、关闭 `close_all`（运行时验证项，沙箱无 Docker/agentscope 运行时，待用户在真实环境执行）
