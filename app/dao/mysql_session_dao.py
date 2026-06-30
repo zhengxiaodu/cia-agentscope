@@ -89,7 +89,7 @@ class SessionDAO:
                             "INSERT INTO sessions "
                             "(session_id, user_id, name, created_at, updated_at) "
                             "VALUES (%s, %s, %s, %s, %s)",
-                            (session_id, user_id, name, now),
+                            (session_id, user_id, name, now, now),
                         )
                     else:
                         await cur.execute(
@@ -177,7 +177,7 @@ class SessionDAO:
                             "INSERT INTO sessions "
                             "(session_id, user_id, name, created_at, updated_at) "
                             "VALUES (%s, %s, %s, %s, %s)",
-                            (session_id, user_id, name, now),
+                            (session_id, user_id, name, now, now),
                         )
 
                     # 2) 插入消息

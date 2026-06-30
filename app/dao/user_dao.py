@@ -21,7 +21,7 @@ import os
 
 import httpx
 
-from app.config import MNG_URL
+from app.config import MNG_AUTH_URL
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +71,14 @@ _MOCK_USERS = {
 async def verify_login_via_mng(username: str, password: str) -> dict:
     """调用 mng 管理中心进行登录校验。
 
-    请求 POST {MNG_URL}/api/auth/login，body: {"username", "password"}
+    请求 POST {MNG_AUTH_URL}/api/auth/login，body: {"username", "password"}
     成功时解析 mng 返回并标准化为内部结构。
     """
-    if not MNG_URL:
-        logger.error("[user_dao] MNG_URL 未配置，无法调用 mng 登录")
+    if not MNG_AUTH_URL:
+        logger.error("[user_dao] MNG_AUTH_URL 未配置，无法调用 mng 登录")
         return {"verification": False}
 
-    url = f"{MNG_URL}/api/auth/login"
+    url = f"{MNG_AUTH_URL}/api/auth/login"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -129,15 +129,15 @@ async def verify_login(username: str, password: str) -> dict:
 async def register_via_mng(username: str, password: str) -> dict:
     """调用 mng 管理中心注册。
 
-    请求 POST {MNG_URL}/api/auth/register, body: {"username", "password"}
+    请求 POST {MNG_AUTH_URL}/api/auth/register, body: {"username", "password"}
     成功时把 mng 返回标准化为与登录一致的内部结构。
     失败时返回 {"verification": False, "message": <mng message 或默认>}。
     """
-    if not MNG_URL:
-        logger.error("[user_dao] MNG_URL 未配置，无法调用 mng 注册")
-        return {"verification": False, "message": "MNG_URL 未配置"}
+    if not MNG_AUTH_URL:
+        logger.error("[user_dao] MNG_AUTH_URL 未配置，无法调用 mng 注册")
+        return {"verification": False, "message": "MNG_AUTH_URL 未配置"}
 
-    url = f"{MNG_URL}/api/auth/register"
+    url = f"{MNG_AUTH_URL}/api/auth/register"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
