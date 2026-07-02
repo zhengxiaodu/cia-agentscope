@@ -192,7 +192,16 @@ async def generate_response(
     final_output = "\n".join(final_output_parts).strip()
 
     # 持久化对话历史（用户输入 + 智能体输出）
-    if session_service and session_id and user_id:
+    if not (session_service and session_id and user_id):
+        missing = []
+        if not session_service:
+            missing.append("session_service")
+        if not session_id:
+            missing.append("session_id")
+        if not user_id:
+            missing.append("user_id")
+        logger.warning(f"[chat_service] 跳过持久化：{', '.join(missing)} 为空")
+    else:
         try:
             now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             user_input = ""
