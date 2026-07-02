@@ -91,6 +91,7 @@ class DockerWorkspaceManager:
                 default_mcps=[],
             )
             await ws.initialize()
+            ws.workdir = session_dir
             self._cache[wid] = _Entry(ws, user_id)
             logger.info(f"[workspace_manager] 创建工作区 wid={wid} skills={len(valid)}")
             return ws
