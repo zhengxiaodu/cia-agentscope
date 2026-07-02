@@ -7,7 +7,7 @@
 标准返回结构：
     {
         "verification": bool,
-        "user_info": {"user_id", "user_name", "department", "role"},
+        "user_info": {"id", "user_name", "department", "role"},
         "access_token": str,        # mng 返回的 access_token
         "permissions": {            # mng 返回的权限
             "agent_whitelist": [{"id","name","code"}, ...],
@@ -31,7 +31,7 @@ _MOCK_USERS = {
         "password": "123456",
         "verification": True,
         "user_info": {
-            "user_id": "123",
+            "id": "123",
             "user_name": "小张",
             "department": "后勤部",
             "role": "普通用户",
@@ -51,7 +51,7 @@ _MOCK_USERS = {
         "password": "123456",
         "verification": True,
         "user_info": {
-            "user_id": "1",
+            "id": "1",
             "user_name": "管理员",
             "department": "管理部",
             "role": "管理员",
@@ -71,14 +71,14 @@ _MOCK_USERS = {
 async def verify_login_via_mng(username: str, password: str) -> dict:
     """调用 mng 管理中心进行登录校验。
 
-    请求 POST {MNG_AUTH_URL}/api/auth/login，body: {"username", "password"}
+    请求 POST {MNG_AUTH_URL}/api/auth/user/login，body: {"username", "password"}
     成功时解析 mng 返回并标准化为内部结构。
     """
     if not MNG_AUTH_URL:
         logger.error("[user_dao] MNG_AUTH_URL 未配置，无法调用 mng 登录")
         return {"verification": False}
 
-    url = f"{MNG_AUTH_URL}/api/auth/login"
+    url = f"{MNG_AUTH_URL}/api/auth/user/login"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -174,7 +174,7 @@ async def register(username: str, password: str) -> dict:
         return {
             "verification": True,
             "user_info": {
-                "user_id": username,
+                "id": username,
                 "user_name": username,
                 "department": "",
                 "role": "普通用户",
