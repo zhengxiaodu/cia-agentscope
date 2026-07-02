@@ -133,9 +133,10 @@ class AgentRegistry:
 
         agent = Agent(
             name=definition.name,
-            system_prompt=definition.system_prompt,
+            system_prompt=definition.system_prompt + f"\n注意你当前只能在{self._workspace.workdir} 目录下读/写/编辑文件，绝不允许操作目录以外的文件!",
             model=model,
             toolkit=toolkit,
             state=agent_state,
+            offloader=self._workspace
         )
         return agent
