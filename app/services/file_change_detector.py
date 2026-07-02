@@ -6,13 +6,14 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # 顶层要跳过的子目录名（/upload 落点）
-_EXCLUDED_TOP_DIRS = {"data"}
+_EXCLUDED_TOP_DIRS = {"data", "skills"}
 
 
 def snapshot(workdir: str) -> set[str]:
     """递归扫描 workdir，返回相对路径集合（POSIX 风格 / 分隔）。
 
-    - 跳过顶层名为 `data` 的子目录（/upload 落点）
+    - 跳过顶层名为 `data` 和 `skills` 的子目录（/upload 落点 / 技能目录）
+    - 跳过所有层级中文件名为 `.mcp` 的文件
     - 目录不存在返回空集合，不抛异常
     - 仅收录文件（不含目录本身）
     - 相对路径形如 "report.csv" / "sub/dir/chart.png"
@@ -28,6 +29,8 @@ def snapshot(workdir: str) -> set[str]:
         rel = os.path.relpath(root, workdir)
         prefix = "" if rel == "." else rel.replace(os.sep, "/")
         for filename in files:
+            if filename == ".mcp":
+                continue
             rel_path = f"{prefix}/{filename}" if prefix else filename
             result.add(rel_path)
     return result

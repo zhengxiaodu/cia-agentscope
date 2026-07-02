@@ -16,10 +16,13 @@ from app.config import (
     WORKSPACE_BASE_IMAGE,
     WORKSPACE_BASEDIR,
     WORKSPACE_TTL,
+    WORKSPACE_RETENTION_DAYS,
+    WORKSPACE_CLEANUP_INTERVAL_HOURS,
 )
 from app.services.chat_service import load_model_config
 from app.services.orchestrator_service import OrchestratorService
 from app.services.workspace_manager import DockerWorkspaceManager
+from app.services.workspace_cleanup_service import WorkspaceCleanupService
 from app.dao.mysql_session_dao import SessionDAO
 from app.dao.init_mysql import init_mysql_tables
 from app.services.session_service import SessionService
@@ -44,6 +47,18 @@ async def lifespan(app: FastAPI):
     print(
         f"Workspace manager initialized "
         f"(image={WORKSPACE_BASE_IMAGE}, basedir={WORKSPACE_BASEDIR}, ttl={WORKSPACE_TTL})"
+    )
+
+    # ---- 工作区定时清理服务 ----
+    cleanup_service = WorkspaceCleanupService(
+        basedir=WORKSPACE_BASEDIR,
+        retention_days=WORKSPACE_RETENTION_DAYS,
+        interval_hours=WORKSPACE_CLEANUP_INTERVAL_HOURS,
+    )
+    cleanup_service.start()
+    print(
+        f"Workspace cleanup service started "
+        f"(retention={WORKSPACE_RETENTION_DAYS}天, interval={WORKSPACE_CLEANUP_INTERVAL_HOURS}小时)"
     )
 
     # 初始化多智能体编排服务（加载智能体定义 + skill + 意图识别器）
@@ -94,6 +109,9 @@ async def lifespan(app: FastAPI):
     await workspace_manager.stop_sweeper()
     await workspace_manager.close_all()
     print("Workspace manager closed")
+
+    cleanup_service.stop()
+    print("Workspace cleanup service stopped")
 
     # 关闭 MySQL 连接池
     mysql_pool.close()

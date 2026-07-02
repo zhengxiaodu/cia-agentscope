@@ -23,6 +23,7 @@ from openai import AsyncOpenAI
 from agentscope.state import AgentState
 from agentscope.event import AgentEvent, ReplyStartEvent
 from agentscope.message import AssistantMsg, UserMsg
+from agentscope.tool import Bash, Read, Write, Edit, Glob, Grep
 
 from app.config import (
     AGENT_CONFIG_PATH,
@@ -262,7 +263,7 @@ class OrchestratorService:
                 session_id=session_id_safe,
                 skill_dirs=all_skill_dirs,
             )
-        all_tools = await workspace.list_tools()
+        all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep()]
         all_skills_meta = await workspace.list_skills()
 
         # ---- 6. 构建临时注册表 ----
