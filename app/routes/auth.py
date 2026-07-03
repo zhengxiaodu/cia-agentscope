@@ -74,7 +74,12 @@ async def login(request: Request, login_req: LoginRequest):
 
 @router.post("/register")
 async def register(request: Request, register_req: RegisterRequest):
-    result = await register_user(register_req.username, register_req.password)
+    result = await register_user(
+        username=register_req.username,
+        password=register_req.password,
+        name=register_req.name,
+        department=register_req.department,
+    )
     if not result.get("verification"):
         return error_response(400, result.get("message", "注册失败"))
     return await _build_auth_success(result, request)
