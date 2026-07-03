@@ -252,6 +252,7 @@ class SessionDAO:
                     "updated_at = NOW() WHERE session_id = %s",
                     (trace_id, session_id),
                 )
+                await conn.commit()
 
     # ================================================================
     # Session 元信息
@@ -383,6 +384,7 @@ class SessionDAO:
                     "updated_at = %s WHERE session_id = %s AND user_id = %s",
                     (now, now, session_id, user_id),
                 )
+                await conn.commit()
 
     async def unpin_session(self, user_id: str, session_id: str) -> None:
         """取消会话置顶。"""
@@ -393,6 +395,7 @@ class SessionDAO:
                     "updated_at = NOW() WHERE session_id = %s AND user_id = %s",
                     (session_id, user_id),
                 )
+                await conn.commit()
 
     # ================================================================
     # 删除会话
@@ -407,6 +410,7 @@ class SessionDAO:
                     "WHERE session_id = %s AND user_id = %s",
                     (session_id, user_id),
                 )
+                await conn.commit()
 
     # ================================================================
     # AgentScope 原生接口
