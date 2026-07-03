@@ -1,5 +1,6 @@
 # AgentScope AI 问答系统依赖
 agentscope>=2.0.0
+aiodocker>=0.23.0
 fastapi>=0.100.0
 uvicorn>=0.31.1
 pydantic>=2.11.7

@@ -27,7 +27,7 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
     login 与 register 共用此函数，保证返回前端的字段结构逐字段一致。
     """
     user_info = result.get("user_info", {}) or {}
-    user_id = user_info.get("user_id")
+    user_id = user_info.get("id")
     access_token = result.get("access_token", "")
     permissions = result.get("permissions", {}) or {}
 
@@ -60,7 +60,7 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
         "agent_access": [{"id": d["code"], "name": d["name"]} for d in permissions["agent_whitelist"]],
-        "skills_blacklist": permissions["skills_blacklist"],
+        "skill_blacklist": permissions["skill_blacklist"],
     })
 
 
@@ -74,7 +74,12 @@ async def login(request: Request, login_req: LoginRequest):
 
 @router.post("/register")
 async def register(request: Request, register_req: RegisterRequest):
-    result = await register_user(register_req.username, register_req.password)
+    result = await register_user(
+        username=register_req.username,
+        password=register_req.password,
+        name=register_req.name,
+        department=register_req.department,
+    )
     if not result.get("verification"):
         return error_response(400, result.get("message", "注册失败"))
     return await _build_auth_success(result, request)

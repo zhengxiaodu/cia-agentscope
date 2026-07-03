@@ -13,14 +13,21 @@ from app.config import (
     MYSQL_USER,
     MYSQL_PASSWORD,
     MYSQL_DATABASE,
+    WORKSPACE_BASE_IMAGE,
+    WORKSPACE_BASEDIR,
+    WORKSPACE_TTL,
+    WORKSPACE_RETENTION_DAYS,
+    WORKSPACE_CLEANUP_INTERVAL_HOURS,
 )
 from app.services.chat_service import load_model_config
 from app.services.orchestrator_service import OrchestratorService
+from app.services.workspace_manager import DockerWorkspaceManager
+from app.services.workspace_cleanup_service import WorkspaceCleanupService
 from app.dao.mysql_session_dao import SessionDAO
 from app.dao.init_mysql import init_mysql_tables
 from app.services.session_service import SessionService
 from app.services.langfuse_service import LangfuseService
-from app.routes import auth, chat, feedback, health, mng_proxy, sessions, upload
+from app.routes import auth, chat, feedback, files, health, mng_proxy, sessions, upload
 
 
 @asynccontextmanager
@@ -29,8 +36,35 @@ async def lifespan(app: FastAPI):
     model_config = load_model_config(MODEL_CONFIG_PATH)
     app.state.model_config = model_config
 
+    # ---- Docker 工作区管理器 ----
+    workspace_manager = DockerWorkspaceManager(
+        base_image=WORKSPACE_BASE_IMAGE,
+        basedir=WORKSPACE_BASEDIR,
+        ttl=WORKSPACE_TTL,
+    )
+    app.state.workspace_manager = workspace_manager
+    await workspace_manager.start_sweeper()
+    print(
+        f"Workspace manager initialized "
+        f"(image={WORKSPACE_BASE_IMAGE}, basedir={WORKSPACE_BASEDIR}, ttl={WORKSPACE_TTL})"
+    )
+
+    # ---- 工作区定时清理服务 ----
+    cleanup_service = WorkspaceCleanupService(
+        basedir=WORKSPACE_BASEDIR,
+        retention_days=WORKSPACE_RETENTION_DAYS,
+        interval_hours=WORKSPACE_CLEANUP_INTERVAL_HOURS,
+    )
+    cleanup_service.start()
+    print(
+        f"Workspace cleanup service started "
+        f"(retention={WORKSPACE_RETENTION_DAYS}天, interval={WORKSPACE_CLEANUP_INTERVAL_HOURS}小时)"
+    )
+
     # 初始化多智能体编排服务（加载智能体定义 + skill + 意图识别器）
-    app.state.orchestrator_service = await OrchestratorService.create(model_config)
+    app.state.orchestrator_service = await OrchestratorService.create(
+        model_config, workspace_manager
+    )
     print("Orchestrator service initialized (multi-agent + multi-intent)")
 
     # ---- Redis（保留，用于其他需求） ----
@@ -71,6 +105,14 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # 关闭工作区管理器（停清扫 + 销毁全部容器）
+    await workspace_manager.stop_sweeper()
+    await workspace_manager.close_all()
+    print("Workspace manager closed")
+
+    cleanup_service.stop()
+    print("Workspace cleanup service stopped")
+
     # 关闭 MySQL 连接池
     mysql_pool.close()
     await mysql_pool.wait_closed()
@@ -86,6 +128,7 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(auth.router, tags=["auth"])
 app.include_router(chat.router, tags=["chat"])
 app.include_router(feedback.router, tags=["feedback"])
+app.include_router(files.router, tags=["files"])
 app.include_router(health.router, tags=["health"])
 app.include_router(sessions.router, tags=["sessions"])
 app.include_router(upload.router, tags=["upload"])
