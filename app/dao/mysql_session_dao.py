@@ -33,6 +33,7 @@ class SessionDAO:
                     (session_id,),
                 )
                 row = await cur.fetchone()
+                await conn.commit()
                 return row is not None
 
     # ================================================================
@@ -51,6 +52,7 @@ class SessionDAO:
                     (session_id, agent_id),
                 )
                 row = await cur.fetchone()
+                await conn.commit()
                 if row is None:
                     return None
                 # MySQL JSON 列返回的是字符串，需要解析
@@ -127,6 +129,7 @@ class SessionDAO:
                     (session_id,),
                 )
                 rows = await cur.fetchall()
+                await conn.commit()
                 return [
                     {
                         "role": r["role"],
@@ -269,6 +272,7 @@ class SessionDAO:
                     (session_id,),
                 )
                 row = await cur.fetchone()
+                await conn.commit()
                 if row is None:
                     return None
                 return {
@@ -368,6 +372,7 @@ class SessionDAO:
                         "is_pinned": bool(row["is_pinned"]),
                     })
 
+                await conn.commit()
                 return top_sessions, sessions
 
     # ================================================================
@@ -439,6 +444,7 @@ class SessionDAO:
                     (agent_id, session_id, user_id),
                 )
                 row = await cur.fetchone()
+                await conn.commit()
                 if row is None:
                     return None
                 result = dict(row)
