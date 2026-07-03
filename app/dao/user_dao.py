@@ -180,6 +180,6 @@ async def register(username: str, password: str, name: str = "", department: str
                 "role": "普通用户",
             },
             "access_token": f"mock-access-token-{username}",
-            "permissions": {"agent_whitelist": [], "skills_blacklist": []},
+            "permissions": {"agent_whitelist": [], "skill_blacklist": []},
         }
     return await register_via_mng(username, password, name=name, department=department)
