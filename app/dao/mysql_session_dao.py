@@ -410,7 +410,18 @@ class SessionDAO:
                     "WHERE session_id = %s AND user_id = %s",
                     (session_id, user_id),
                 )
+                affected = cur.rowcount
                 await conn.commit()
+                if affected == 0:
+                    logger.warning(
+                        f"[session_dao] DELETE 未命中任何行: "
+                        f"session_id={session_id!r}, user_id={user_id!r}"
+                    )
+                else:
+                    logger.info(
+                        f"[session_dao] 已删除会话: session_id={session_id}, "
+                        f"user_id={user_id}, affected={affected}"
+                    )
 
     # ================================================================
     # AgentScope 原生接口

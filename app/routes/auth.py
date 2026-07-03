@@ -47,7 +47,7 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
 
     # 自己生成 JWT 返回前端（payload 只放基础信息，权限走 Redis 查询）
     token_payload = {
-        "user_id": user_id,
+        "user_id": str(user_id) if user_id is not None else None,
         "user_name": user_info.get("user_name", ""),
         "department": user_info.get("department", ""),
         "role": user_info.get("role", ""),
