@@ -13,7 +13,7 @@ services:
       REDIS_URL: redis://redis:6379/0
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - workspace-data:/data/docker-workspaces
+      - workspace-data:${WORKSPACE_BASEDIR:-/data/docker-workspaces}
     depends_on:
       mysql:
         condition: service_healthy
