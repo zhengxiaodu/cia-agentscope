@@ -3,6 +3,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from app.utils.secret_codec import resolve as _resolve_secret
+
+# ---- 主密钥（用于解密 .env 中 ENC(...) 形式的敏感配置）----
+# 形态：32 位 hex 字符串（16 字节）。明文模式下可为空。
+_CONFIG_DECRYPT_KEY_RAW = os.getenv("CONFIG_DECRYPT_KEY", "")
+try:
+    _CONFIG_KEY = bytes.fromhex(_CONFIG_DECRYPT_KEY_RAW) if _CONFIG_DECRYPT_KEY_RAW else b""
+    if _CONFIG_KEY and len(_CONFIG_KEY) != 16:
+        raise ValueError(
+            f"CONFIG_DECRYPT_KEY 必须为 32 位 hex（16 字节），当前 {len(_CONFIG_KEY)} 字节"
+        )
+except ValueError as e:
+    raise RuntimeError(f"CONFIG_DECRYPT_KEY 配置非法: {e}") from e
+
 SKILL_CONFIG_PATH = "../config/skill_config.yml"
 MODEL_CONFIG_PATH = "../config/model_config.yml"
 # 多智能体与多意图编排配置
@@ -10,7 +24,8 @@ AGENT_CONFIG_PATH = "../config/agent_config.yml"
 INTENT_CONFIG_PATH = "../config/intent_config.yml"
 
 JWT_ALGORITHM = "HS256"
-JWT_SECRET = os.getenv("JWT_SECRET", "please-change-this-secret")
+# 支持 ENC(...) 密文（由 CONFIG_DECRYPT_KEY 解密）或明文（向后兼容）
+JWT_SECRET = _resolve_secret(os.getenv("JWT_SECRET", "please-change-this-secret"), _CONFIG_KEY)
 JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "8"))
 
 # Redis 配置（保留，用于其他需求）
@@ -21,9 +36,9 @@ REDIS_SESSION_TTL = int(os.getenv("REDIS_SESSION_TTL", "86400"))
 MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+# 支持 ENC(...) 密文（由 CONFIG_DECRYPT_KEY 解密）或明文（向后兼容）
+MYSQL_PASSWORD = _resolve_secret(os.getenv("MYSQL_PASSWORD", ""), _CONFIG_KEY)
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "agentscope")
-MYSQL_DSN = os.getenv("MYSQL_DSN", "")
 
 # 文件上传配置
 UPLOAD_MAX_SIZE_MB = int(os.getenv("UPLOAD_MAX_SIZE_MB", "10"))
