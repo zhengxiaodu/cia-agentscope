@@ -135,40 +135,29 @@ class ParallelOrchestrator(BaseOrchestrator):
 
         result_box = []
         events = []
-        try:
-            async for event_str in asyncio.wait_for(
-                self._consume_agent_events(intent, session_id, agent_state, result_box),
-                timeout=self._timeout,
-            ):
-                events.append(event_str)
-        except asyncio.TimeoutError:
-            result_box.append(TaskResult(
-                intent_id=intent.id,
-                agent_id=agent_id,
-                success=False,
-                output="执行超时",
-            ))
+        timed_out = False
 
-        result = result_box[0] if result_box else TaskResult(
-            intent_id=intent.id,
-            agent_id=agent_id,
-            success=False,
-            output="未获取到执行结果",
-        )
-        return result, events
-
-    async def _consume_agent_events(
-        self,
-        intent,
-        session_id: Optional[str],
-        agent_state: Optional[AgentState],
-        result_box: list,
-    ) -> AsyncGenerator[str, None]:
-        """包装 _run_single_agent，将事件转为可被 wait_for 的生成器。"""
-        async for event_str in self._run_single_agent(
+        # async generator 不能用 asyncio.wait_for，改用手动超时
+        gen = self._run_single_agent(
             intent,
             session_id=session_id,
             agent_state=agent_state,
             result_box=result_box,
-        ):
-            yield event_str
+        )
+        try:
+            async for event_str in gen:
+                events.append(event_str)
+        except asyncio.TimeoutError:
+            timed_out = True
+
+        if timed_out or not result_box:
+            result = TaskResult(
+                intent_id=intent.id,
+                agent_id=agent_id,
+                success=False,
+                output="执行超时" if timed_out else "未获取到执行结果",
+            )
+        else:
+            result = result_box[0]
+
+        return result, events
