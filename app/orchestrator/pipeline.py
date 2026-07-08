@@ -7,7 +7,7 @@
 """
 import asyncio
 import logging
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import AsyncGenerator, Dict, Optional
 
 from agentscope.state import AgentState
 
@@ -41,7 +41,7 @@ class PipelineOrchestrator(BaseOrchestrator):
         session_id: Optional[str] = None,
         agent_states: Optional[Dict[str, AgentState]] = None,
     ) -> AsyncGenerator[str, None]:
-        """按固定顺序串行执行意图。"""
+        """按固定顺序串行执行意图，实时透传 agent 事件。"""
         intents = intent_result.intents
         agent_states = agent_states or {}
 
@@ -68,25 +68,27 @@ class PipelineOrchestrator(BaseOrchestrator):
             agent_id = intent.agent or "general_agent"
             agent_state = agent_states.get(agent_id)
 
-            # 执行当前步骤
+            # 执行当前步骤 — 实时透传事件
+            result_box = []
+            timed_out = False
             try:
-                result = await asyncio.wait_for(
-                    self._run_single_agent(
-                        intent,
-                        prior_context=prior_context,
-                        session_id=session_id,
-                        agent_state=agent_state,
-                    ),
-                    timeout=self._step_timeout,
-                )
+                async for event_str in self._run_single_agent(
+                    intent,
+                    prior_context=prior_context,
+                    session_id=session_id,
+                    agent_state=agent_state,
+                    result_box=result_box,
+                ):
+                    yield event_str
             except asyncio.TimeoutError:
+                timed_out = True
+
+            if timed_out:
                 result = self._make_timeout_result(intent)
+            else:
+                result = result_box[0] if result_box else self._make_timeout_result(intent)
 
             self._last_results.append(result)
-
-            # 回放 SSE 事件
-            for event_str in result.events:
-                yield event_str
 
             # 发送任务完成事件
             yield self._event({
