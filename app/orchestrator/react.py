@@ -229,20 +229,10 @@ class ReActOrchestrator(BaseOrchestrator):
             )
 
             agent_state = (agent_states or {}).get(agent_id)
-            # 收集结果但不推送 agent 内部事件（ReAct 只推送 react_* 事件）
-            result_box = []
-            async for _ in self._run_single_agent(
+            result = await self._run_single_agent(
                 intent,
                 session_id=session_id,
                 agent_state=agent_state,
-                result_box=result_box,
-            ):
-                pass
-            result = result_box[0] if result_box else TaskResult(
-                intent_id=intent.id,
-                agent_id=agent_id,
-                success=False,
-                output="未获取到执行结果",
             )
             if result.final_state:
                 self._last_results.append(result)
