@@ -75,7 +75,7 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
-        "agent_access": [{"id": d["code"], "name": d["name"]} for d in permissions["agent_whitelist"]],
+        "agent_access": permissions["agent_whitelist"],
         "skill_blacklist": permissions["skill_blacklist"],
     })
 
