@@ -7,6 +7,7 @@
 设计原则（来自文档）：能并行就并行，减少用户等待时间。
 """
 import asyncio
+import json
 import logging
 from typing import AsyncGenerator, Dict, List, Optional
 
@@ -43,7 +44,7 @@ class ParallelOrchestrator(BaseOrchestrator):
         session_id: Optional[str] = None,
         agent_states: Optional[Dict[str, AgentState]] = None,
     ) -> AsyncGenerator[str, None]:
-        """并行执行所有意图，等全部完成后回放事件。"""
+        """并行执行所有意图。"""
         intents = intent_result.intents
         agent_states = agent_states or {}
 
@@ -54,7 +55,7 @@ class ParallelOrchestrator(BaseOrchestrator):
             "intent_count": len(intents),
         })
 
-        # ① 并行执行所有意图（收集事件到局部缓冲，等全部完成后回放）
+        # ① 并行执行所有意图
         tasks = [
             self._run_with_timeout(intent, session_id, agent_states)
             for intent in intents
@@ -68,30 +69,27 @@ class ParallelOrchestrator(BaseOrchestrator):
                 "agent_id": intent.agent or "general_agent",
             })
 
-        results: List[tuple] = await asyncio.gather(*tasks, return_exceptions=True)
+        results: List[TaskResult] = await asyncio.gather(*tasks, return_exceptions=True)
 
         # 存储结果供后续保存状态用
-        self._last_results = []
+        self._last_results = [
+            r for r in results if isinstance(r, TaskResult)
+        ]
 
         # ② 回放事件 + 汇总结果
         summary_parts = []
-        for i, item in enumerate(results):
-            if isinstance(item, Exception):
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
                 logger.exception(f"[ParallelOrchestrator] 意图 {intents[i].id} 执行异常")
                 result = TaskResult(
                     intent_id=intents[i].id,
                     agent_id=intents[i].agent or "general_agent",
                     success=False,
-                    output=f"执行异常: {str(item)}",
+                    output=f"执行异常: {str(result)}",
                 )
-                events = []
-            else:
-                result, events = item
-
-            self._last_results.append(result)
 
             # 回放该智能体产生的 SSE 事件
-            for event_str in events:
+            for event_str in result.events:
                 yield event_str
 
             # 发送任务完成事件
@@ -124,40 +122,11 @@ class ParallelOrchestrator(BaseOrchestrator):
         intent,
         session_id: Optional[str] = None,
         agent_states: Optional[Dict[str, AgentState]] = None,
-    ) -> tuple[TaskResult, list[str]]:
-        """带超时的智能体执行，收集事件到局部缓冲。
-
-        Returns:
-            (TaskResult, events_list)
-        """
+    ) -> TaskResult:
+        """带超时的智能体执行。"""
         agent_id = intent.agent or "general_agent"
         agent_state = (agent_states or {}).get(agent_id)
-
-        result_box = []
-        events = []
-        timed_out = False
-
-        # async generator 不能用 asyncio.wait_for，改用手动超时
-        gen = self._run_single_agent(
-            intent,
-            session_id=session_id,
-            agent_state=agent_state,
-            result_box=result_box,
+        return await asyncio.wait_for(
+            self._run_single_agent(intent, session_id=session_id, agent_state=agent_state),
+            timeout=self._timeout,
         )
-        try:
-            async for event_str in gen:
-                events.append(event_str)
-        except asyncio.TimeoutError:
-            timed_out = True
-
-        if timed_out or not result_box:
-            result = TaskResult(
-                intent_id=intent.id,
-                agent_id=agent_id,
-                success=False,
-                output="执行超时" if timed_out else "未获取到执行结果",
-            )
-        else:
-            result = result_box[0]
-
-        return result, events
