@@ -6,6 +6,7 @@ class ChatRequest(BaseModel):
     messages: List[Dict[str, Any]]
     session_id: Optional[str] = None
     agent_id: Optional[str] = None
+    search_enabled: bool = True
 
 
 class ChatResponse(BaseModel):

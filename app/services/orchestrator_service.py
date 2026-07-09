@@ -55,6 +55,9 @@ logger = logging.getLogger(__name__)
 _REDIS_KEY_USER_CONFIG = "user_config:{user_id}"
 _USER_CONFIG_TTL = JWT_EXPIRE_HOURS * 3600  # 与 user_permissions 同 TTL
 
+# 联网搜索技能名（与 skill_config.yml / agent_config.yml 中的 name 一致）
+_SEARCH_SKILL_NAME = "bocha_search"
+
 
 class OrchestratorService:
     """编排服务：持有不可变资源，每次 run() 动态构建请求级组件。
@@ -296,6 +299,7 @@ class OrchestratorService:
         user_id: str,
         redis_client,
         session_id: Optional[str] = None,
+        search_enabled: bool = True,
     ) -> tuple:
         """会话时构建临时组件：读 Redis 缓存（步骤 1-4 的产物）+ 步骤 5-8。
 
@@ -351,6 +355,15 @@ class OrchestratorService:
         
         all_skills_meta = await workspace.list_skills()
 
+        # 按请求开关显隐联网搜索技能（workspace 始终装载全部技能，此处按轮次过滤）
+        if not search_enabled:
+            all_skills_meta = [
+                m for m in all_skills_meta
+                if (getattr(m, "name", None) or
+                    (m.get("name") if isinstance(m, dict) else None)
+                    ) != _SEARCH_SKILL_NAME
+            ]
+
         # ---- 6. 构建临时注册表 ----
         agent_defs = [AgentDefinition(**a) for a in merged_agents]
         registry = AgentRegistry(
@@ -390,6 +403,7 @@ class OrchestratorService:
         session_service: Optional[Any] = None,
         agent_id: Optional[str] = None,
         request: Optional[Request] = None,
+        search_enabled: bool = True,
     ) -> AsyncGenerator[str, None]:
         """编排主流程：改写 → 识别 → 选择编排器 → 执行。
 
@@ -426,6 +440,7 @@ class OrchestratorService:
                 user_id=user_id,
                 redis_client=redis_client,
                 session_id=session_id,
+                search_enabled=search_enabled,
             )
         )
 
