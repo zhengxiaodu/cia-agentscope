@@ -43,6 +43,22 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX idx_messages_session_id ON messages(session_id);
 CREATE INDEX idx_messages_timestamp ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS session_files (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    session_id   VARCHAR(64) NOT NULL,
+    name         VARCHAR(255) NOT NULL,
+    path         VARCHAR(512) NOT NULL,
+    url          VARCHAR(512) NOT NULL,
+    size         BIGINT NOT NULL DEFAULT 0,
+    media_type   VARCHAR(255) NOT NULL DEFAULT 'application/octet-stream',
+    created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE UNIQUE INDEX uniq_session_file ON session_files(session_id, path);
+CREATE INDEX idx_session_files_session_id ON session_files(session_id);
 """
 
 

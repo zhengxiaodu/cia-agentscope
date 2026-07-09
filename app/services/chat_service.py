@@ -248,6 +248,13 @@ async def generate_response(
         logger.warning("[chat_service] 检测新文件失败", exc_info=True)
     yield f"data: {json.dumps({'type': 'files_generated', 'files': files_payload}, ensure_ascii=False)}\n\n"
 
+    # ---- 持久化本轮生成的文件元信息（供 /sessions/{session_id} 回看） ----
+    if files_payload and session_service and session_id:
+        try:
+            await session_service.append_session_files(session_id, files_payload)
+        except Exception:
+            logger.warning("[chat_service] 持久化生成文件元信息失败", exc_info=True)
+
     # 更新 Langfuse observation 并发送 TRACE_READY 事件
     trace_id = None
     if obs and langfuse_service:

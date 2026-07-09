@@ -418,6 +418,74 @@ class SessionDAO:
                 await conn.commit()
 
     # ================================================================
+    # Session 文件元信息
+    # ================================================================
+
+    async def append_session_files(
+        self, session_id: str, files: list[dict]
+    ) -> None:
+        """向 session_files 表 UPSERT 文件元信息（按 (session_id, path) 去重）。
+
+        files: [{"name", "path", "url", "size", "media_type"}, ...]
+        空列表直接返回。
+        """
+        if not files:
+            return
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await conn.begin()
+                try:
+                    for f in files:
+                        await cur.execute(
+                            "INSERT INTO session_files "
+                            "(session_id, name, path, url, size, media_type) "
+                            "VALUES (%s, %s, %s, %s, %s, %s) "
+                            "ON DUPLICATE KEY UPDATE "
+                            "name = VALUES(name), url = VALUES(url), "
+                            "size = VALUES(size), media_type = VALUES(media_type), "
+                            "updated_at = NOW()",
+                            (
+                                session_id,
+                                f.get("name", ""),
+                                f.get("path", ""),
+                                f.get("url", ""),
+                                int(f.get("size", 0) or 0),
+                                f.get("media_type", "application/octet-stream"),
+                            ),
+                        )
+                    await conn.commit()
+                except Exception:
+                    await conn.rollback()
+                    raise
+
+    async def load_session_files(self, session_id: str) -> list[dict]:
+        """加载 session 的生成文件元信息列表（按首次生成顺序 id ASC）。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT name, path, url, size, media_type, created_at "
+                    "FROM session_files WHERE session_id = %s ORDER BY id ASC",
+                    (session_id,),
+                )
+                rows = await cur.fetchall()
+                await conn.commit()
+                return [
+                    {
+                        "name": r["name"],
+                        "path": r["path"],
+                        "url": r["url"],
+                        "size": r["size"],
+                        "media_type": r["media_type"],
+                        "created_at": r["created_at"].strftime(
+                            "%Y-%m-%d %H:%M:%S.%f"
+                        )[:-3]
+                        if hasattr(r["created_at"], "strftime")
+                        else str(r["created_at"]),
+                    }
+                    for r in rows
+                ]
+
+    # ================================================================
     # AgentScope 原生接口
     # ================================================================
 

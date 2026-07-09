@@ -9,6 +9,15 @@ class SessionMessage(BaseModel):
     timestamp: str
 
 
+class SessionFile(BaseModel):
+    name: str
+    path: str
+    url: str
+    size: int
+    media_type: str
+    created_at: Optional[str] = None
+
+
 class SessionMeta(BaseModel):
     session_id: str
     user_id: str
@@ -28,3 +37,4 @@ class SessionDetailResponse(BaseModel):
     updated_at: str
     trace_id: Optional[str] = None
     messages: List[SessionMessage]
+    files: List[SessionFile] = []
