@@ -99,7 +99,7 @@ class DockerWorkspaceManager:
                     logger.warning(f"[workspace_manager] 技能目录不存在，跳过: {d}")
             ws = DockerWorkspace(
                 base_image=self._base_image,
-                host_workdir=self._basedir,
+                workdir=session_dir,
                 skill_paths=valid or None,
                 default_mcps=[],
             )
