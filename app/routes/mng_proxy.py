@@ -32,7 +32,7 @@ async def proxy_card_configs(request: Request, user: dict = Depends(current_user
     access_token = await _get_access_token(request, user)
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            f"{MNG_INTENT_URL}/presentation/cards",
+            f"{MNG_INTENT_URL}/api/presentation/cards",
             headers={"Authorization": f"Bearer {access_token}"},
         )
         return resp.json()
@@ -45,7 +45,7 @@ async def proxy_custom_component_configs(request: Request, user: dict = Depends(
     access_token = await _get_access_token(request, user)
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            f"{MNG_INTENT_URL}/presentation/custom-components",
+            f"{MNG_INTENT_URL}/api/presentation/custom-components",
             headers={"Authorization": f"Bearer {access_token}"},
         )
         return resp.json()
