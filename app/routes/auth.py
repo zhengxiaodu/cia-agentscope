@@ -45,6 +45,22 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
                     f"[auth] 保存用户 {user_id} 权限到 Redis 失败"
                 )
 
+            # 登录时融合意图/智能体/技能并缓存到 Redis，供 /chat 直接读取
+            orchestrator = getattr(request.app.state, "orchestrator_service", None)
+            if orchestrator is not None:
+                try:
+                    await orchestrator.build_and_cache_user_config(
+                        user_id=user_id,
+                        access_token=access_token,
+                        permissions=permissions,
+                        redis_client=redis_client,
+                    )
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        f"[auth] 登录时融合并缓存用户 {user_id} 配置失败"
+                    )
+
     # 自己生成 JWT 返回前端（payload 只放基础信息，权限走 Redis 查询）
     token_payload = {
         "user_id": user_id,
@@ -59,7 +75,7 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
-        "agent_access": [{"id": d["code"], "name": d["name"]} for d in permissions["agent_whitelist"]],
+        "agent_access": permissions["agent_whitelist"],
         "skill_blacklist": permissions["skill_blacklist"],
     })
 

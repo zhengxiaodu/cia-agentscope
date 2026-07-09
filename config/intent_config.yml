@@ -29,7 +29,7 @@ intents:
 #   - related_dynamic:  多意图有关联，顺序需动态决策，走 ReAct
 # 单意图统一走 parallel（直接执行，无汇总开销）
 default_orchestration:
-  single_intent: parallel
+  single_intent: pipeline
   multi_independent: parallel
   multi_related_fixed: pipeline
   multi_related_dynamic: react

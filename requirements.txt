@@ -12,6 +12,9 @@ redis>=5.0.0
 PyJWT>=2.8.0
 aiomysql>=0.2.0
 
+# 国密 SM4 加密（敏感配置解密）
+gmssl>=3.2.2
+
 # LLM 可观测性
 langfuse>=3.5.0
 

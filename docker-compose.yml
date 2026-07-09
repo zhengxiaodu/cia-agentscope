@@ -1,0 +1,56 @@
+version: "3.8"
+
+services:
+  app:
+    build: .
+    ports:
+      - "7010:7010"
+    env_file:
+      - .env
+    # 覆盖 .env 中指向 localhost 的地址为容器名
+    environment:
+      MYSQL_HOST: mysql
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - workspace-data:${WORKSPACE_BASEDIR:-/data/docker-workspaces}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-zxdzxd.123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-agentscope}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:
+  workspace-data:

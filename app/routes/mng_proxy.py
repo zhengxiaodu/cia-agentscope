@@ -25,27 +25,27 @@ async def _get_access_token(request: Request, user: dict) -> str:
     return access_token
 
 
-@router.get("/api/ui/presentation/cards")
+@router.get("/api/presentation/cards")
 async def proxy_card_configs(request: Request, user: dict = Depends(current_user)):
     if not MNG_INTENT_URL:
         raise HTTPException(status_code=500, detail="MNG_INTENT_URL not configured")
     access_token = await _get_access_token(request, user)
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            f"{MNG_INTENT_URL}/ui/presentation/cards",
+            f"{MNG_INTENT_URL}/presentation/cards",
             headers={"Authorization": f"Bearer {access_token}"},
         )
         return resp.json()
 
 
-@router.get("/api/ui/presentation/custom-components")
+@router.get("/api/presentation/custom-components")
 async def proxy_custom_component_configs(request: Request, user: dict = Depends(current_user)):
     if not MNG_INTENT_URL:
         raise HTTPException(status_code=500, detail="MNG_INTENT_URL not configured")
     access_token = await _get_access_token(request, user)
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            f"{MNG_INTENT_URL}/ui/presentation/custom-components",
+            f"{MNG_INTENT_URL}/presentation/custom-components",
             headers={"Authorization": f"Bearer {access_token}"},
         )
         return resp.json()

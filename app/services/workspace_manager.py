@@ -1,8 +1,9 @@
-"""Docker 工作区管理器：按 session_id 分配、缓存、TTL 回收 Docker workspace。
+"""Docker 工作区管理器：按 user_id 分配可复用 Docker workspace。
 
 自研管理器（官方 WorkspaceManager 绑定 agentservice 无法复用），底层每个 workspace
-复用 agentscope SDK 的 DockerWorkspace。隔离策略：同一 session_id 复用同一 workspace，
-不同 session_id 各自独立容器；空闲超 TTL 的 workspace 被后台 sweeper 惰性/周期淘汰并销毁。
+复用 agentscope SDK 的 DockerWorkspace。隔离策略：同一 user_id 复用同一 workspace 容器，
+不同 user_id 各自独立容器；容器挂载 basedir 根目录，工作路径按 session_id 隔离
+（ws.workdir = {basedir}/{session_id}）；空闲超 TTL 的 workspace 被后台 sweeper 惰性/周期淘汰并销毁。
 """
 import asyncio
 import logging
@@ -16,12 +17,13 @@ logger = logging.getLogger(__name__)
 
 
 class _Entry:
-    __slots__ = ("workspace", "last_access", "user_id")
+    __slots__ = ("workspace", "last_access", "user_id", "session_ids")
 
-    def __init__(self, workspace, user_id: str):
+    def __init__(self, workspace, user_id: str, session_ids: set | None = None):
         self.workspace = workspace
         self.last_access = time.monotonic()
         self.user_id = user_id
+        self.session_ids = session_ids or set()
 
 
 class DockerWorkspaceManager:
@@ -37,8 +39,8 @@ class DockerWorkspaceManager:
         self._sweeper_interval = max(30.0, min(self._ttl / 2, 300.0))
 
     @staticmethod
-    def _workspace_id(session_id: str) -> str:
-        return session_id
+    def _workspace_id(user_id: str) -> str:
+        return f"user-{user_id}"
 
     def _session_dir(self, session_id: str) -> str:
         return os.path.join(self._basedir, session_id)
@@ -68,16 +70,27 @@ class DockerWorkspaceManager:
     async def create_workspace(
         self, user_id: str, session_id: str, skill_dirs: list[str]
     ) -> DockerWorkspace:
-        wid = self._workspace_id(session_id)
+        wid = self._workspace_id(user_id)
         lock = await self._get_lock(wid)
         async with lock:
-            # Double-check：另一并发 waiter 可能已创建；命中且未过期则直接复用。
+            # 复用已有容器：仅切换 workdir 到当前 session
             entry = self._cache.get(wid)
             if entry is not None and (time.monotonic() - entry.last_access) <= self._ttl:
                 entry.last_access = time.monotonic()
+                session_dir = self._session_dir(session_id)
+                os.makedirs(session_dir, exist_ok=True)
+                entry.workspace.workdir = session_dir
+                entry.session_ids.add(session_id)
+                logger.info(
+                    f"[workspace_manager] 复用工作区 wid={wid} session={session_id}"
+                )
                 return entry.workspace
+
+            # 首次创建：挂载 basedir 根目录，容器可访问所有 session 子目录
+            os.makedirs(self._basedir, exist_ok=True)
             session_dir = self._session_dir(session_id)
             os.makedirs(session_dir, exist_ok=True)
+
             valid: list[str] = []
             for d in skill_dirs or []:
                 if d and os.path.isdir(d):
@@ -86,20 +99,20 @@ class DockerWorkspaceManager:
                     logger.warning(f"[workspace_manager] 技能目录不存在，跳过: {d}")
             ws = DockerWorkspace(
                 base_image=self._base_image,
-                host_workdir=session_dir,
+                workdir=session_dir,
                 skill_paths=valid or None,
                 default_mcps=[],
             )
             await ws.initialize()
             ws.workdir = session_dir
-            self._cache[wid] = _Entry(ws, user_id)
+            self._cache[wid] = _Entry(ws, user_id, session_ids={session_id})
             logger.info(f"[workspace_manager] 创建工作区 wid={wid} skills={len(valid)}")
             return ws
 
     async def get_workspace(
         self, user_id: str, session_id: str
     ) -> Optional[DockerWorkspace]:
-        wid = self._workspace_id(session_id)
+        wid = self._workspace_id(user_id)
         lock = await self._get_lock(wid)
         async with lock:
             entry = self._cache.get(wid)
@@ -109,7 +122,12 @@ class DockerWorkspaceManager:
             if (time.monotonic() - entry.last_access) > self._ttl:
                 await self._evict_locked(wid)
                 return None
+            # 切换 workdir 到当前 session
+            session_dir = self._session_dir(session_id)
+            os.makedirs(session_dir, exist_ok=True)
+            entry.workspace.workdir = session_dir
             entry.last_access = time.monotonic()
+            entry.session_ids.add(session_id)
             return entry.workspace
 
     async def close(self, workspace_id: str) -> None:

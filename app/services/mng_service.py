@@ -90,7 +90,7 @@ def _build_whitelist_codes(agent_whitelist: list) -> set:
         return codes
     for item in agent_whitelist:
         if isinstance(item, dict):
-            code = item.get("code")
+            code = item.get("id")
             if code:
                 codes.add(code)
     return codes
@@ -163,6 +163,7 @@ def merge_external_into_memory(
             continue
 
         intent_name = ext.get("name", "")
+        intent_description = ext.get("definition", "")
         intent_code = ext.get("intentCode", "")
         if not intent_code:
             logger.warning(
@@ -171,29 +172,21 @@ def merge_external_into_memory(
             continue
 
         # 解析该意图关联的 agent
-        agents_data = ext.get("agents", [])
-        if not isinstance(agents_data, list) or not agents_data:
+        agent_data = ext.get("agent", {})
+        if not isinstance(agent_data, dict) or not agent_data:
             logger.warning(
                 f"[mng_service] 外部意图 {intent_code} 无关联 agent，跳过"
             )
             continue
 
-        # 找到第一个在权限白名单中的 agent
-        selected_agent = None
-        for agent_item in agents_data:
-            if not isinstance(agent_item, dict):
-                continue
-            agent_code = agent_item.get("code", "")
-            if not agent_code:
-                continue
-            # 白名单检查
-            if agent_code not in agent_whitelist:
-                logger.info(
-                    f"[mng_service] 外部 agent '{agent_code}' 不在白名单中，跳过"
-                )
-                continue
-            selected_agent = agent_item
-            break
+        agent_id = agent_data.get("id", "")
+        # 白名单检查
+        if agent_id not in agent_whitelist:
+            logger.info(
+                f"[mng_service] 外部 agent '{agent_id}' 不在白名单中，跳过"
+            )
+            continue
+        selected_agent = agent_data
 
         if selected_agent is None:
             logger.info(
@@ -202,7 +195,7 @@ def merge_external_into_memory(
             )
             continue
 
-        agent_code = selected_agent.get("code", "")
+        agent_code = selected_agent.get("id", "")
         agent_name = selected_agent.get("name", "")
         agent_prompt = selected_agent.get("prompt", "") or ""
 
@@ -246,7 +239,7 @@ def merge_external_into_memory(
         merged_intents.append({
             "id": intent_code,          # intent.id = intentCode
             "name": intent_name,
-            "description": intent_name, # 外部意图没有独立 description，用 name
+            "description": intent_description, # 外部意图没有独立 description，用 name
             "agent": agent_code,        # intent.agent = agent.code
         })
 

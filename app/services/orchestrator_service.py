@@ -30,6 +30,7 @@ from app.config import (
     INTENT_CONFIG_PATH,
     SKILL_CONFIG_PATH,
     EXTERNAL_SKILLS_DIR,
+    JWT_EXPIRE_HOURS,
 )
 from app.agents.base import AgentDefinition
 from app.agents.factory import AgentFactory
@@ -45,11 +46,14 @@ from app.intent.llm_client import create_async_client
 from app.orchestrator.parallel import ParallelOrchestrator
 from app.orchestrator.pipeline import PipelineOrchestrator
 from app.orchestrator.react import ReActOrchestrator
-from app.services.auth_service import get_user_permissions
 from app.services.chat_service import create_model_from_config
 from app.services.mng_service import fetch_external_intents, merge_external_into_memory
 
 logger = logging.getLogger(__name__)
+
+# Redis key：用户融合后的配置（登录时写入，会话时读取）
+_REDIS_KEY_USER_CONFIG = "user_config:{user_id}"
+_USER_CONFIG_TTL = JWT_EXPIRE_HOURS * 3600  # 与 user_permissions 同 TTL
 
 
 class OrchestratorService:
@@ -197,24 +201,13 @@ class OrchestratorService:
                 history.append({"role": role, "content": content})
         return history
 
-    async def _build_request_components(
-        self,
-        user_id: str,
-        redis_client,
-        session_id: Optional[str] = None,
-    ) -> tuple:
-        """每次 /chat 请求时动态构建临时组件。
+    async def _fuse_user_config(
+        self, access_token: str, permissions: dict
+    ) -> dict:
+        """步骤 1-4：加载 YAML + 请求 mng 外部意图 + 权限过滤 + 合并。
 
-        步骤：
-        1. 从 YAML 加载基础配置到内存
-        2. 从 Redis 获取当前用户权限 + access_token
-        3. 从 mng 获取外部意图（失败不影响主流程）
-        4. 权限过滤 + 合并配置
-        5. 通过 DockerWorkspaceManager 获取/创建工作区
-        6. 构建 AgentRegistry / AgentFactory / IntentRecognizer / QueryRewriter
-
-        Returns:
-            (registry, agent_factory, rewriter, recognizer)
+        返回可 JSON 序列化的 dict，供登录时写入 Redis。
+        mng 请求失败仅记日志，降级为只用基础配置。
         """
         # ---- 1. 加载基础配置到内存 ----
         base_agent_defs = load_agent_definitions(AGENT_CONFIG_PATH)
@@ -224,23 +217,16 @@ class OrchestratorService:
             base_skill_config = yaml.safe_load(f)
         base_skills = base_skill_config.get("skills", [])
 
-        # ---- 2. 获取用户权限 ----
-        permissions = {}
+        # ---- 2-3. 请求 mng 获取外部意图 ----
         external_intents = []
-        if user_id and redis_client:
+        if access_token:
             try:
-                perms_data = await get_user_permissions(redis_client, user_id)
-                if perms_data:
-                    access_token = perms_data.get("access_token", "")
-                    permissions = perms_data.get("permissions", {}) or {}
-
-                    # ---- 3. 从 mng 获取外部意图 ----
-                    if access_token:
-                        external_intents = await fetch_external_intents(access_token)
+                external_intents = await fetch_external_intents(access_token)
             except Exception:
                 logger.exception(
-                    f"[OrchestratorService] 获取用户 {user_id} 权限或外部意图失败"
+                    "[OrchestratorService] 登录时获取外部意图失败，仅用基础配置"
                 )
+                external_intents = []
 
         # ---- 4. 权限过滤 + 合并配置 ----
         merged_intents, merged_agents, merged_skills = merge_external_into_memory(
@@ -248,9 +234,102 @@ class OrchestratorService:
             base_agents=[a.model_dump() for a in base_agent_defs],
             base_skills=base_skills,
             external_intents=external_intents,
-            permissions=permissions,
+            permissions=permissions or {},
             external_skills_dir=EXTERNAL_SKILLS_DIR,
         )
+        return {
+            "merged_intents": merged_intents,
+            "merged_agents": merged_agents,
+            "merged_skills": merged_skills,
+            "default_orchestration": base_intents_raw.get("default_orchestration", {}),
+        }
+
+    async def build_and_cache_user_config(
+        self,
+        user_id: str,
+        access_token: str,
+        permissions: dict,
+        redis_client,
+    ) -> None:
+        """登录时融合（YAML + mng 外部意图 + 权限过滤）并写入 Redis。
+
+        供 /chat 会话时直接读取。失败不阻断登录：mng 不可用或 Redis
+        写失败均仅记日志，会话时读取不到缓存则走 base-only 兜底。
+        """
+        fused = await self._fuse_user_config(access_token, permissions)
+        if redis_client is not None and user_id:
+            try:
+                key = _REDIS_KEY_USER_CONFIG.format(user_id=user_id)
+                await redis_client.set(
+                    key,
+                    json.dumps(fused, ensure_ascii=False).encode("utf-8"),
+                    ex=_USER_CONFIG_TTL,
+                )
+                logger.info(f"[OrchestratorService] 用户配置已缓存: {key}")
+            except Exception:
+                logger.exception(
+                    f"[OrchestratorService] 缓存用户配置失败 user={user_id}"
+                )
+
+    async def _load_cached_user_config(
+        self, user_id: str, redis_client
+    ) -> Optional[dict]:
+        """会话时从 Redis 读取登录时缓存的融合配置。不存在或失败返回 None。"""
+        if not user_id or redis_client is None:
+            return None
+        try:
+            key = _REDIS_KEY_USER_CONFIG.format(user_id=user_id)
+            raw = await redis_client.get(key)
+            if raw is None:
+                return None
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            return json.loads(raw)
+        except Exception:
+            logger.exception(
+                f"[OrchestratorService] 读取用户配置缓存失败 user={user_id}"
+            )
+            return None
+
+    async def _build_request_components(
+        self,
+        user_id: str,
+        redis_client,
+        session_id: Optional[str] = None,
+    ) -> tuple:
+        """会话时构建临时组件：读 Redis 缓存（步骤 1-4 的产物）+ 步骤 5-8。
+
+        缓存命中 → 直接用登录时融合好的 merged_intents/agents/skills；
+        缓存未命中 → base-only 兜底融合（不请求 mng，无外部意图），
+        外部意图在下次登录后恢复。会话路径永不发起 mng HTTP 调用。
+
+        步骤：
+        5. 通过 DockerWorkspaceManager 获取/创建工作区
+        6. 构建 AgentRegistry / AgentFactory
+        7. 构建临时识别器 IntentRecognizer
+        8. 构建临时改写器 QueryRewriter
+
+        Returns:
+            (registry, agent_factory, rewriter, recognizer)
+        """
+        # ---- 读取登录时缓存的融合配置（步骤 1-4 产物） ----
+        fused = await self._load_cached_user_config(user_id, redis_client)
+        if fused is not None:
+            merged_intents = fused.get("merged_intents", [])
+            merged_agents = fused.get("merged_agents", [])
+            merged_skills = fused.get("merged_skills", [])
+            default_orchestration = fused.get("default_orchestration", {})
+        else:
+            # 缓存未命中兜底：base-only 融合（不请求 mng，无外部意图）
+            logger.warning(
+                f"[OrchestratorService] 用户配置缓存未命中 user={user_id}，"
+                f"走 base-only 兜底（无外部意图），下次登录后恢复"
+            )
+            fused = await self._fuse_user_config(access_token="", permissions={})
+            merged_intents = fused["merged_intents"]
+            merged_agents = fused["merged_agents"]
+            merged_skills = fused["merged_skills"]
+            default_orchestration = fused["default_orchestration"]
 
         # ---- 5. 通过 DockerWorkspaceManager 获取/创建工作区 ----
         all_skill_dirs = [s["directory"] for s in merged_skills]
@@ -263,7 +342,13 @@ class OrchestratorService:
                 session_id=session_id_safe,
                 skill_dirs=all_skill_dirs,
             )
-        all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep()]
+            
+        from tools.chart_tools import render_bar_chart,render_line_chart,render_pie_chart,render_generic_card,render_metric_card,render_confirm_action,render_indicator_table,render_selectable_list
+        from agentscope.tool import FunctionTool
+        all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep(),FunctionTool(render_pie_chart),FunctionTool(render_bar_chart),
+                     FunctionTool(render_line_chart),FunctionTool(render_generic_card),FunctionTool(render_metric_card),
+                     FunctionTool(render_confirm_action),FunctionTool(render_indicator_table),FunctionTool(render_selectable_list)]
+        
         all_skills_meta = await workspace.list_skills()
 
         # ---- 6. 构建临时注册表 ----
@@ -279,7 +364,6 @@ class OrchestratorService:
 
         # ---- 7. 构建临时识别器 ----
         intent_configs = [IntentConfig(**item) for item in merged_intents]
-        default_orchestration = base_intents_raw.get("default_orchestration", {})
 
         recognizer = IntentRecognizer(
             client=self._intent_client,
