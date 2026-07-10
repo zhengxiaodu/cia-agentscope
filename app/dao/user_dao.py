@@ -7,7 +7,7 @@
 标准返回结构：
     {
         "verification": bool,
-        "user_info": {"id", "user_name", "department", "role"},
+        "user_info": {"id", "username", "name", "department", "role"},
         "access_token": str,        # mng 返回的 access_token
         "permissions": {            # mng 返回的权限
             "agent_whitelist": [{"id","name","code"}, ...],
@@ -32,7 +32,8 @@ _MOCK_USERS = {
         "verification": True,
         "user_info": {
             "id": "123",
-            "user_name": "小张",
+            "username": "zhangsan",
+            "name": "小张",
             "department": "后勤部",
             "role": "普通用户",
         },
@@ -52,7 +53,8 @@ _MOCK_USERS = {
         "verification": True,
         "user_info": {
             "id": "1",
-            "user_name": "管理员",
+            "username": "admin",
+            "name": "管理员",
             "department": "管理部",
             "role": "管理员",
         },
@@ -98,7 +100,7 @@ async def verify_login_via_mng(username: str, password: str) -> dict:
             data = body.get("data", {}) or {}
             return {
                 "verification": True,
-                "user_info": data.get("user_info", {}),
+                "user_info": data.get("user", {}),
                 "access_token": data.get("access_token", ""),
                 "permissions": data.get("permissions", {}),
             }
@@ -158,7 +160,7 @@ async def register_via_mng(username: str, password: str, name: str = "", departm
             data = body.get("data", {}) or {}
             return {
                 "verification": True,
-                "user_info": data.get("user_info", {}),
+                "user_info": data.get("user", {}),
                 "access_token": data.get("access_token", ""),
                 "permissions": data.get("permissions", {}),
             }
@@ -175,7 +177,8 @@ async def register(username: str, password: str, name: str = "", department: str
             "verification": True,
             "user_info": {
                 "id": username,
-                "user_name": name or username,
+                "username": username,
+                "name": name or username,
                 "department": department,
                 "role": "普通用户",
             },
@@ -183,3 +186,102 @@ async def register(username: str, password: str, name: str = "", department: str
             "permissions": {"agent_whitelist": [], "skill_blacklist": []},
         }
     return await register_via_mng(username, password, name=name, department=department)
+
+
+async def update_name_via_mng(access_token: str, name: str) -> dict:
+    """调用 mng 修改姓名。
+
+    请求 PUT {MNG_AUTH_URL}/api/auth/me/name，body: {"name"}，需带 Authorization。
+    成功返回 {"success": True}，失败返回 {"success": False, "message": ...}。
+    """
+    if not MNG_AUTH_URL:
+        logger.error("[user_dao] MNG_AUTH_URL 未配置，无法调用 mng 修改姓名")
+        return {"success": False, "message": "MNG_AUTH_URL 未配置"}
+
+    url = f"{MNG_AUTH_URL}/api/auth/me/name"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.put(
+                url,
+                json={"name": name},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[user_dao] mng 修改姓名返回非 200: {resp.status_code}")
+                return {"success": False, "message": "修改姓名失败"}
+
+            body = resp.json()
+            if body.get("code") != 200:
+                msg = body.get("message", "修改姓名失败")
+                logger.warning(f"[user_dao] mng 修改姓名业务失败: {msg}")
+                return {"success": False, "message": msg}
+            return {"success": True}
+    except Exception as e:
+        logger.exception(f"[user_dao] 调用 mng 修改姓名服务失败: {e}")
+        return {"success": False, "message": "修改姓名服务异常"}
+
+
+async def update_department_via_mng(access_token: str, department: str) -> dict:
+    """调用 mng 修改部门。
+
+    请求 PUT {MNG_AUTH_URL}/api/auth/me/department，body: {"department"}，需带 Authorization。
+    成功返回 {"success": True}，失败返回 {"success": False, "message": ...}。
+    """
+    if not MNG_AUTH_URL:
+        logger.error("[user_dao] MNG_AUTH_URL 未配置，无法调用 mng 修改部门")
+        return {"success": False, "message": "MNG_AUTH_URL 未配置"}
+
+    url = f"{MNG_AUTH_URL}/api/auth/me/department"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.put(
+                url,
+                json={"department": department},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[user_dao] mng 修改部门返回非 200: {resp.status_code}")
+                return {"success": False, "message": "修改部门失败"}
+
+            body = resp.json()
+            if body.get("code") != 200:
+                msg = body.get("message", "修改部门失败")
+                logger.warning(f"[user_dao] mng 修改部门业务失败: {msg}")
+                return {"success": False, "message": msg}
+            return {"success": True}
+    except Exception as e:
+        logger.exception(f"[user_dao] 调用 mng 修改部门服务失败: {e}")
+        return {"success": False, "message": "修改部门服务异常"}
+
+
+async def update_password_via_mng(access_token: str, old_password: str, new_password: str) -> dict:
+    """调用 mng 修改密码。
+
+    请求 PUT {MNG_AUTH_URL}/api/auth/me/password，body: {"old_password","new_password"}，需带 Authorization。
+    成功返回 {"success": True}，失败返回 {"success": False, "message": ...}。
+    """
+    if not MNG_AUTH_URL:
+        logger.error("[user_dao] MNG_AUTH_URL 未配置，无法调用 mng 修改密码")
+        return {"success": False, "message": "MNG_AUTH_URL 未配置"}
+
+    url = f"{MNG_AUTH_URL}/api/auth/me/password"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.put(
+                url,
+                json={"old_password": old_password, "new_password": new_password},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[user_dao] mng 修改密码返回非 200: {resp.status_code}")
+                return {"success": False, "message": "修改密码失败"}
+
+            body = resp.json()
+            if body.get("code") != 200:
+                msg = body.get("message", "修改密码失败")
+                logger.warning(f"[user_dao] mng 修改密码业务失败: {msg}")
+                return {"success": False, "message": msg}
+            return {"success": True}
+    except Exception as e:
+        logger.exception(f"[user_dao] 调用 mng 修改密码服务失败: {e}")
+        return {"success": False, "message": "修改密码服务异常"}

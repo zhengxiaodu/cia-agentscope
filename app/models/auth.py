@@ -14,9 +14,23 @@ class RegisterRequest(BaseModel):
     password: str
 
 
+class UpdateNameRequest(BaseModel):
+    name: str
+
+
+class UpdateDepartmentRequest(BaseModel):
+    department: str
+
+
+class UpdatePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+
 class UserInfo(BaseModel):
     user_id: str
-    user_name: str
+    username: str
+    name: str
     department: str
     role: str
 
