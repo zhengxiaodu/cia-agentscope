@@ -39,12 +39,12 @@ _MOCK_USERS = {
         },
         "access_token": "mock-access-token-zhangsan",
         "permissions": {
-            "agent_whitelist": [
-                {"id": "123", "name": "制度问答", "code": "zhidu"},
-                {"id": "999", "name": "生成PPT智能体", "code": "agent_ppt"},
+            "agent_access": [
+                {"id": "123", "name": "制度问答", "show": 1},
+                {"id": "999", "name": "生成PPT智能体", "show": 0},
             ],
             "skill_blacklist": [
-                {"id": "456", "name": "博查搜索", "code": "bocha"},
+                {"id": "456", "name": "博查搜索", "code": "bocha_search"},
             ],
         },
     },
@@ -60,9 +60,9 @@ _MOCK_USERS = {
         },
         "access_token": "mock-access-token-admin",
         "permissions": {
-            "agent_whitelist": [
-                {"id": "123", "name": "制度问答", "code": "zhidu"},
-                {"id": "999", "name": "生成PPT智能体", "code": "agent_ppt"},
+            "agent_access": [
+                {"id": "123", "name": "制度问答", "show": "1"},
+                {"id": "999", "name": "生成PPT智能体", "show": 0},
             ],
             "skill_blacklist": [],
         },
