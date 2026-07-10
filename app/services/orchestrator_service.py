@@ -205,7 +205,7 @@ class OrchestratorService:
         return history
 
     async def _fuse_user_config(
-        self, access_token: str, permissions: dict
+        self, jwt_token: str, permissions: dict
     ) -> dict:
         """步骤 1-4：加载 YAML + 请求 mng 外部意图 + 权限过滤 + 合并。
 
@@ -222,9 +222,9 @@ class OrchestratorService:
 
         # ---- 2-3. 请求 mng 获取外部意图 ----
         external_intents = []
-        if access_token:
+        if jwt_token:
             try:
-                external_intents = await fetch_external_intents(access_token)
+                external_intents = await fetch_external_intents(jwt_token)
             except Exception:
                 logger.exception(
                     "[OrchestratorService] 登录时获取外部意图失败，仅用基础配置"
@@ -250,7 +250,7 @@ class OrchestratorService:
     async def build_and_cache_user_config(
         self,
         user_id: str,
-        access_token: str,
+        jwt_token: str,
         permissions: dict,
         redis_client,
     ) -> None:
@@ -259,7 +259,7 @@ class OrchestratorService:
         供 /chat 会话时直接读取。失败不阻断登录：mng 不可用或 Redis
         写失败均仅记日志，会话时读取不到缓存则走 base-only 兜底。
         """
-        fused = await self._fuse_user_config(access_token, permissions)
+        fused = await self._fuse_user_config(jwt_token, permissions)
         if redis_client is not None and user_id:
             try:
                 key = _REDIS_KEY_USER_CONFIG.format(user_id=user_id)
@@ -329,7 +329,7 @@ class OrchestratorService:
                 f"[OrchestratorService] 用户配置缓存未命中 user={user_id}，"
                 f"走 base-only 兜底（无外部意图），下次登录后恢复"
             )
-            fused = await self._fuse_user_config(access_token="", permissions={})
+            fused = await self._fuse_user_config(jwt_token="", permissions={})
             merged_intents = fused["merged_intents"]
             merged_agents = fused["merged_agents"]
             merged_skills = fused["merged_skills"]

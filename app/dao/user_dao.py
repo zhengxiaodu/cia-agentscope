@@ -1,14 +1,13 @@
 """用户登录校验 DAO。
 
 支持两种模式：
-- AUTH_MOCK=true：使用内置模拟数据（含 access_token + permissions），便于本地开发
+- AUTH_MOCK=true：使用内置模拟数据（含 permissions），便于本地开发
 - AUTH_MOCK=false：调用 mng 管理中心进行登录校验，返回结构标准化后供 auth 路由使用
 
 标准返回结构：
     {
         "verification": bool,
         "user_info": {"id", "username", "name", "department", "role"},
-        "access_token": str,        # mng 返回的 access_token
         "permissions": {            # mng 返回的权限
             "agent_whitelist": [{"id","name","code"}, ...],
             "skill_blacklist": [{"id","name","code"}, ...],
@@ -25,7 +24,7 @@ from app.config import MNG_AUTH_URL
 
 logger = logging.getLogger(__name__)
 
-# 模拟账号数据（含 access_token + permissions，结构与 mng 返回保持一致）
+# 模拟账号数据（含 permissions，结构与 mng 返回保持一致）
 _MOCK_USERS = {
     "zhangsan": {
         "password": "123456",
@@ -37,7 +36,6 @@ _MOCK_USERS = {
             "department": "后勤部",
             "role": "普通用户",
         },
-        "access_token": "mock-access-token-zhangsan",
         "permissions": {
             "agent_access": [
                 {"id": "123", "name": "制度问答", "show": 1},
@@ -58,7 +56,6 @@ _MOCK_USERS = {
             "department": "管理部",
             "role": "管理员",
         },
-        "access_token": "mock-access-token-admin",
         "permissions": {
             "agent_access": [
                 {"id": "123", "name": "制度问答", "show": "1"},
@@ -101,7 +98,6 @@ async def verify_login_via_mng(username: str, password: str) -> dict:
             return {
                 "verification": True,
                 "user_info": data.get("user", {}),
-                "access_token": data.get("access_token", ""),
                 "permissions": data.get("permissions", {}),
             }
     except Exception as e:
@@ -120,7 +116,6 @@ async def verify_login(username: str, password: str) -> dict:
             return {
                 "verification": True,
                 "user_info": user["user_info"],
-                "access_token": user["access_token"],
                 "permissions": user["permissions"],
             }
         return {"verification": False}
@@ -161,7 +156,6 @@ async def register_via_mng(username: str, password: str, name: str = "", departm
             return {
                 "verification": True,
                 "user_info": data.get("user", {}),
-                "access_token": data.get("access_token", ""),
                 "permissions": data.get("permissions", {}),
             }
     except Exception as e:
@@ -182,16 +176,15 @@ async def register(username: str, password: str, name: str = "", department: str
                 "department": department,
                 "role": "普通用户",
             },
-            "access_token": f"mock-access-token-{username}",
             "permissions": {"agent_whitelist": [], "skill_blacklist": []},
         }
     return await register_via_mng(username, password, name=name, department=department)
 
 
-async def update_name_via_mng(access_token: str, name: str) -> dict:
+async def update_name_via_mng(jwt_token: str, name: str) -> dict:
     """调用 mng 修改姓名。
 
-    请求 PUT {MNG_AUTH_URL}/api/auth/me/name，body: {"name"}，需带 Authorization。
+    请求 PUT {MNG_AUTH_URL}/api/auth/me/name，body: {"name"}，需带 Authorization（本系统 JWT）。
     成功返回 {"success": True}，失败返回 {"success": False, "message": ...}。
     """
     if not MNG_AUTH_URL:
@@ -204,7 +197,7 @@ async def update_name_via_mng(access_token: str, name: str) -> dict:
             resp = await client.put(
                 url,
                 json={"name": name},
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={"Authorization": f"Bearer {jwt_token}"},
             )
             if resp.status_code != 200:
                 logger.warning(f"[user_dao] mng 修改姓名返回非 200: {resp.status_code}")
@@ -221,10 +214,10 @@ async def update_name_via_mng(access_token: str, name: str) -> dict:
         return {"success": False, "message": "修改姓名服务异常"}
 
 
-async def update_department_via_mng(access_token: str, department: str) -> dict:
+async def update_department_via_mng(jwt_token: str, department: str) -> dict:
     """调用 mng 修改部门。
 
-    请求 PUT {MNG_AUTH_URL}/api/auth/me/department，body: {"department"}，需带 Authorization。
+    请求 PUT {MNG_AUTH_URL}/api/auth/me/department，body: {"department"}，需带 Authorization（本系统 JWT）。
     成功返回 {"success": True}，失败返回 {"success": False, "message": ...}。
     """
     if not MNG_AUTH_URL:
@@ -237,7 +230,7 @@ async def update_department_via_mng(access_token: str, department: str) -> dict:
             resp = await client.put(
                 url,
                 json={"department": department},
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={"Authorization": f"Bearer {jwt_token}"},
             )
             if resp.status_code != 200:
                 logger.warning(f"[user_dao] mng 修改部门返回非 200: {resp.status_code}")
@@ -254,10 +247,10 @@ async def update_department_via_mng(access_token: str, department: str) -> dict:
         return {"success": False, "message": "修改部门服务异常"}
 
 
-async def update_password_via_mng(access_token: str, old_password: str, new_password: str) -> dict:
+async def update_password_via_mng(jwt_token: str, old_password: str, new_password: str) -> dict:
     """调用 mng 修改密码。
 
-    请求 PUT {MNG_AUTH_URL}/api/auth/me/password，body: {"old_password","new_password"}，需带 Authorization。
+    请求 PUT {MNG_AUTH_URL}/api/auth/me/password，body: {"old_password","new_password"}，需带 Authorization（本系统 JWT）。
     成功返回 {"success": True}，失败返回 {"success": False, "message": ...}。
     """
     if not MNG_AUTH_URL:
@@ -270,7 +263,7 @@ async def update_password_via_mng(access_token: str, old_password: str, new_pass
             resp = await client.put(
                 url,
                 json={"old_password": old_password, "new_password": new_password},
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={"Authorization": f"Bearer {jwt_token}"},
             )
             if resp.status_code != 200:
                 logger.warning(f"[user_dao] mng 修改密码返回非 200: {resp.status_code}")

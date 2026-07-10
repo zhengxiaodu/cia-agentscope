@@ -28,19 +28,17 @@ def decode_access_token(token: str) -> dict:
     return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
 
 
-async def save_user_permissions(redis_client, user_id: str, access_token: str, permissions: dict) -> None:
-    """将用户的 mng access_token 和 permissions 存入 Redis。
+async def save_user_permissions(redis_client, user_id: str, permissions: dict) -> None:
+    """将用户的 permissions 存入 Redis。
 
     Args:
         redis_client: redis.asyncio 客户端
         user_id: 用户唯一标识（来自 mng 返回的 user_info）
-        access_token: mng 系统返回的 access_token
         permissions: mng 系统返回的 permissions 对象
             {"agent_whitelist": [...], "skill_blacklist": [...]}
     """
     key = _REDIS_KEY_PERMISSIONS.format(user_id=user_id)
     value = json.dumps({
-        "access_token": access_token,
         "permissions": permissions,
     }, ensure_ascii=False)
     ttl = _PERMISSIONS_TTL
@@ -49,10 +47,10 @@ async def save_user_permissions(redis_client, user_id: str, access_token: str, p
 
 
 async def get_user_permissions(redis_client, user_id: str) -> dict | None:
-    """从 Redis 获取用户的 mng access_token 和 permissions。
+    """从 Redis 获取用户的 permissions。
 
     Returns:
-        成功返回 {"access_token": str, "permissions": dict}，
+        成功返回 {"permissions": dict}，
         不存在或解析失败返回 None。
     """
     key = _REDIS_KEY_PERMISSIONS.format(user_id=user_id)
