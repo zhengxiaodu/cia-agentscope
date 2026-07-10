@@ -59,6 +59,17 @@ CREATE TABLE IF NOT EXISTS session_files (
 
 CREATE UNIQUE INDEX uniq_session_file ON session_files(session_id, path);
 CREATE INDEX idx_session_files_session_id ON session_files(session_id);
+
+CREATE TABLE IF NOT EXISTS action_audit (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    userId     VARCHAR(64) NOT NULL,
+    action     VARCHAR(128) NOT NULL,
+    query      VARCHAR(1024) NOT NULL DEFAULT '',
+    confirm    TINYINT(1) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX idx_action_audit_userId ON action_audit(userId);
 """
 
 
