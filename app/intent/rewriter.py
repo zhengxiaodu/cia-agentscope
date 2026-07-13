@@ -28,7 +28,7 @@ _TIME_KEYWORDS_PATTERN = re.compile(
 def _get_current_date_str() -> str:
     """获取 Asia/Shanghai 当前时间字符串，格式：2026-07-13 星期一 14:30。"""
     now = datetime.now(_SHANGHAI_TZ)
-    weekday_cn = "星期一二三四五六日"[now.weekday()]
+    weekday_cn = "星期" + "一二三四五六日"[now.weekday()]
     return now.strftime(f"%Y-%m-%d {weekday_cn} %H:%M")
 
 
