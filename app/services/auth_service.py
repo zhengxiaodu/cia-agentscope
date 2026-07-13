@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import jwt
 
-from app.config import JWT_ALGORITHM, JWT_SECRET, JWT_EXPIRE_HOURS
+from app.config import JWT_ALGORITHM, JWT_SECRET, JWT_EXPIRE_HOURS, JWT_REFRESH_EXPIRE_DAYS
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,24 @@ def create_access_token(payload: dict, expire_hours: int = JWT_EXPIRE_HOURS) -> 
 def decode_access_token(token: str) -> dict:
     """解析 JWT; 过期或签名错误时抛出 jwt 异常。"""
     return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+
+
+def create_refresh_token(payload: dict, expire_days: int = JWT_REFRESH_EXPIRE_DAYS) -> str:
+    """生成 refresh JWT, 默认按 JWT_REFRESH_EXPIRE_DAYS 过期（天）。"""
+    now = datetime.now(timezone.utc)
+    body = payload.copy()
+    body["iat"] = int(now.timestamp())
+    body["exp"] = int((now + timedelta(days=expire_days)).timestamp())
+    body["type"] = "refresh"
+    return jwt.encode(body, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def decode_refresh_token(token: str) -> dict:
+    """解析 refresh JWT; 非 refresh 类型或过期/签名错误时抛异常。"""
+    payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    if payload.get("type") != "refresh":
+        raise jwt.InvalidTokenError("非 refresh token")
+    return payload
 
 
 async def save_user_permissions(redis_client, user_id: str, permissions: dict) -> None:

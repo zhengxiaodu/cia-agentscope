@@ -27,6 +27,10 @@ class UpdatePasswordRequest(BaseModel):
     new_password: str
 
 
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
 class UserInfo(BaseModel):
     user_id: str
     username: str

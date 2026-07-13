@@ -27,6 +27,7 @@ JWT_ALGORITHM = "HS256"
 # 支持 ENC(...) 密文（由 CONFIG_DECRYPT_KEY 解密）或明文（向后兼容）
 JWT_SECRET = _resolve_secret(os.getenv("JWT_SECRET", "please-change-this-secret"), _CONFIG_KEY)
 JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "8"))
+JWT_REFRESH_EXPIRE_DAYS = int(os.getenv("JWT_REFRESH_EXPIRE_DAYS", "7"))
 
 # Redis 配置（保留，用于其他需求）
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")

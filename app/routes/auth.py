@@ -1,4 +1,5 @@
 """登录路由：调用 mng 校验 → 存 Redis 权限 → 生成 JWT 返回前端。"""
+import jwt
 from fastapi import APIRouter, HTTPException, Request, Depends
 from typing import Any, Dict
 
@@ -16,13 +17,16 @@ from app.models.auth import (
     UpdateNameRequest,
     UpdateDepartmentRequest,
     UpdatePasswordRequest,
+    RefreshRequest,
 )
 from app.services.auth_service import (
     create_access_token,
+    create_refresh_token,
+    decode_refresh_token,
     save_user_permissions,
     get_user_permissions,
 )
-from app.config import JWT_EXPIRE_HOURS
+from app.config import JWT_EXPIRE_HOURS, JWT_REFRESH_EXPIRE_DAYS
 
 router = APIRouter()
 
@@ -53,6 +57,8 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
         "role": user_info.get("role", ""),
     }
     token = create_access_token(token_payload)
+    # 同时签发 refresh token（固定有效期 7 天，不滚动刷新）
+    refresh_token = create_refresh_token(token_payload)
 
     # 将 permissions 按 user_id 存入 Redis，
     # 方便后续 /chat 接口查询用户权限（用于权限过滤）
@@ -89,6 +95,8 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
         "token": token,
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
+        "refresh_token": refresh_token,
+        "refresh_expires_in": JWT_REFRESH_EXPIRE_DAYS * 86400,
         "user_info": user_info,
         "agent_access": permissions["agent_whitelist"],
         "skill_blacklist": permissions["skill_blacklist"],
@@ -194,3 +202,48 @@ async def update_password(request: Request, body: UpdatePasswordRequest, user: d
     if not result.get("success"):
         return error_response(400, result.get("message", "修改密码失败"))
     return await _build_update_response(request, user, {})
+
+
+@router.post("/refresh")
+async def refresh_token(request: Request, body: RefreshRequest):
+    """凭 refresh_token 换取新的 access token（固定有效期，不滚动刷新）。"""
+    try:
+        payload = decode_refresh_token(body.refresh_token)
+    except jwt.ExpiredSignatureError:
+        return error_response(401, "refresh_token 已过期，请重新登录")
+    except jwt.InvalidTokenError:
+        return error_response(401, "refresh_token 无效")
+
+    user_id = payload.get("user_id")
+    if not user_id:
+        return error_response(401, "refresh_token 无效")
+
+    redis_client = getattr(request.app.state, "redis_client", None)
+    if redis_client is None:
+        raise HTTPException(status_code=500, detail="Redis 未就绪")
+    perms_data = await get_user_permissions(redis_client, user_id)
+    if not perms_data:
+        return error_response(401, "用户登录态已过期，请重新登录")
+    permissions = perms_data.get("permissions", {}) or {}
+
+    token_payload = {
+        "user_id": user_id,
+        "username": payload.get("username", ""),
+        "name": payload.get("name", ""),
+        "department": payload.get("department", ""),
+        "role": payload.get("role", ""),
+    }
+    token = create_access_token(token_payload)
+    user_info = {
+        "id": user_id,
+        **{k: token_payload[k] for k in ("username", "name", "department", "role")},
+    }
+    return success_response({
+        "verification": True,
+        "token": token,
+        "token_type": "bearer",
+        "expires_in": JWT_EXPIRE_HOURS * 3600,
+        "user_info": user_info,
+        "agent_access": permissions.get("agent_whitelist", []),
+        "skill_blacklist": permissions.get("skill_blacklist", []),
+    })
