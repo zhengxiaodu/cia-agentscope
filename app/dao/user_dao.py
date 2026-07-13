@@ -98,7 +98,7 @@ async def verify_login_via_mng(username: str, password: str) -> dict:
             data = body.get("data", {}) or {}
             return {
                 "verification": True,
-                "user_info": data.get("user", {}),
+                "user_info": data.get("user_info", {}),
                 "permissions": data.get("permissions", {}),
             }
     except Exception as e:
