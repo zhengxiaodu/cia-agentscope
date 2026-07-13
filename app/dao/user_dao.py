@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # 模拟账号数据（含 permissions，结构与 mng 返回保持一致）
 _MOCK_USERS = {
     "zhangsan": {
-        "password": "123456",
+        "password": "207cf410532f92a47dee245ce9b11ff71f578ebd763eb3bbea44ebd043d018fb",
         "verification": True,
         "user_info": {
             "id": "123",
@@ -37,7 +37,7 @@ _MOCK_USERS = {
             "role": "普通用户",
         },
         "permissions": {
-            "agent_access": [
+            "agent_whitelist": [
                 {"id": "123", "name": "制度问答", "show": 1},
                 {"id": "999", "name": "生成PPT智能体", "show": 0},
             ],
@@ -47,7 +47,7 @@ _MOCK_USERS = {
         },
     },
     "admin": {
-        "password": "123456",
+        "password": "207cf410532f92a47dee245ce9b11ff71f578ebd763eb3bbea44ebd043d018fb",
         "verification": True,
         "user_info": {
             "id": "1",
@@ -57,7 +57,7 @@ _MOCK_USERS = {
             "role": "管理员",
         },
         "permissions": {
-            "agent_access": [
+            "agent_whitelist": [
                 {"id": "123", "name": "制度问答", "show": "1"},
                 {"id": "999", "name": "生成PPT智能体", "show": 0},
             ],
