@@ -15,6 +15,7 @@
     }
 验证失败时仅返回 {"verification": False}。
 """
+import asyncio
 import logging
 import os
 
@@ -278,3 +279,53 @@ async def update_password_via_mng(jwt_token: str, old_password: str, new_passwor
     except Exception as e:
         logger.exception(f"[user_dao] 调用 mng 修改密码服务失败: {e}")
         return {"success": False, "message": "修改密码服务异常"}
+
+
+async def notify_mng_active(jwt_token: str) -> None:
+    """向 mng 上报用户活跃（POST /api/me/active）。
+
+    异步 fire-and-forget，所有异常仅记日志，不抛出。
+    """
+    if not MNG_AUTH_URL or not jwt_token:
+        return
+    url = f"{MNG_AUTH_URL}/api/me/active"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                url,
+                json={},
+                headers={"Authorization": f"Bearer {jwt_token}"},
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    f"[mng_active] 上报失败 status={resp.status_code} "
+                    f"body={resp.text[:200]}"
+                )
+                return
+            body = resp.json()
+            if body.get("code") != 200:
+                logger.warning(
+                    f"[mng_active] mng 业务码异常 code={body.get('code')} "
+                    f"msg={body.get('message')}"
+                )
+    except Exception:
+        logger.warning("[mng_active] 上报异常", exc_info=True)
+
+
+def fire_notify_mng_active(jwt_token: str) -> None:
+    """fire-and-forget 包装：投递后台任务上报 mng active，不阻断主流程。
+
+    若当前无运行中的事件循环则静默跳过。
+    """
+    if not MNG_AUTH_URL or not jwt_token:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 无运行中的事件循环，跳过
+        return
+    task = loop.create_task(notify_mng_active(jwt_token))
+    # 兜底：消费任务中未捕获的异常，避免"Task exception was never retrieved"警告
+    task.add_done_callback(
+        lambda t: t.exception() if not t.cancelled() and t.exception() else None
+    )

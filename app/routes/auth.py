@@ -9,6 +9,7 @@ from app.dao.user_dao import (
     update_name_via_mng,
     update_department_via_mng,
     update_password_via_mng,
+    fire_notify_mng_active,
 )
 from app.dependencies import current_user
 from app.models.auth import (
@@ -59,6 +60,9 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
     token = create_access_token(token_payload)
     # 同时签发 refresh token（固定有效期 7 天，不滚动刷新）
     refresh_token = create_refresh_token(token_payload)
+
+    # 异步上报 mng 用户活跃（fire-and-forget，失败不影响登录）
+    fire_notify_mng_active(token)
 
     # 将 permissions 按 user_id 存入 Redis，
     # 方便后续 /chat 接口查询用户权限（用于权限过滤）

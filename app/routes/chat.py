@@ -6,12 +6,20 @@ from fastapi.responses import StreamingResponse
 from app.dependencies import current_user
 from app.models.chat import ChatRequest
 from app.services.chat_service import generate_response
+from app.dao.user_dao import fire_notify_mng_active
 
 router = APIRouter()
 
 
 @router.post("/chat")
 async def chat(request: Request, body: ChatRequest, user: dict = Depends(current_user)):
+    # 异步上报 mng 用户活跃（fire-and-forget，失败不影响对话）
+    authorization = request.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        jwt_token = authorization.split(" ", 1)[1].strip()
+        if jwt_token:
+            fire_notify_mng_active(jwt_token)
+
     session_service = request.app.state.session_service
     user_id = user.get("user_id")
 
