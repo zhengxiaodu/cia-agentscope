@@ -3,7 +3,7 @@ from typing import Optional
 
 from agentscope.state import AgentState
 
-from app.models.session import SessionMeta, SessionMessage, SessionDetailResponse
+from app.models.session import SessionMeta, SessionMessage, SessionDetailResponse, SessionFile
 
 
 class SessionService:
@@ -39,6 +39,14 @@ class SessionService:
     ) -> None:
         """向会话历史追加消息（用户输入 + 智能体输出）。"""
         await self.dao.append_messages(session_id, user_id, messages)
+
+    async def append_session_files(self, session_id: str, files: list[dict]) -> None:
+        """持久化本轮生成的文件元信息（按 (session_id, path) UPSERT 去重）。"""
+        await self.dao.append_session_files(session_id, files)
+
+    async def load_session_files(self, session_id: str) -> list[dict]:
+        """加载会话历史生成的文件元信息列表。"""
+        return await self.dao.load_session_files(session_id)
 
     async def pin_session(self, user_id: str, session_id: str) -> None:
         """置顶会话。"""
@@ -78,10 +86,15 @@ class SessionService:
         raw_messages = await self.dao.load_messages(session_id)
         messages = [SessionMessage(**m) for m in raw_messages]
 
+        # 从 session_files 表加载历史生成的文件
+        raw_files = await self.dao.load_session_files(session_id)
+        files = [SessionFile(**f) for f in raw_files]
+
         return SessionDetailResponse(
             session_id=session_id,
             created_at=meta.get("created_at", ""),
             updated_at=meta.get("updated_at", ""),
             trace_id=meta.get("latest_trace_id"),
             messages=messages,
+            files=files,
         )

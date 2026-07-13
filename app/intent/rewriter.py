@@ -1,5 +1,7 @@
 """查询改写器：把口语化输入结合上下文改写为语义完整的规范查询。"""
 import logging
+import re
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
 from openai import AsyncOpenAI
@@ -7,6 +9,27 @@ from openai import AsyncOpenAI
 from app.intent.llm_client import chat_complete, create_async_client
 
 logger = logging.getLogger(__name__)
+
+# 东八区（Asia/Shanghai）
+_SHANGHAI_TZ = timezone(timedelta(hours=8))
+
+# 时间代词正则：覆盖常见中文时间指代词
+_TIME_KEYWORDS_PATTERN = re.compile(
+    r"今天|今日|明天|明日|后天|大后天|昨天|昨日|前天|大前天|"
+    r"本周|这周|上周|下周|本周内|"
+    r"本月|这个月|上个月|下个月|近几个月|最近几个月|"
+    r"本季度|上季度|下季度|近几个季度|"
+    r"今年|本年|去年|上一年|明年|下一年|近几年|"
+    r"近几天|最近几天|近几周|最近几周|近几天内|"
+    r"最近|近期|此刻|现在|当前|刚刚|刚才"
+)
+
+
+def _get_current_date_str() -> str:
+    """获取 Asia/Shanghai 当前时间字符串，格式：2026-07-13 星期一 14:30。"""
+    now = datetime.now(_SHANGHAI_TZ)
+    weekday_cn = "星期" + "一二三四五六日"[now.weekday()]
+    return now.strftime(f"%Y-%m-%d {weekday_cn} %H:%M")
 
 
 class QueryRewriter:
@@ -35,14 +58,15 @@ class QueryRewriter:
             history: 历史对话上下文 [{role, content}, ...]，可选
 
         Returns:
-            改写后的查询；无上下文或失败时原样返回
+            改写后的查询；无上下文且不含时间代词或失败时原样返回
         """
-        # 无上下文无需改写
+        # 无上下文时，仅在含时间代词时才改写（避免每条首条消息都调 LLM）
         if not history:
-            return user_input
+            if not _TIME_KEYWORDS_PATTERN.search(user_input):
+                return user_input
 
         # 拼接最近若干轮上下文摘要
-        recent = history[-6:]  # 最近 3 轮（user+assistant）
+        recent = history[-6:] if history else []  # 最近 3 轮（user+assistant）
         context_str = "\n".join(
             [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in recent]
         )
@@ -54,10 +78,14 @@ class QueryRewriter:
         )
 
         try:
+            # 注入服务器当前时间到 system prompt
+            system_prompt = self._rewrite_prompt.replace(
+                "{{current_date}}", _get_current_date_str()
+            )
             rewritten = await chat_complete(
                 self._client,
                 self._model_config,
-                system_prompt=self._rewrite_prompt,
+                system_prompt=system_prompt,
                 user_prompt=user_prompt,
             )
             rewritten = rewritten.strip()

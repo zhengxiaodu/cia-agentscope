@@ -24,10 +24,12 @@ from app.services.orchestrator_service import OrchestratorService
 from app.services.workspace_manager import DockerWorkspaceManager
 from app.services.workspace_cleanup_service import WorkspaceCleanupService
 from app.dao.mysql_session_dao import SessionDAO
+from app.dao.action_audit_dao import ActionAuditDAO
 from app.dao.init_mysql import init_mysql_tables
 from app.services.session_service import SessionService
+from app.services.action_audit_service import ActionAuditService
 from app.services.langfuse_service import LangfuseService
-from app.routes import auth, chat, feedback, files, health, mng_proxy, sessions, upload
+from app.routes import auth, chat, feedback, files, health, mng_proxy, sessions, upload, action_audit
 
 
 @asynccontextmanager
@@ -91,6 +93,9 @@ async def lifespan(app: FastAPI):
     session_dao = SessionDAO(mysql_pool)
     app.state.session_dao = session_dao
     app.state.session_service = SessionService(session_dao)
+    action_audit_dao = ActionAuditDAO(mysql_pool)
+    app.state.action_audit_dao = action_audit_dao
+    app.state.action_audit_service = ActionAuditService(action_audit_dao)
     print(
         f"Session service initialized "
         f"(MySQL: {MYSQL_USER}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE})"
@@ -133,6 +138,7 @@ app.include_router(health.router, tags=["health"])
 app.include_router(sessions.router, tags=["sessions"])
 app.include_router(upload.router, tags=["upload"])
 app.include_router(mng_proxy.router, tags=["mng"])
+app.include_router(action_audit.router, tags=["action-audit"])
 
 if __name__ == "__main__":
     uvicorn.run("app.main:app", host="0.0.0.0", port=7010, reload=True)

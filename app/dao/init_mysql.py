@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     message_count INT NOT NULL DEFAULT 0,
     latest_trace_id VARCHAR(255),
     is_pinned    TINYINT(1) NOT NULL DEFAULT 0,
-    pinned_at    TIMESTAMP NULL
+    pinned_at    TIMESTAMP NULL,
+    agent_ids    JSON NULL DEFAULT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE INDEX idx_sessions_user_id ON sessions(user_id);
@@ -38,11 +39,43 @@ CREATE TABLE IF NOT EXISTS messages (
     role         VARCHAR(32) NOT NULL,
     content      TEXT NOT NULL,
     timestamp    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    agent_ids    JSON NULL DEFAULT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE INDEX idx_messages_session_id ON messages(session_id);
 CREATE INDEX idx_messages_timestamp ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS session_files (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    session_id   VARCHAR(64) NOT NULL,
+    name         VARCHAR(255) NOT NULL,
+    path         VARCHAR(512) NOT NULL,
+    url          VARCHAR(512) NOT NULL,
+    size         BIGINT NOT NULL DEFAULT 0,
+    media_type   VARCHAR(255) NOT NULL DEFAULT 'application/octet-stream',
+    created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE UNIQUE INDEX uniq_session_file ON session_files(session_id, path);
+CREATE INDEX idx_session_files_session_id ON session_files(session_id);
+
+CREATE TABLE IF NOT EXISTS action_audit (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    userId     VARCHAR(64) NOT NULL,
+    action     VARCHAR(128) NOT NULL,
+    query      VARCHAR(1024) NOT NULL DEFAULT '',
+    confirm    TINYINT(1) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX idx_action_audit_userId ON action_audit(userId);
+
+-- 兼容已存在表：追加 agent_ids 列（MySQL 8 支持 IF NOT EXISTS）
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS (agent_ids JSON NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS (agent_ids JSON NULL DEFAULT NULL);
 """
 
 
@@ -65,9 +98,12 @@ async def init_mysql_tables(pool: aiomysql.Pool) -> None:
                             # 索引已存在时忽略（MySQL 不直接支持
                             # CREATE INDEX IF NOT EXISTS）
                             code = getattr(exec_err, "args", [None])[0]
-                            if isinstance(code, int) and code == 1061:
+                            if isinstance(code, int) and code in (1060, 1061, 1064):
+                                # 1060: 重复列；1061: 重复索引；
+                                # 1064: 语法错误（MySQL 5.7 不支持
+                                # ADD COLUMN IF NOT EXISTS）
                                 logger.debug(
-                                    f"Index already exists, skipping: "
+                                    f"Ignoring SQL error {code}, skipping: "
                                     f"{stmt[:60]}..."
                                 )
                             else:

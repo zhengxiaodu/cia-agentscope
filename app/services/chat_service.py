@@ -20,9 +20,49 @@ from agentscope.model import OpenAIChatModel
 from app.config import MODEL_CONFIG_PATH, WORKSPACE_BASEDIR
 from app.services.file_change_detector import snapshot, diff, build_file_meta
 from app.services.langfuse_service import LangfuseService
+from app.intent.llm_client import chat_complete, extract_json
 from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
+
+
+async def _generate_recommended_questions(
+    orchestrator_service,
+    user_input: str,
+    final_output: str,
+) -> List[str]:
+    """调用 LLM 根据本轮问答生成 3 个推荐问题。
+
+    复用 orchestrator 的 _intent_client / _intent_model_cfg。
+    任何异常都吞掉返回空列表，确保不影响主流程。
+    """
+    try:
+        client = getattr(orchestrator_service, "_intent_client", None)
+        model_config = getattr(orchestrator_service, "_intent_model_cfg", None)
+        if not client or not model_config or not final_output:
+            return []
+
+        system_prompt = (
+            "你是一个推荐问题生成助手。根据用户的提问和助手的回答，"
+            "生成 3 个用户可能想继续追问的相关问题。"
+            "只输出 JSON，格式为 {\"questions\": [\"问题1\", \"问题2\", \"问题3\"]}，"
+            "不要有任何额外说明或 markdown 标记。"
+        )
+        user_prompt = f"用户提问：{user_input}\n\n助手回答：{final_output}"
+
+        text = await chat_complete(client, model_config, system_prompt, user_prompt)
+        data = extract_json(text)
+        if not isinstance(data, dict):
+            return []
+        questions = data.get("questions", [])
+        if not isinstance(questions, list):
+            return []
+        # 最多 3 个，过滤空白与非字符串
+        cleaned = [str(q).strip() for q in questions if q and str(q).strip()]
+        return cleaned[:3]
+    except Exception:
+        logger.debug("[chat_service] 生成推荐问题失败", exc_info=True)
+        return []
 
 
 def load_model_config(config_path: str = MODEL_CONFIG_PATH) -> dict:
@@ -108,6 +148,7 @@ async def generate_response(
     langfuse_service: LangfuseService = None,
     agent_id: Optional[str] = None,
     request=None,
+    search_enabled: bool = True,
 ) -> AsyncGenerator[str, None]:
     """根据消息列表生成流式回复（多智能体编排版本）。
 
@@ -168,6 +209,7 @@ async def generate_response(
         session_service=session_service,
         agent_id=agent_id,
         request=request,
+        search_enabled=search_enabled,
     ):
         yield event_str
 
@@ -221,10 +263,19 @@ async def generate_response(
             if user_input:
                 new_messages.append({
                     "role": "user", "content": user_input, "timestamp": now_str,
+                    "agent_ids": [],
                 })
             if final_output:
+                # 取本轮参与的 agent_id 列表（单 agent 路径=[agent_id]，多 agent 路径=编排汇总）
+                involved_agent_ids = []
+                if orchestrator_service is not None:
+                    try:
+                        involved_agent_ids = orchestrator_service.last_agent_ids
+                    except Exception:
+                        involved_agent_ids = []
                 new_messages.append({
                     "role": "assistant", "content": final_output, "timestamp": now_str,
+                    "agent_ids": involved_agent_ids,
                 })
             if new_messages:
                 await session_service.append_messages(
@@ -247,6 +298,41 @@ async def generate_response(
     except Exception:
         logger.warning("[chat_service] 检测新文件失败", exc_info=True)
     yield f"data: {json.dumps({'type': 'files_generated', 'files': files_payload}, ensure_ascii=False)}\n\n"
+
+    # ---- 持久化本轮生成的文件元信息（供 /sessions/{session_id} 回看） ----
+    if files_payload and session_service and session_id:
+        try:
+            await session_service.append_session_files(session_id, files_payload)
+        except Exception:
+            logger.warning("[chat_service] 持久化生成文件元信息失败", exc_info=True)
+
+    # ---- 生成推荐问题并通过 recommended_questions 事件返回前端 ----
+    try:
+        # 复用本轮用户输入（持久化块内已提取过，这里独立提取以保证可用）
+        user_input_for_rec = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    user_input_for_rec = "\n".join(
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                else:
+                    user_input_for_rec = str(content)
+                break
+
+        questions = await _generate_recommended_questions(
+            orchestrator_service, user_input_for_rec, final_output
+        )
+        rec_event = json.dumps(
+            {"type": "recommended_questions", "questions": questions},
+            ensure_ascii=False,
+        )
+        yield f"data: {rec_event}\n\n"
+    except Exception:
+        logger.debug("[chat_service] 推荐问题事件发送失败", exc_info=True)
 
     # 更新 Langfuse observation 并发送 TRACE_READY 事件
     trace_id = None

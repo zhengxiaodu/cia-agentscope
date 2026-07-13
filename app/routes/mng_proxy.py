@@ -3,37 +3,30 @@ import httpx
 
 from app.config import MNG_INTENT_URL
 from app.dependencies import current_user
-from app.services.auth_service import get_user_permissions
 
 router = APIRouter()
 
 
-async def _get_access_token(request: Request, user: dict) -> str:
-    """从 redis 按 user_id 取 mng access_token；取不到则抛 401。"""
-    user_id = user.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="token 中缺少 user_id")
-    redis_client = getattr(request.app.state, "redis_client", None)
-    if redis_client is None:
-        raise HTTPException(status_code=500, detail="Redis 未就绪")
-    perms_data = await get_user_permissions(redis_client, user_id)
-    if not perms_data:
-        raise HTTPException(status_code=401, detail="用户登录态已过期，请重新登录")
-    access_token = perms_data.get("access_token", "")
-    if not access_token:
-        raise HTTPException(status_code=401, detail="未找到 mng access_token，请重新登录")
-    return access_token
+async def _get_jwt_from_header(request: Request) -> str:
+    """从请求头 Authorization 中取出本系统签发的原始 JWT，用于转发给 mng。"""
+    authorization = request.headers.get("authorization", "")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="缺少或无效的 Authorization 头")
+    jwt_token = authorization.split(" ", 1)[1].strip()
+    if not jwt_token:
+        raise HTTPException(status_code=401, detail="Authorization 头无效")
+    return jwt_token
 
 
 @router.get("/api/presentation/cards")
 async def proxy_card_configs(request: Request, user: dict = Depends(current_user)):
     if not MNG_INTENT_URL:
         raise HTTPException(status_code=500, detail="MNG_INTENT_URL not configured")
-    access_token = await _get_access_token(request, user)
+    jwt_token = await _get_jwt_from_header(request)
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            f"{MNG_INTENT_URL}/presentation/cards",
-            headers={"Authorization": f"Bearer {access_token}"},
+            f"{MNG_INTENT_URL}/api/presentation/cards",
+            headers={"Authorization": f"Bearer {jwt_token}"},
         )
         return resp.json()
 
@@ -42,10 +35,10 @@ async def proxy_card_configs(request: Request, user: dict = Depends(current_user
 async def proxy_custom_component_configs(request: Request, user: dict = Depends(current_user)):
     if not MNG_INTENT_URL:
         raise HTTPException(status_code=500, detail="MNG_INTENT_URL not configured")
-    access_token = await _get_access_token(request, user)
+    jwt_token = await _get_jwt_from_header(request)
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            f"{MNG_INTENT_URL}/presentation/custom-components",
-            headers={"Authorization": f"Bearer {access_token}"},
+            f"{MNG_INTENT_URL}/api/presentation/custom-components",
+            headers={"Authorization": f"Bearer {jwt_token}"},
         )
         return resp.json()

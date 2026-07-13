@@ -55,6 +55,9 @@ logger = logging.getLogger(__name__)
 _REDIS_KEY_USER_CONFIG = "user_config:{user_id}"
 _USER_CONFIG_TTL = JWT_EXPIRE_HOURS * 3600  # 与 user_permissions 同 TTL
 
+# 联网搜索技能名（与 skill_config.yml / agent_config.yml 中的 name 一致）
+_SEARCH_SKILL_NAME = "bocha_search"
+
 
 class OrchestratorService:
     """编排服务：持有不可变资源，每次 run() 动态构建请求级组件。
@@ -82,6 +85,8 @@ class OrchestratorService:
 
         # 最近一次编排结果引用（供外部提取 agent states）
         self._last_orchestrator: Optional[Any] = None
+        # 最近一次编排参与的 agent_id 列表（供 chat_service 持久化到 messages）
+        self._last_agent_ids: List[str] = []
 
     @classmethod
     async def create(
@@ -163,6 +168,14 @@ class OrchestratorService:
                 states[r.agent_id] = r.final_state
         return states
 
+    @property
+    def last_agent_ids(self) -> List[str]:
+        """获取最近一次编排中参与的 agent_id 列表（去重保序）。
+
+        覆盖单 agent 直接问答与多 agent 编排两条路径。
+        """
+        return list(self._last_agent_ids) if self._last_agent_ids else []
+
     @staticmethod
     def _event(data: dict) -> str:
         """序列化 SSE 事件。"""
@@ -202,7 +215,7 @@ class OrchestratorService:
         return history
 
     async def _fuse_user_config(
-        self, access_token: str, permissions: dict
+        self, jwt_token: str, permissions: dict
     ) -> dict:
         """步骤 1-4：加载 YAML + 请求 mng 外部意图 + 权限过滤 + 合并。
 
@@ -219,9 +232,9 @@ class OrchestratorService:
 
         # ---- 2-3. 请求 mng 获取外部意图 ----
         external_intents = []
-        if access_token:
+        if jwt_token:
             try:
-                external_intents = await fetch_external_intents(access_token)
+                external_intents = await fetch_external_intents(jwt_token)
             except Exception:
                 logger.exception(
                     "[OrchestratorService] 登录时获取外部意图失败，仅用基础配置"
@@ -247,7 +260,7 @@ class OrchestratorService:
     async def build_and_cache_user_config(
         self,
         user_id: str,
-        access_token: str,
+        jwt_token: str,
         permissions: dict,
         redis_client,
     ) -> None:
@@ -256,7 +269,7 @@ class OrchestratorService:
         供 /chat 会话时直接读取。失败不阻断登录：mng 不可用或 Redis
         写失败均仅记日志，会话时读取不到缓存则走 base-only 兜底。
         """
-        fused = await self._fuse_user_config(access_token, permissions)
+        fused = await self._fuse_user_config(jwt_token, permissions)
         if redis_client is not None and user_id:
             try:
                 key = _REDIS_KEY_USER_CONFIG.format(user_id=user_id)
@@ -296,6 +309,7 @@ class OrchestratorService:
         user_id: str,
         redis_client,
         session_id: Optional[str] = None,
+        search_enabled: bool = True,
     ) -> tuple:
         """会话时构建临时组件：读 Redis 缓存（步骤 1-4 的产物）+ 步骤 5-8。
 
@@ -325,7 +339,7 @@ class OrchestratorService:
                 f"[OrchestratorService] 用户配置缓存未命中 user={user_id}，"
                 f"走 base-only 兜底（无外部意图），下次登录后恢复"
             )
-            fused = await self._fuse_user_config(access_token="", permissions={})
+            fused = await self._fuse_user_config(jwt_token="", permissions={})
             merged_intents = fused["merged_intents"]
             merged_agents = fused["merged_agents"]
             merged_skills = fused["merged_skills"]
@@ -350,6 +364,15 @@ class OrchestratorService:
                      FunctionTool(render_confirm_action),FunctionTool(render_indicator_table),FunctionTool(render_selectable_list)]
         
         all_skills_meta = await workspace.list_skills()
+
+        # 按请求开关显隐联网搜索技能（workspace 始终装载全部技能，此处按轮次过滤）
+        if not search_enabled:
+            all_skills_meta = [
+                m for m in all_skills_meta
+                if (getattr(m, "name", None) or
+                    (m.get("name") if isinstance(m, dict) else None)
+                    ) != _SEARCH_SKILL_NAME
+            ]
 
         # ---- 6. 构建临时注册表 ----
         agent_defs = [AgentDefinition(**a) for a in merged_agents]
@@ -390,6 +413,7 @@ class OrchestratorService:
         session_service: Optional[Any] = None,
         agent_id: Optional[str] = None,
         request: Optional[Request] = None,
+        search_enabled: bool = True,
     ) -> AsyncGenerator[str, None]:
         """编排主流程：改写 → 识别 → 选择编排器 → 执行。
 
@@ -426,6 +450,7 @@ class OrchestratorService:
                 user_id=user_id,
                 redis_client=redis_client,
                 session_id=session_id,
+                search_enabled=search_enabled,
             )
         )
 
@@ -507,6 +532,9 @@ class OrchestratorService:
                         session_id, user_id, agent_id, final_state,
                     )
 
+                # 记录本轮参与的 agent_id（供 chat_service 持久化到 messages）
+                self._last_agent_ids = [agent_id]
+
             except Exception as e:
                 logger.exception(
                     f"[OrchestratorService] 单智能体 {agent_id} 执行异常"
@@ -583,6 +611,7 @@ class OrchestratorService:
                     )
 
         # ⑤ 执行编排（内部 yield SSE 事件）
+        self._last_agent_ids = []  # 重置，避免上一轮残留
         async for event_str in orchestrator.run(
             intent_result,
             session_id=session_id,
@@ -592,6 +621,10 @@ class OrchestratorService:
 
         # ⑥ 保存编排结果引用（供外部提取 agent states）
         self._last_orchestrator = orchestrator
+        # 汇总本轮编排参与的 agent_id 列表（去重保序）
+        self._last_agent_ids = list(dict.fromkeys(
+            r.agent_id for r in orchestrator._last_results if r.agent_id
+        ))
 
         # ⑦ 持久化所有 AgentState
         if session_service and session_id and user_id:

@@ -15,14 +15,14 @@ logger = logging.getLogger(__name__)
 _MNG_INTENTS_PATH = "/api/intents"
 
 
-async def fetch_external_intents(access_token: str) -> List[dict]:
+async def fetch_external_intents(jwt_token: str) -> List[dict]:
     """从 mng 系统获取外部意图配置列表。
 
-    请求 GET {MNG_INTENT_URL}/api/intents，Header 中携带 access_token。
+    请求 GET {MNG_INTENT_URL}/api/intents，Header 中携带本系统签发的 JWT。
     失败不影响主流程，返回空列表。
 
     Args:
-        access_token: 用户登录时 mng 返回的 access_token
+        jwt_token: 本系统登录签发的 JWT，作为 Authorization 转发给 mng
 
     Returns:
         外部意图配置列表，mng 返回格式：
@@ -45,8 +45,8 @@ async def fetch_external_intents(access_token: str) -> List[dict]:
     if not MNG_INTENT_URL:
         logger.warning("[mng_service] MNG_INTENT_URL 未配置，跳过获取外部意图")
         return []
-    if not access_token:
-        logger.warning("[mng_service] access_token 为空，跳过获取外部意图")
+    if not jwt_token:
+        logger.warning("[mng_service] jwt_token 为空，跳过获取外部意图")
         return []
 
     url = f"{MNG_INTENT_URL}{_MNG_INTENTS_PATH}"
@@ -54,7 +54,7 @@ async def fetch_external_intents(access_token: str) -> List[dict]:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(
                 url,
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={"Authorization": f"Bearer {jwt_token}"},
             )
             if resp.status_code != 200:
                 logger.warning(
