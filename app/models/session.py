@@ -7,6 +7,7 @@ class SessionMessage(BaseModel):
     role: str
     content: str
     timestamp: str
+    agent_ids: List[str] = []
 
 
 class SessionFile(BaseModel):
@@ -25,6 +26,7 @@ class SessionMeta(BaseModel):
     created_at: str
     updated_at: str
     message_count: int
+    agent_ids: List[str] = []
 
 
 class SessionListResponse(BaseModel):

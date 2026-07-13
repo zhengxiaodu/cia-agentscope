@@ -263,10 +263,19 @@ async def generate_response(
             if user_input:
                 new_messages.append({
                     "role": "user", "content": user_input, "timestamp": now_str,
+                    "agent_ids": [],
                 })
             if final_output:
+                # 取本轮参与的 agent_id 列表（单 agent 路径=[agent_id]，多 agent 路径=编排汇总）
+                involved_agent_ids = []
+                if orchestrator_service is not None:
+                    try:
+                        involved_agent_ids = orchestrator_service.last_agent_ids
+                    except Exception:
+                        involved_agent_ids = []
                 new_messages.append({
                     "role": "assistant", "content": final_output, "timestamp": now_str,
+                    "agent_ids": involved_agent_ids,
                 })
             if new_messages:
                 await session_service.append_messages(

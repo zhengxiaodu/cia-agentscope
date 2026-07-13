@@ -85,6 +85,8 @@ class OrchestratorService:
 
         # 最近一次编排结果引用（供外部提取 agent states）
         self._last_orchestrator: Optional[Any] = None
+        # 最近一次编排参与的 agent_id 列表（供 chat_service 持久化到 messages）
+        self._last_agent_ids: List[str] = []
 
     @classmethod
     async def create(
@@ -165,6 +167,14 @@ class OrchestratorService:
             if r.final_state:
                 states[r.agent_id] = r.final_state
         return states
+
+    @property
+    def last_agent_ids(self) -> List[str]:
+        """获取最近一次编排中参与的 agent_id 列表（去重保序）。
+
+        覆盖单 agent 直接问答与多 agent 编排两条路径。
+        """
+        return list(self._last_agent_ids) if self._last_agent_ids else []
 
     @staticmethod
     def _event(data: dict) -> str:
@@ -522,6 +532,9 @@ class OrchestratorService:
                         session_id, user_id, agent_id, final_state,
                     )
 
+                # 记录本轮参与的 agent_id（供 chat_service 持久化到 messages）
+                self._last_agent_ids = [agent_id]
+
             except Exception as e:
                 logger.exception(
                     f"[OrchestratorService] 单智能体 {agent_id} 执行异常"
@@ -598,6 +611,7 @@ class OrchestratorService:
                     )
 
         # ⑤ 执行编排（内部 yield SSE 事件）
+        self._last_agent_ids = []  # 重置，避免上一轮残留
         async for event_str in orchestrator.run(
             intent_result,
             session_id=session_id,
@@ -607,6 +621,10 @@ class OrchestratorService:
 
         # ⑥ 保存编排结果引用（供外部提取 agent states）
         self._last_orchestrator = orchestrator
+        # 汇总本轮编排参与的 agent_id 列表（去重保序）
+        self._last_agent_ids = list(dict.fromkeys(
+            r.agent_id for r in orchestrator._last_results if r.agent_id
+        ))
 
         # ⑦ 持久化所有 AgentState
         if session_service and session_id and user_id:
