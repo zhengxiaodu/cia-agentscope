@@ -143,7 +143,8 @@ class SessionDAO:
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
-                    "SELECT role, content, timestamp, agent_ids FROM messages "
+                    "SELECT role, content, timestamp, agent_ids, user_id, "
+                    "success, tokens FROM messages "
                     "WHERE session_id = %s ORDER BY id ASC",
                     (session_id,),
                 )
@@ -159,6 +160,9 @@ class SessionDAO:
                         if hasattr(r["timestamp"], "strftime")
                         else str(r["timestamp"]),
                         "agent_ids": _parse_json_list(r.get("agent_ids")),
+                        "user_id": r.get("user_id", "") or "",
+                        "success": bool(r.get("success", 1)),
+                        "tokens": int(r.get("tokens", 0) or 0),
                     }
                     for r in rows
                 ]
@@ -235,10 +239,14 @@ class SessionDAO:
                         )
                         await cur.execute(
                             "INSERT INTO messages "
-                            "(session_id, role, content, timestamp, agent_ids) "
-                            "VALUES (%s, %s, %s, %s, %s)",
+                            "(session_id, role, content, timestamp, agent_ids, "
+                            "user_id, success, tokens) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                             (session_id, msg.get("role", "user"),
-                             msg.get("content", ""), ts, agent_ids_json),
+                             msg.get("content", ""), ts, agent_ids_json,
+                             msg.get("user_id", ""),
+                             int(bool(msg.get("success", True))),
+                             int(msg.get("tokens", 0) or 0)),
                         )
 
                     # 3) 更新 sessions 元信息

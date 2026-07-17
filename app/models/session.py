@@ -8,6 +8,9 @@ class SessionMessage(BaseModel):
     content: str
     timestamp: str
     agent_ids: List[str] = []
+    user_id: str = ""
+    success: bool = True
+    tokens: int = 0
 
 
 class SessionFile(BaseModel):

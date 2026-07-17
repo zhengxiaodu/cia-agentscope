@@ -14,9 +14,22 @@
 
 ## Assumptions & Decisions
 1. **列命名**：沿用 messages 表现有 snake_case 风格（session_id/agent_ids），用 `user_id` 而非 userId（action_audit 表的 userId 是历史遗留，不作为新列参照）
-2. **success 语义**：user 消息 success=True（提问本身无执行成功与否概念，统一记 True）；assistant 消息 success=`orchestrator_service.last_success`（本轮编排是否全部成功）
-3. **last_success 派生**：多 agent 路径 `all(r.success for r in orchestrator._last_results)`，空列表时 True；单 agent 路径正常完成 True、异常 False
-4. **tokens 估算**：用户明确"用内容长度估算不用精确"。用 `len(content)` 作为粗略估算值（字符数），封装为 `_estimate_tokens(content)` 函数便于后续调整。user 和 assistant 消息都按各自 content 长度估算
+2. **success 语义**：user 消息 success=True（提问本身无执行成功与否概念，统一记 True）；assistant 消息 success=`orchestrator_service.last_success`
+3. **last_success 派生（关键：基于 TaskResult.success 字段，而非"是否有返回"）**：编排返回 output 不代表成功。`_run_single_agent` 在 agent 执行异常/超时时设置 `TaskResult.success=False`（[base.py:134-136](file:///workspace/app/orchestrator/base.py) 异常分支、pipeline 超时 `_make_timeout_result`）。因此：
+   - 多 agent 路径：`all(r.success for r in orchestrator._last_results)` —— 任一 agent 失败则整体 False；空列表时 True
+   - 单 agent 路径：正常完成 True、异常 False（通过 `_last_success` 标志位）
+   - **即使有 output 返回，只要 success=False 就记 False**
+4. **tokens 估算（中英文分别乘系数）**：deepseek-v4 基于 BPE tokenizer，经验值：中文 1 字 ≈ 1.5 token，英文 4 字符 ≈ 1 token（0.25/字符）。封装为 `_estimate_tokens(content)`：
+   ```python
+   def _estimate_tokens(content: str) -> int:
+       """按内容长度估算 token 数（deepseek-v4，中英文分别计系数，粗略估算）。"""
+       if not content:
+           return 0
+       chinese_count = sum(1 for c in content if ord(c) > 127)
+       ascii_count = len(content) - chinese_count
+       return int(chinese_count * 1.5 + ascii_count * 0.25)
+   ```
+   user 和 assistant 消息都按各自 content 估算
 5. **列类型**：`user_id VARCHAR(64)`、`success TINYINT(1) NOT NULL DEFAULT 1`、`tokens INT NOT NULL DEFAULT 0`
 6. **兼容已部署环境**：末尾追加 `ALTER TABLE messages ADD COLUMN IF NOT EXISTS`（与 agent_ids 一致）
 
@@ -53,8 +66,12 @@
 - 顶部新增 `_estimate_tokens` 函数（L26 附近）：
   ```python
   def _estimate_tokens(content: str) -> int:
-      """按内容长度粗略估算 token 数（deepseek-v4，不追求精确）。"""
-      return len(content) if content else 0
+      """按内容长度估算 token 数（deepseek-v4，中英文分别计系数，粗略估算）。"""
+      if not content:
+          return 0
+      chinese_count = sum(1 for c in content if ord(c) > 127)
+      ascii_count = len(content) - chinese_count
+      return int(chinese_count * 1.5 + ascii_count * 0.25)
   ```
 - 持久化块（L262-279）构造 new_messages 时，user 消息加 `"user_id": user_id, "success": True, "tokens": _estimate_tokens(user_input)`；assistant 消息加 `"user_id": user_id, "success": orchestrator_service.last_success, "tokens": _estimate_tokens(final_output)`
 - 异常时 `orchestrator_service.last_success` 访问失败兜底 `False`

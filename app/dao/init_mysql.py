@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS messages (
     content      TEXT NOT NULL,
     timestamp    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     agent_ids    JSON NULL DEFAULT NULL,
+    user_id      VARCHAR(64) NOT NULL DEFAULT '',
+    success      TINYINT(1) NOT NULL DEFAULT 1,
+    tokens       INT NOT NULL DEFAULT 0,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -76,6 +79,9 @@ CREATE INDEX idx_action_audit_userId ON action_audit(userId);
 -- 兼容已存在表：追加 agent_ids 列（MySQL 8 支持 IF NOT EXISTS）
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS (agent_ids JSON NULL DEFAULT NULL);
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS (agent_ids JSON NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS (user_id VARCHAR(64) NOT NULL DEFAULT '');
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS (success TINYINT(1) NOT NULL DEFAULT 1);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS (tokens INT NOT NULL DEFAULT 0);
 """
 
 
