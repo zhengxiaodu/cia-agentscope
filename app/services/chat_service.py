@@ -21,7 +21,6 @@ from app.config import MODEL_CONFIG_PATH, WORKSPACE_BASEDIR
 from app.services.file_change_detector import snapshot, diff, build_file_meta
 from app.services.langfuse_service import LangfuseService
 from app.intent.llm_client import chat_complete, extract_json
-from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
@@ -170,9 +169,6 @@ async def generate_response(
     3. 透传 SSE 事件，检测 CUSTOM_COMPONENT
     4. 流结束后持久化对话历史 + Langfuse 追踪
     """
-    if not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
-
     # 从 session 加载历史消息，拼接到 messages 前面作为上下文
     history_messages = []
     if session_service and session_id:
