@@ -56,5 +56,6 @@ async def upload_file(
     return UploadResponse(
         code=200,
         msg="success",
+        session_id=session_id,
         data={"datablock": datablock.model_dump()},
     )
