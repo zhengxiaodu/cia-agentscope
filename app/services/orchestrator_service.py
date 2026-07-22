@@ -14,7 +14,8 @@
 """
 import json
 import logging
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from contextlib import contextmanager
+from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional
 
 import yaml
 from fastapi import Request
@@ -57,6 +58,15 @@ _USER_CONFIG_TTL = JWT_EXPIRE_HOURS * 3600  # 与 user_permissions 同 TTL
 
 # 联网搜索技能名（与 skill_config.yml / agent_config.yml 中的 name 一致）
 _SEARCH_SKILL_NAME = "bocha_search"
+
+# 历史上下文保留条数（3 轮 = 6 条 user/assistant 消息），用于截断 AgentState.context
+_HISTORY_KEEP_LAST = 6
+
+
+@contextmanager
+def _noop_ctx() -> Iterator[None]:
+    """空 context manager，langfuse 未启用时作为 start_span 的占位，yield None。"""
+    yield None
 
 
 class OrchestratorService:
@@ -227,6 +237,20 @@ class OrchestratorService:
             if role in ("user", "assistant") and content:
                 history.append({"role": role, "content": content})
         return history
+
+    @staticmethod
+    def _trim_state_context(state_dict: dict, keep_last: int = _HISTORY_KEEP_LAST) -> dict:
+        """截断 AgentState.context 为最后 N 条消息，控制模型输入 token。
+
+        AgentState.context 是完整对话历史 Msg_dict 列表；大模型上下文有限时
+        仅保留最近 keep_last 条（默认 6 = 3 轮）。仅内存截断，不落库。
+        """
+        if not state_dict:
+            return state_dict
+        ctx = state_dict.get("context")
+        if isinstance(ctx, list) and len(ctx) > keep_last:
+            state_dict = {**state_dict, "context": ctx[-keep_last:]}
+        return state_dict
 
     async def _fuse_user_config(
         self, jwt_token: str, permissions: dict
@@ -428,6 +452,7 @@ class OrchestratorService:
         agent_id: Optional[str] = None,
         request: Optional[Request] = None,
         search_enabled: bool = True,
+        langfuse_service: Optional[Any] = None,
     ) -> AsyncGenerator[str, None]:
         """编排主流程：改写 → 识别 → 选择编排器 → 执行。
 
@@ -495,6 +520,8 @@ class OrchestratorService:
                         session_id, agent_id
                     )
                     if state_dict:
+                        # 截断 context 为最近 N 条，控制模型输入 token
+                        state_dict = self._trim_state_context(state_dict)
                         agent_state = AgentState.model_validate(state_dict)
                 except Exception:
                     logger.debug(
@@ -519,38 +546,56 @@ class OrchestratorService:
             apply = None
             final_output_parts = []
 
+            # 环节埋点：单 agent 调用子 span
+            span_ctx = (
+                langfuse_service.start_span(
+                    f"agent-{agent_id}",
+                    input={"intent": intent.id, "query": user_input},
+                )
+                if langfuse_service
+                else _noop_ctx()
+            )
             try:
-                async for event in agent.reply_stream(user_msg):
-                    if isinstance(event, ReplyStartEvent):
-                        apply = AssistantMsg(
-                            name=event.name, content=[], id=event.reply_id
+                with span_ctx as agent_span:
+                    async for event in agent.reply_stream(user_msg):
+                        if isinstance(event, ReplyStartEvent):
+                            apply = AssistantMsg(
+                                name=event.name, content=[], id=event.reply_id
+                            )
+
+                        if isinstance(event, AgentEvent):
+                            if apply:
+                                apply.append_event(event)
+                            yield f"data: {event.model_dump_json()}\n\n"
+
+                    if apply:
+                        text_parts = []
+                        for block in apply.content:
+                            if hasattr(block, "type") and block.type == "text":
+                                text_parts.append(getattr(block, "text", str(block)))
+                        final_output = "\n".join(text_parts).strip()
+                        final_output_parts.append(final_output)
+
+                    # 保存 AgentState
+                    final_state = agent.state.model_dump()
+                    if session_service and session_id and user_id and final_state:
+                        await session_service.save_agent_state(
+                            session_id, user_id, agent_id, final_state,
                         )
 
-                    if isinstance(event, AgentEvent):
-                        if apply:
-                            apply.append_event(event)
-                        yield f"data: {event.model_dump_json()}\n\n"
+                    # 记录本轮参与的 agent_id（供 chat_service 持久化到 messages）
+                    self._last_agent_ids = [agent_id]
+                    # 单 agent 路径执行成功
+                    self._last_success = True
 
-                if apply:
-                    text_parts = []
-                    for block in apply.content:
-                        if hasattr(block, "type") and block.type == "text":
-                            text_parts.append(getattr(block, "text", str(block)))
-                    final_output = "\n".join(text_parts).strip()
-                    final_output_parts.append(final_output)
-
-                # 保存 AgentState
-                final_state = agent.state.model_dump()
-                if session_service and session_id and user_id and final_state:
-                    await session_service.save_agent_state(
-                        session_id, user_id, agent_id, final_state,
-                    )
-
-                # 记录本轮参与的 agent_id（供 chat_service 持久化到 messages）
-                self._last_agent_ids = [agent_id]
-                # 单 agent 路径执行成功
-                self._last_success = True
-
+                    if agent_span:
+                        try:
+                            agent_span.update(output={
+                                "output": final_output_parts[0] if final_output_parts else "",
+                                "success": True,
+                            })
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.exception(
                     f"[OrchestratorService] 单智能体 {agent_id} 执行异常"
@@ -573,11 +618,25 @@ class OrchestratorService:
             return  # 跳过后续改写→识别→编排流程
 
         # ① 查询改写（联系上下文）
-        try:
-            rewritten = await rewriter.rewrite(user_input, history)
-        except Exception:
-            logger.exception("[OrchestratorService] 查询改写失败，使用原始输入")
-            rewritten = user_input
+        rw_ctx = (
+            langfuse_service.start_span(
+                "query-rewrite",
+                input={"original": user_input, "history_len": len(history)},
+            )
+            if langfuse_service
+            else _noop_ctx()
+        )
+        with rw_ctx as rw_span:
+            try:
+                rewritten = await rewriter.rewrite(user_input, history)
+            except Exception:
+                logger.exception("[OrchestratorService] 查询改写失败，使用原始输入")
+                rewritten = user_input
+            if rw_span:
+                try:
+                    rw_span.update(output={"rewritten": rewritten})
+                except Exception:
+                    pass
 
         yield self._event({
             "type": "query_rewritten",
@@ -586,19 +645,40 @@ class OrchestratorService:
         })
 
         # ② 意图识别
-        try:
-            intent_result = await recognizer.recognize(rewritten, history)
-        except Exception:
-            logger.exception(
-                "[OrchestratorService] 意图识别失败，降级为 general_chat"
+        ir_ctx = (
+            langfuse_service.start_span(
+                "intent-recognition",
+                input={"rewritten": rewritten, "history_len": len(history)},
             )
-            intent_result = IntentResult(
-                rewritten_query=rewritten,
-                intents=[
-                    Intent(id="general_chat", query=rewritten, agent="general_agent")
-                ],
-                relation="independent",
-            )
+            if langfuse_service
+            else _noop_ctx()
+        )
+        with ir_ctx as ir_span:
+            try:
+                intent_result = await recognizer.recognize(rewritten, history)
+            except Exception:
+                logger.exception(
+                    "[OrchestratorService] 意图识别失败，降级为 general_chat"
+                )
+                intent_result = IntentResult(
+                    rewritten_query=rewritten,
+                    intents=[
+                        Intent(id="general_chat", query=rewritten, agent="general_agent")
+                    ],
+                    relation="independent",
+                )
+            if ir_span:
+                try:
+                    ir_span.update(output={
+                        "intents": [
+                            {"id": i.id, "agent": i.agent}
+                            for i in intent_result.intents
+                        ],
+                        "relation": intent_result.relation,
+                    })
+                except Exception:
+                    pass
+
         yield self._event({
             "type": "intents_recognized",
             "intents": [
@@ -622,6 +702,8 @@ class OrchestratorService:
                         session_id, aid
                     )
                     if state_dict:
+                        # 截断 context 为最近 N 条，控制模型输入 token
+                        state_dict = self._trim_state_context(state_dict)
                         agent_states[aid] = AgentState.model_validate(state_dict)
                 except Exception:
                     logger.debug(
@@ -635,6 +717,7 @@ class OrchestratorService:
             intent_result,
             session_id=session_id,
             agent_states=agent_states,
+            langfuse_service=langfuse_service,
         ):
             yield event_str
 

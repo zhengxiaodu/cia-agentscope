@@ -7,7 +7,7 @@
 """
 import asyncio
 import logging
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from agentscope.state import AgentState
 
@@ -40,6 +40,7 @@ class PipelineOrchestrator(BaseOrchestrator):
         intent_result: IntentResult,
         session_id: Optional[str] = None,
         agent_states: Optional[Dict[str, AgentState]] = None,
+        langfuse_service: Optional[Any] = None,
     ) -> AsyncGenerator[str, None]:
         """按固定顺序串行执行意图。"""
         intents = intent_result.intents
@@ -77,6 +78,7 @@ class PipelineOrchestrator(BaseOrchestrator):
                         prior_context=prior_context,
                         session_id=session_id,
                         agent_state=agent_state,
+                        langfuse_service=langfuse_service,
                     ):
                         if isinstance(item, TaskResult):
                             result = item
