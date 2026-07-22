@@ -13,7 +13,7 @@
 import asyncio
 import json
 import logging
-from typing import AsyncGenerator, Dict, Optional
+from typing import AsyncGenerator, Dict, Optional, Union
 
 from agentscope.state import AgentState
 
@@ -21,7 +21,7 @@ from openai import AsyncOpenAI
 
 from app.agents.factory import AgentFactory
 from app.intent.models import IntentResult
-from app.orchestrator.base import BaseOrchestrator
+from app.orchestrator.base import BaseOrchestrator, TaskResult
 from app.intent.llm_client import chat_complete, extract_json
 
 logger = logging.getLogger(__name__)
@@ -130,10 +130,16 @@ class ReActOrchestrator(BaseOrchestrator):
                 "thought": thought.get("thought", ""),
             })
 
-            # 执行智能体
-            observation = await self._execute_action(
+            # 执行智能体（实时透传事件 + 提取 observation）
+            observation = ""
+            async for item in self._execute_action(
                 action_name, action_args, intent_result, session_id, agent_states
-            )
+            ):
+                if isinstance(item, TaskResult):
+                    observation = item.output if item.success else f"执行失败: {item.output}"
+                else:
+                    # 实时透传 SSE 事件
+                    yield item
 
             # Observe：追加到 scratch
             step_record = (
@@ -212,10 +218,25 @@ class ReActOrchestrator(BaseOrchestrator):
         intent_result: IntentResult,
         session_id: Optional[str] = None,
         agent_states: Optional[Dict[str, AgentState]] = None,
-    ) -> str:
-        """执行 ReAct 中选定的一步动作。"""
+    ) -> AsyncGenerator[Union[str, "TaskResult"], None]:
+        """执行 ReAct 中选定的一步动作，实时 yield 事件，最后 yield TaskResult。
+
+        约定：最后一定 yield 一个 TaskResult 作为哨兵，其 output 字段即 observation。
+        中间 yield 的 str 为 SSE 事件（实时透传）。
+
+        Yields:
+            str: SSE 事件字符串（实时透传）
+            TaskResult: 哨兵，output 字段作为 observation（调用方据此判断结束）
+        """
         if action_name == "final":
-            return action_args.get("conclusion", "")
+            conclusion = action_args.get("conclusion", "")
+            yield TaskResult(
+                intent_id="react_final",
+                agent_id="",
+                success=True,
+                output=conclusion,
+            )
+            return
 
         if action_name == "call_agent":
             agent_id = action_args.get("agent_id", "general_agent")
@@ -229,13 +250,35 @@ class ReActOrchestrator(BaseOrchestrator):
             )
 
             agent_state = (agent_states or {}).get(agent_id)
-            result = await self._run_single_agent(
+            result = None
+            async for item in self._run_single_agent(
                 intent,
                 session_id=session_id,
                 agent_state=agent_state,
-            )
+            ):
+                if isinstance(item, TaskResult):
+                    result = item
+                else:
+                    # 实时透传 SSE 事件
+                    yield item
+            if result is None:
+                # 理论上不会，兜底
+                yield TaskResult(
+                    intent_id=f"react_{agent_id}",
+                    agent_id=agent_id,
+                    success=False,
+                    output="执行失败: 未获取到结果",
+                )
+                return
             if result.final_state:
                 self._last_results.append(result)
-            return result.output if result.success else f"执行失败: {result.output}"
+            # 最后 yield TaskResult 哨兵（output 即 observation）
+            yield result
+            return
 
-        return f"未知动作: {action_name}"
+        yield TaskResult(
+            intent_id="react_unknown",
+            agent_id="",
+            success=False,
+            output=f"未知动作: {action_name}",
+        )

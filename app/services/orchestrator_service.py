@@ -87,6 +87,8 @@ class OrchestratorService:
         self._last_orchestrator: Optional[Any] = None
         # 最近一次编排参与的 agent_id 列表（供 chat_service 持久化到 messages）
         self._last_agent_ids: List[str] = []
+        # 最近一次编排是否成功（单 agent 路径标志位；多 agent 路径从 _last_results 派生）
+        self._last_success: bool = True
 
     @classmethod
     async def create(
@@ -175,6 +177,18 @@ class OrchestratorService:
         覆盖单 agent 直接问答与多 agent 编排两条路径。
         """
         return list(self._last_agent_ids) if self._last_agent_ids else []
+
+    @property
+    def last_success(self) -> bool:
+        """获取最近一次编排是否全部成功。
+
+        多 agent 路径从 _last_orchestrator._last_results 派生
+        （任一 TaskResult.success=False 则整体 False，即使有 output 返回）；
+        单 agent 路径使用 _last_success 标志位。
+        """
+        if self._last_orchestrator and self._last_orchestrator._last_results:
+            return all(r.success for r in self._last_orchestrator._last_results)
+        return self._last_success
 
     @staticmethod
     def _event(data: dict) -> str:
@@ -534,11 +548,15 @@ class OrchestratorService:
 
                 # 记录本轮参与的 agent_id（供 chat_service 持久化到 messages）
                 self._last_agent_ids = [agent_id]
+                # 单 agent 路径执行成功
+                self._last_success = True
 
             except Exception as e:
                 logger.exception(
                     f"[OrchestratorService] 单智能体 {agent_id} 执行异常"
                 )
+                # 单 agent 路径执行失败
+                self._last_success = False
                 yield self._event({
                     "type": "error",
                     "message": f"执行出错: {str(e)}",
@@ -612,6 +630,7 @@ class OrchestratorService:
 
         # ⑤ 执行编排（内部 yield SSE 事件）
         self._last_agent_ids = []  # 重置，避免上一轮残留
+        self._last_success = True  # 重置
         async for event_str in orchestrator.run(
             intent_result,
             session_id=session_id,

@@ -44,7 +44,7 @@ class ParallelOrchestrator(BaseOrchestrator):
         session_id: Optional[str] = None,
         agent_states: Optional[Dict[str, AgentState]] = None,
     ) -> AsyncGenerator[str, None]:
-        """并行执行所有意图。"""
+        """并行执行所有意图，事件实时交错透传。"""
         intents = intent_result.intents
         agent_states = agent_states or {}
 
@@ -55,12 +55,6 @@ class ParallelOrchestrator(BaseOrchestrator):
             "intent_count": len(intents),
         })
 
-        # ① 并行执行所有意图
-        tasks = [
-            self._run_with_timeout(intent, session_id, agent_states)
-            for intent in intents
-        ]
-
         # 发送各任务启动事件
         for intent in intents:
             yield self._event({
@@ -69,40 +63,73 @@ class ParallelOrchestrator(BaseOrchestrator):
                 "agent_id": intent.agent or "general_agent",
             })
 
-        results: List[TaskResult] = await asyncio.gather(*tasks, return_exceptions=True)
+        # ① 用 asyncio.Queue 汇聚多 agent 事件，实现交错实时透传
+        queue: asyncio.Queue = asyncio.Queue()
+        # 用哨兵 None 标记某个 agent 的流结束
+        SENTINEL = object()
 
-        # 存储结果供后续保存状态用
-        self._last_results = [
-            r for r in results if isinstance(r, TaskResult)
+        async def runner(intent):
+            """单个 agent 的执行协程：把事件/result 推入队列，超时则推失败 result。"""
+            agent_id = intent.agent or "general_agent"
+            agent_state = (agent_states or {}).get(agent_id)
+            try:
+                async with asyncio.timeout(self._timeout):
+                    async for item in self._run_single_agent(
+                        intent, session_id=session_id, agent_state=agent_state,
+                    ):
+                        await queue.put(item)
+            except asyncio.TimeoutError:
+                await queue.put(TaskResult(
+                    intent_id=intent.id,
+                    agent_id=agent_id,
+                    success=False,
+                    output="执行超时",
+                ))
+            except Exception as e:
+                logger.exception(
+                    f"[ParallelOrchestrator] 意图 {intent.id} 执行异常"
+                )
+                await queue.put(TaskResult(
+                    intent_id=intent.id,
+                    agent_id=agent_id,
+                    success=False,
+                    output=f"执行异常: {str(e)}",
+                ))
+            finally:
+                await queue.put(SENTINEL)
+
+        # 启动所有 runner task
+        runner_tasks = [
+            asyncio.create_task(runner(intent)) for intent in intents
         ]
 
-        # ② 回放事件 + 汇总结果
+        # ② 主循环：从 queue 取 item，事件实时 yield，TaskResult 收集 + 发 task_end
+        self._last_results = []
+        finished = 0
+        total = len(intents)
         summary_parts = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.exception(f"[ParallelOrchestrator] 意图 {intents[i].id} 执行异常")
-                result = TaskResult(
-                    intent_id=intents[i].id,
-                    agent_id=intents[i].agent or "general_agent",
-                    success=False,
-                    output=f"执行异常: {str(result)}",
-                )
+        while finished < total:
+            item = await queue.get()
+            if item is SENTINEL:
+                finished += 1
+                continue
+            if isinstance(item, TaskResult):
+                self._last_results.append(item)
+                # 发送任务完成事件
+                yield self._event({
+                    "type": "task_end",
+                    "intent_id": item.intent_id,
+                    "agent_id": item.agent_id,
+                    "success": item.success,
+                })
+                if item.output:
+                    summary_parts.append(item.output)
+            else:
+                # 实时透传 SSE 事件
+                yield item
 
-            # 回放该智能体产生的 SSE 事件
-            for event_str in result.events:
-                yield event_str
-
-            # 发送任务完成事件
-            yield self._event({
-                "type": "task_end",
-                "intent_id": result.intent_id,
-                "agent_id": result.agent_id,
-                "success": result.success,
-            })
-
-            # 收集摘要
-            if result.output:
-                summary_parts.append(result.output)
+        # 等待所有 runner task 结束（消费可能的异常，避免未检索警告）
+        await asyncio.gather(*runner_tasks, return_exceptions=True)
 
         # ③ 汇总事件
         if len(summary_parts) > 1:
@@ -116,17 +143,3 @@ class ParallelOrchestrator(BaseOrchestrator):
                 "type": "summary",
                 "content": summary_parts[0],
             })
-
-    async def _run_with_timeout(
-        self,
-        intent,
-        session_id: Optional[str] = None,
-        agent_states: Optional[Dict[str, AgentState]] = None,
-    ) -> TaskResult:
-        """带超时的智能体执行。"""
-        agent_id = intent.agent or "general_agent"
-        agent_state = (agent_states or {}).get(agent_id)
-        return await asyncio.wait_for(
-            self._run_single_agent(intent, session_id=session_id, agent_state=agent_state),
-            timeout=self._timeout,
-        )

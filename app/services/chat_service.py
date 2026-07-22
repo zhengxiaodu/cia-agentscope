@@ -21,9 +21,20 @@ from app.config import MODEL_CONFIG_PATH, WORKSPACE_BASEDIR
 from app.services.file_change_detector import snapshot, diff, build_file_meta
 from app.services.langfuse_service import LangfuseService
 from app.intent.llm_client import chat_complete, extract_json
-from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
+
+
+def _estimate_tokens(content: str) -> int:
+    """按内容长度估算 token 数（deepseek-v4，中英文分别计系数，粗略估算）。
+
+    经验值：中文 1 字 ≈ 1.5 token，英文 4 字符 ≈ 1 token（0.25/字符）。
+    """
+    if not content:
+        return 0
+    chinese_count = sum(1 for c in content if ord(c) > 127)
+    ascii_count = len(content) - chinese_count
+    return int(chinese_count * 1.5 + ascii_count * 0.25)
 
 
 async def _generate_recommended_questions(
@@ -158,9 +169,6 @@ async def generate_response(
     3. 透传 SSE 事件，检测 CUSTOM_COMPONENT
     4. 流结束后持久化对话历史 + Langfuse 追踪
     """
-    if not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
-
     # 从 session 加载历史消息，拼接到 messages 前面作为上下文
     history_messages = []
     if session_service and session_id:
@@ -264,6 +272,9 @@ async def generate_response(
                 new_messages.append({
                     "role": "user", "content": user_input, "timestamp": now_str,
                     "agent_ids": [],
+                    "user_id": user_id,
+                    "success": True,
+                    "tokens": _estimate_tokens(user_input),
                 })
             if final_output:
                 # 取本轮参与的 agent_id 列表（单 agent 路径=[agent_id]，多 agent 路径=编排汇总）
@@ -273,9 +284,19 @@ async def generate_response(
                         involved_agent_ids = orchestrator_service.last_agent_ids
                     except Exception:
                         involved_agent_ids = []
+                # 取本轮编排是否成功（基于 TaskResult.success，异常/超时/失败为 False）
+                last_success = True
+                if orchestrator_service is not None:
+                    try:
+                        last_success = orchestrator_service.last_success
+                    except Exception:
+                        last_success = False
                 new_messages.append({
                     "role": "assistant", "content": final_output, "timestamp": now_str,
                     "agent_ids": involved_agent_ids,
+                    "user_id": user_id,
+                    "success": last_success,
+                    "tokens": _estimate_tokens(final_output),
                 })
             if new_messages:
                 await session_service.append_messages(

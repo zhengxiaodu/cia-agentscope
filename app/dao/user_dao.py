@@ -98,7 +98,7 @@ async def verify_login_via_mng(username: str, password: str) -> dict:
             data = body.get("data", {}) or {}
             return {
                 "verification": True,
-                "user_info": data.get("user", {}),
+                "user_info": data.get("user_info", {}),
                 "permissions": data.get("permissions", {}),
             }
     except Exception as e:
@@ -282,13 +282,13 @@ async def update_password_via_mng(jwt_token: str, old_password: str, new_passwor
 
 
 async def notify_mng_active(jwt_token: str) -> None:
-    """向 mng 上报用户活跃（POST /api/me/active）。
+    """向 mng 上报用户活跃（POST /api/auth/me/active）。
 
     异步 fire-and-forget，所有异常仅记日志，不抛出。
     """
     if not MNG_AUTH_URL or not jwt_token:
         return
-    url = f"{MNG_AUTH_URL}/api/me/active"
+    url = f"{MNG_AUTH_URL}/api/auth/me/active"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(

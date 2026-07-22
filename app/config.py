@@ -51,6 +51,7 @@ UPLOAD_ALLOWED_MEDIA_TYPES = [
     "application/pdf",
     "text/plain",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # docx
+    "application/msword",  # doc
     "text/csv",  # csv
     "application/vnd.ms-excel",  # xls
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # xlsx
@@ -79,3 +80,7 @@ WORKSPACE_CLEANUP_INTERVAL_HOURS = int(os.getenv("WORKSPACE_CLEANUP_INTERVAL_HOU
 EXTERNAL_SKILLS_DIR = os.getenv("EXTERNAL_SKILLS_DIR", "")
 RAGFLOW_API_KEY = os.getenv("RAGFLOW_API_KEY", "")
 RAGFLOW_BASE_URL = os.getenv("RAGFLOW_BASE_URL", "")
+
+# MinerU 文档解析配置（鉴权头为 x-api-key，非 Authorization）
+MINERU_API_KEY = os.getenv("MINERU_API_KEY", "")
+MINERU_BASE_URL = os.getenv("MINERU_BASE_URL", "")

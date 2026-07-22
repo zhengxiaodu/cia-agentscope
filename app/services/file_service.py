@@ -16,10 +16,8 @@ class FileService:
         content: bytes,
         media_type: str,
     ) -> DataBlock:
-        if session_id:
-            data_dir = Path(self.workdir) / "data" / session_id
-        else:
-            data_dir = Path(self.workdir) / "data"
+        
+        data_dir = Path(self.workdir) / "data"
 
         data_dir.mkdir(parents=True, exist_ok=True)
 

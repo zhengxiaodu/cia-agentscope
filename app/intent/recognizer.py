@@ -185,4 +185,4 @@ class IntentRecognizer:
             "related_fixed": self._default_orchestration.get("multi_related_fixed", "pipeline"),
             "related_dynamic": self._default_orchestration.get("multi_related_dynamic", "react"),
         }
-        return mapping.get(result.relation, "parallel")
+        return mapping.get(result.relation, "pipeline")

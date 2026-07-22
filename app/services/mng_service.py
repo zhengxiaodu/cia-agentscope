@@ -51,7 +51,7 @@ async def fetch_external_intents(jwt_token: str) -> List[dict]:
 
     url = f"{MNG_INTENT_URL}{_MNG_INTENTS_PATH}"
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             resp = await client.get(
                 url,
                 headers={"Authorization": f"Bearer {jwt_token}"},

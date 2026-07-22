@@ -2,7 +2,7 @@
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -53,14 +53,18 @@ class BaseOrchestrator(ABC):
         prior_context: str = "",
         session_id: Optional[str] = None,
         agent_state: Optional[AgentState] = None,
-    ) -> TaskResult:
-        """执行单个智能体，收集所有 SSE 事件。
+    ) -> AsyncGenerator[Union[str, "TaskResult"], None]:
+        """执行单个智能体，实时 yield SSE 事件，最后 yield TaskResult。
 
         Args:
             intent: 要执行的意图
             prior_context: 前置步骤的输出（流水线模式中使用）
             session_id: 会话 id
             agent_state: 已恢复的 AgentState（多轮上下文），为 None 则新建
+
+        Yields:
+            str: SSE 事件字符串（实时透传，形如 "data: {...}\\n\\n"）
+            TaskResult: 最后一个 yield，含 output/final_state/success（events 留空）
         """
         agent_id = intent.agent or "general_agent"
         agent = self.agent_factory.create_for_agent(
@@ -69,12 +73,13 @@ class BaseOrchestrator(ABC):
             agent_state=agent_state,
         )
         if agent is None:
-            return TaskResult(
+            yield TaskResult(
                 intent_id=intent.id,
                 agent_id=agent_id,
                 success=False,
                 output=f"无法创建智能体 {agent_id}",
             )
+            return
 
         # 构建用户消息：如有前置上下文，附加在前
         user_content = intent.query
@@ -94,8 +99,8 @@ class BaseOrchestrator(ABC):
                 if isinstance(event, AgentEvent):
                     if apply:
                         apply.append_event(event)
-                    # 收集事件用于回放
-                    result.events.append(f"data: {event.model_dump_json()}\n\n")
+                    # 实时透传事件给上层
+                    yield f"data: {event.model_dump_json()}\n\n"
 
             # 提取文本输出
             if apply:
@@ -114,7 +119,7 @@ class BaseOrchestrator(ABC):
             result.success = False
             result.output = f"执行出错: {str(e)}"
 
-        return result
+        yield result
 
     @abstractmethod
     async def run(

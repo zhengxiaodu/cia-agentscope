@@ -68,25 +68,29 @@ class PipelineOrchestrator(BaseOrchestrator):
             agent_id = intent.agent or "general_agent"
             agent_state = agent_states.get(agent_id)
 
-            # 执行当前步骤
+            # 执行当前步骤（实时透传事件 + 超时控制）
+            result = None
             try:
-                result = await asyncio.wait_for(
-                    self._run_single_agent(
+                async with asyncio.timeout(self._step_timeout):
+                    async for item in self._run_single_agent(
                         intent,
                         prior_context=prior_context,
                         session_id=session_id,
                         agent_state=agent_state,
-                    ),
-                    timeout=self._step_timeout,
-                )
+                    ):
+                        if isinstance(item, TaskResult):
+                            result = item
+                        else:
+                            # 实时透传 SSE 事件
+                            yield item
             except asyncio.TimeoutError:
                 result = self._make_timeout_result(intent)
 
-            self._last_results.append(result)
+            # 若未拿到 result（理论上不会），兜底
+            if result is None:
+                result = self._make_timeout_result(intent)
 
-            # 回放 SSE 事件
-            for event_str in result.events:
-                yield event_str
+            self._last_results.append(result)
 
             # 发送任务完成事件
             yield self._event({
