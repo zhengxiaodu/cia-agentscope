@@ -115,7 +115,7 @@ class PipelineOrchestrator(BaseOrchestrator):
                 return
 
             # 传递输出给下一步
-            prior_context += f"\n[步骤{i + 1} {intent.id} 的输出]\n{result.output}"
+            prior_context = f"\n{result.output}"
 
         # 流水线全部完成
         yield self._event({
