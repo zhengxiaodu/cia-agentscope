@@ -69,6 +69,16 @@ def _noop_ctx() -> Iterator[None]:
     yield None
 
 
+def _safe_update_span(span: Any, output_dict: dict) -> None:
+    """安全更新 span 的 output 字段，span 为 None 或更新异常均静默忽略。"""
+    if not span:
+        return
+    try:
+        span.update(output=output_dict)
+    except Exception:
+        pass
+
+
 class OrchestratorService:
     """编排服务：持有不可变资源，每次 run() 动态构建请求级组件。
 
@@ -462,6 +472,167 @@ class OrchestratorService:
 
         return registry, agent_factory, rewriter, recognizer
 
+    def _span(self, langfuse_service: Any, name: str, input_dict: dict) -> Any:
+        """统一 span 创建：启用 langfuse 时启动子 span，否则返回空 context manager。
+
+        返回一个 context manager，with ... as span 使用；span 可能为 None。
+        """
+        if langfuse_service:
+            return langfuse_service.start_span(name, input=input_dict)
+        return _noop_ctx()
+
+    async def _load_agent_state(
+        self,
+        session_service: Any,
+        session_id: Optional[str],
+        agent_id: str,
+    ) -> Optional[AgentState]:
+        """加载单个 agent 的 AgentState：从 session_service 读取 + trim 截断 + 异常兜底。
+
+        session_service 为空或读取失败均返回 None（调用方创建新状态）。
+        """
+        if not (session_service and session_id):
+            return None
+        try:
+            state_dict = await session_service.load_agent_state(session_id, agent_id)
+            if state_dict:
+                # 截断 context 为最近 N 条，控制模型输入 token
+                state_dict = self._trim_state_context(state_dict)
+                return AgentState.model_validate(state_dict)
+        except Exception:
+            logger.debug(
+                f"[OrchestratorService] 无法加载 {agent_id} 状态，将新建"
+            )
+        return None
+
+    async def _persist_agent_state(
+        self,
+        session_service: Any,
+        session_id: Optional[str],
+        user_id: Optional[str],
+        agent_id: str,
+        state_dict: dict,
+    ) -> None:
+        """保存单个 agent 的 AgentState（带非空校验与异常兜底）。"""
+        if not (session_service and session_id and user_id and state_dict):
+            return
+        try:
+            await session_service.save_agent_state(
+                session_id, user_id, agent_id, state_dict,
+            )
+        except Exception:
+            logger.exception(
+                f"[OrchestratorService] 保存 agent {agent_id} 状态失败"
+            )
+
+    async def _run_single_agent_path(
+        self,
+        registry: AgentRegistry,
+        agent_factory: AgentFactory,
+        agent_id: str,
+        user_input: str,
+        session_id: Optional[str],
+        user_id: Optional[str],
+        session_service: Any,
+        langfuse_service: Any,
+    ) -> AsyncGenerator[str, None]:
+        """单 agent 直接问答全流程：校验 → 加载状态 → 创建 → span 内流式执行 → 存状态 → 记标志 → yield summary。
+
+        跳过改写/识别/编排，直接由指定 agent 回答。
+        """
+        yield self._event({
+            "type": "orchestration_start",
+            "mode": "direct",
+            "agent_id": agent_id,
+        })
+
+        # 校验 agent_id 是否存在
+        definition = registry.get_definition(agent_id)
+        if not definition:
+            yield self._event({
+                "type": "error",
+                "message": f"agent_id '{agent_id}' 不存在",
+            })
+            return
+
+        intent = Intent(id=f"direct_{agent_id}", query=user_input, agent=agent_id)
+
+        # 加载已有 AgentState
+        agent_state = await self._load_agent_state(session_service, session_id, agent_id)
+
+        # 创建 agent 实例
+        agent = agent_factory.create_for_agent(
+            agent_id=agent_id,
+            session_id=session_id,
+            agent_state=agent_state,
+        )
+        if agent is None:
+            yield self._event({
+                "type": "error",
+                "message": f"无法创建智能体 '{agent_id}'",
+            })
+            return
+
+        # 执行单 agent 对话（span 内流式执行）
+        user_msg = UserMsg(name="user", content=user_input)
+        apply = None
+        final_output_parts: List[str] = []
+
+        with self._span(
+            langfuse_service,
+            f"agent-{agent_id}",
+            {"intent": intent.id, "query": user_input},
+        ) as agent_span:
+            try:
+                async for event in agent.reply_stream(user_msg):
+                    if isinstance(event, ReplyStartEvent):
+                        apply = AssistantMsg(
+                            name=event.name, content=[], id=event.reply_id
+                        )
+                    if isinstance(event, AgentEvent):
+                        if apply:
+                            apply.append_event(event)
+                        yield f"data: {event.model_dump_json()}\n\n"
+
+                if apply:
+                    text_parts = []
+                    for block in apply.content:
+                        if hasattr(block, "type") and block.type == "text":
+                            text_parts.append(getattr(block, "text", str(block)))
+                    final_output_parts.append("\n".join(text_parts).strip())
+
+                # 保存 AgentState
+                final_state = agent.state.model_dump()
+                await self._persist_agent_state(
+                    session_service, session_id, user_id, agent_id, final_state,
+                )
+
+                # 记录本轮参与的 agent_id + 成功标志
+                self._last_agent_ids = [agent_id]
+                self._last_success = True
+
+                _safe_update_span(agent_span, {
+                    "output": final_output_parts[0] if final_output_parts else "",
+                    "success": True,
+                })
+            except Exception as e:
+                logger.exception(
+                    f"[OrchestratorService] 单智能体 {agent_id} 执行异常"
+                )
+                self._last_success = False
+                yield self._event({
+                    "type": "error",
+                    "message": f"执行出错: {str(e)}",
+                })
+                return
+
+        # yield summary 事件
+        if final_output_parts:
+            yield self._event({
+                "type": "summary",
+                "content": final_output_parts[0],
+            })
+
     async def run(
         self,
         messages: List[Dict[str, Any]],
@@ -498,7 +669,7 @@ class OrchestratorService:
             yield self._event({"type": "error", "message": "未检测到有效用户输入"})
             return
 
-        # ===== 动态构建请求级组件（配置加载到内存 + 外部意图合并） =====
+        # ① 装配请求级组件（配置加载 + workspace 获取/创建，含 workspace 埋点）
         redis_client = None
         if request is not None:
             redis_client = getattr(request.app.state, "redis_client", None)
@@ -513,150 +684,26 @@ class OrchestratorService:
             )
         )
 
-        # ========== 单智能体直接问答路径（跳过改写→识别→编排） ==========
+        # ② 单 agent 短路路径（跳过改写→识别→编排，直接由指定 agent 回答）
         if agent_id:
-            yield self._event({
-                "type": "orchestration_start",
-                "mode": "direct",
-                "agent_id": agent_id,
-            })
+            async for ev in self._run_single_agent_path(
+                registry, agent_factory, agent_id, user_input,
+                session_id, user_id, session_service, langfuse_service,
+            ):
+                yield ev
+            return
 
-            # 校验 agent_id 是否存在（从内存中的 registry 查找）
-            definition = registry.get_definition(agent_id)
-            if not definition:
-                yield self._event({
-                    "type": "error",
-                    "message": f"agent_id '{agent_id}' 不存在",
-                })
-                return
-
-            intent = Intent(id=f"direct_{agent_id}", query=user_input, agent=agent_id)
-
-            # 加载已有 AgentState
-            agent_state = None
-            if session_service and session_id and user_id:
-                try:
-                    state_dict = await session_service.load_agent_state(
-                        session_id, agent_id
-                    )
-                    if state_dict:
-                        # 截断 context 为最近 N 条，控制模型输入 token
-                        state_dict = self._trim_state_context(state_dict)
-                        agent_state = AgentState.model_validate(state_dict)
-                except Exception:
-                    logger.debug(
-                        f"[OrchestratorService] 无法加载 {agent_id} 状态，将新建"
-                    )
-
-            # 创建 agent 实例
-            agent = agent_factory.create_for_agent(
-                agent_id=agent_id,
-                session_id=session_id,
-                agent_state=agent_state,
-            )
-            if agent is None:
-                yield self._event({
-                    "type": "error",
-                    "message": f"无法创建智能体 '{agent_id}'",
-                })
-                return
-
-            # 执行单 agent 对话
-            user_msg = UserMsg(name="user", content=user_input)
-            apply = None
-            final_output_parts = []
-
-            # 环节埋点：单 agent 调用子 span
-            span_ctx = (
-                langfuse_service.start_span(
-                    f"agent-{agent_id}",
-                    input={"intent": intent.id, "query": user_input},
-                )
-                if langfuse_service
-                else _noop_ctx()
-            )
-            try:
-                with span_ctx as agent_span:
-                    async for event in agent.reply_stream(user_msg):
-                        if isinstance(event, ReplyStartEvent):
-                            apply = AssistantMsg(
-                                name=event.name, content=[], id=event.reply_id
-                            )
-
-                        if isinstance(event, AgentEvent):
-                            if apply:
-                                apply.append_event(event)
-                            yield f"data: {event.model_dump_json()}\n\n"
-
-                    if apply:
-                        text_parts = []
-                        for block in apply.content:
-                            if hasattr(block, "type") and block.type == "text":
-                                text_parts.append(getattr(block, "text", str(block)))
-                        final_output = "\n".join(text_parts).strip()
-                        final_output_parts.append(final_output)
-
-                    # 保存 AgentState
-                    final_state = agent.state.model_dump()
-                    if session_service and session_id and user_id and final_state:
-                        await session_service.save_agent_state(
-                            session_id, user_id, agent_id, final_state,
-                        )
-
-                    # 记录本轮参与的 agent_id（供 chat_service 持久化到 messages）
-                    self._last_agent_ids = [agent_id]
-                    # 单 agent 路径执行成功
-                    self._last_success = True
-
-                    if agent_span:
-                        try:
-                            agent_span.update(output={
-                                "output": final_output_parts[0] if final_output_parts else "",
-                                "success": True,
-                            })
-                        except Exception:
-                            pass
-            except Exception as e:
-                logger.exception(
-                    f"[OrchestratorService] 单智能体 {agent_id} 执行异常"
-                )
-                # 单 agent 路径执行失败
-                self._last_success = False
-                yield self._event({
-                    "type": "error",
-                    "message": f"执行出错: {str(e)}",
-                })
-                return
-
-            # yield summary 事件
-            if final_output_parts:
-                yield self._event({
-                    "type": "summary",
-                    "content": final_output_parts[0],
-                })
-
-            return  # 跳过后续改写→识别→编排流程
-
-        # ① 查询改写（联系上下文）
-        rw_ctx = (
-            langfuse_service.start_span(
-                "query-rewrite",
-                input={"original": user_input, "history_len": len(history)},
-            )
-            if langfuse_service
-            else _noop_ctx()
-        )
-        with rw_ctx as rw_span:
+        # ③ 查询改写（联系上下文，失败降级为原始输入）
+        with self._span(
+            langfuse_service, "query-rewrite",
+            {"original": user_input, "history_len": len(history)},
+        ) as rw_span:
             try:
                 rewritten = await rewriter.rewrite(user_input, history)
             except Exception:
                 logger.exception("[OrchestratorService] 查询改写失败，使用原始输入")
                 rewritten = user_input
-            if rw_span:
-                try:
-                    rw_span.update(output={"rewritten": rewritten})
-                except Exception:
-                    pass
+            _safe_update_span(rw_span, {"rewritten": rewritten})
 
         yield self._event({
             "type": "query_rewritten",
@@ -664,16 +711,11 @@ class OrchestratorService:
             "rewritten": rewritten,
         })
 
-        # ② 意图识别
-        ir_ctx = (
-            langfuse_service.start_span(
-                "intent-recognition",
-                input={"rewritten": rewritten, "history_len": len(history)},
-            )
-            if langfuse_service
-            else _noop_ctx()
-        )
-        with ir_ctx as ir_span:
+        # ④ 意图识别（失败降级为 general_chat）
+        with self._span(
+            langfuse_service, "intent-recognition",
+            {"rewritten": rewritten, "history_len": len(history)},
+        ) as ir_span:
             try:
                 intent_result = await recognizer.recognize(rewritten, history)
             except Exception:
@@ -687,17 +729,13 @@ class OrchestratorService:
                     ],
                     relation="independent",
                 )
-            if ir_span:
-                try:
-                    ir_span.update(output={
-                        "intents": [
-                            {"id": i.id, "agent": i.agent}
-                            for i in intent_result.intents
-                        ],
-                        "relation": intent_result.relation,
-                    })
-                except Exception:
-                    pass
+            _safe_update_span(ir_span, {
+                "intents": [
+                    {"id": i.id, "agent": i.agent}
+                    for i in intent_result.intents
+                ],
+                "relation": intent_result.relation,
+            })
 
         yield self._event({
             "type": "intents_recognized",
@@ -708,29 +746,18 @@ class OrchestratorService:
             "relation": intent_result.relation,
         })
 
-        # ③ 选择编排器
+        # ⑤ 选择编排器并加载各 agent 状态
         mode = recognizer.get_orchestration_mode(intent_result)
         orchestrator = self._create_orchestrator(mode, agent_factory)
 
-        # ④ 加载已有 AgentState（按 agent_id 逐个加载）
         agent_states: Dict[str, AgentState] = {}
-        if session_service and session_id and user_id:
-            for intent in intent_result.intents:
-                aid = intent.agent or "general_agent"
-                try:
-                    state_dict = await session_service.load_agent_state(
-                        session_id, aid
-                    )
-                    if state_dict:
-                        # 截断 context 为最近 N 条，控制模型输入 token
-                        state_dict = self._trim_state_context(state_dict)
-                        agent_states[aid] = AgentState.model_validate(state_dict)
-                except Exception:
-                    logger.debug(
-                        f"[OrchestratorService] 无法加载 {aid} 状态，将新建"
-                    )
+        for intent in intent_result.intents:
+            aid = intent.agent or "general_agent"
+            agent_states[aid] = await self._load_agent_state(
+                session_service, session_id, aid,
+            )
 
-        # ⑤ 执行编排（内部 yield SSE 事件）
+        # ⑥ 执行编排（内部实时 yield SSE 事件）
         self._last_agent_ids = []  # 重置，避免上一轮残留
         self._last_success = True  # 重置
         async for event_str in orchestrator.run(
@@ -741,22 +768,14 @@ class OrchestratorService:
         ):
             yield event_str
 
-        # ⑥ 保存编排结果引用（供外部提取 agent states）
+        # ⑦ 保存编排结果引用 + 持久化各 agent 状态
         self._last_orchestrator = orchestrator
         # 汇总本轮编排参与的 agent_id 列表（去重保序）
         self._last_agent_ids = list(dict.fromkeys(
             r.agent_id for r in orchestrator._last_results if r.agent_id
         ))
-
-        # ⑦ 持久化所有 AgentState
-        if session_service and session_id and user_id:
-            for r in orchestrator._last_results:
-                if r.final_state:
-                    try:
-                        await session_service.save_agent_state(
-                            session_id, user_id, r.agent_id, r.final_state,
-                        )
-                    except Exception:
-                        logger.exception(
-                            f"[OrchestratorService] 保存 agent {r.agent_id} 状态失败"
-                        )
+        for r in orchestrator._last_results:
+            if r.final_state:
+                await self._persist_agent_state(
+                    session_service, session_id, user_id, r.agent_id, r.final_state,
+                )
