@@ -411,11 +411,19 @@ class OrchestratorService:
         with ws_ctx as ws_span:
             workspace = await self._workspace_manager.get_workspace(user_id_safe, session_id_safe)
             if workspace is None:
-                workspace = await self._workspace_manager.create_workspace(
-                    user_id=user_id_safe,
-                    session_id=session_id_safe,
-                    skill_dirs=all_skill_dirs,
-                )
+                # 首次创建：单独记录 initialize 耗时（create_workspace 内部仅首次分支调 ws.initialize()）
+                with self._span(
+                    langfuse_service, "workspace-initialize",
+                    {"user_id": user_id_safe, "session_id": session_id_safe},
+                ) as init_span:
+                    workspace = await self._workspace_manager.create_workspace(
+                        user_id=user_id_safe,
+                        session_id=session_id_safe,
+                        skill_dirs=all_skill_dirs,
+                    )
+                    _safe_update_span(init_span, {
+                        "workspace_id": getattr(workspace, "workspace_id", None),
+                    })
             if ws_span:
                 try:
                     ws_span.update(output={
@@ -459,6 +467,7 @@ class OrchestratorService:
             client=self._intent_client,
             model_config=self._intent_model_cfg,
             recognition_prompt=self._prompts.get("intent_recognition", ""),
+            orchestration_prompt=self._prompts.get("intent_orchestration", ""),
             intent_configs=intent_configs,
             default_orchestration=default_orchestration,
         )
@@ -711,32 +720,52 @@ class OrchestratorService:
             "rewritten": rewritten,
         })
 
-        # ④ 意图识别（失败降级为 general_chat）
+        # ④ 意图识别（第一次 LLM，失败降级为 general_chat）
+        yield self._event({
+            "type": "intent_step", "phase": "recognition", "status": "started",
+            "message": "正在识别意图...",
+        })
         with self._span(
             langfuse_service, "intent-recognition",
-            {"rewritten": rewritten, "history_len": len(history)},
-        ) as ir_span:
+            {"query": rewritten, "history_len": len(history)},
+        ) as rec_span:
             try:
-                intent_result = await recognizer.recognize(rewritten, history)
+                intents = await recognizer.recognize_intents(rewritten, history)
             except Exception:
-                logger.exception(
-                    "[OrchestratorService] 意图识别失败，降级为 general_chat"
-                )
-                intent_result = IntentResult(
-                    rewritten_query=rewritten,
-                    intents=[
-                        Intent(id="general_chat", query=rewritten, agent="general_agent")
-                    ],
-                    relation="independent",
-                )
-            _safe_update_span(ir_span, {
-                "intents": [
-                    {"id": i.id, "agent": i.agent}
-                    for i in intent_result.intents
-                ],
-                "relation": intent_result.relation,
+                logger.exception("[OrchestratorService] 意图识别失败，降级为 general_chat")
+                intents = [Intent(id="general_chat", query=rewritten, agent="general_agent")]
+            _safe_update_span(rec_span, {
+                "intents": [{"id": i.id, "agent": i.agent} for i in intents],
             })
+        yield self._event({
+            "type": "intent_step", "phase": "recognition", "status": "done",
+            "intents": [{"id": i.id, "query": i.query, "agent": i.agent} for i in intents],
+        })
 
+        # ⑤ 意图编排（第二次 LLM，失败降级为 independent）
+        yield self._event({
+            "type": "intent_step", "phase": "orchestration", "status": "started",
+            "message": "正在决策编排策略...",
+        })
+        with self._span(
+            langfuse_service, "intent-orchestration",
+            {"intents_count": len(intents)},
+        ) as orch_span:
+            try:
+                relation, execution_order = await recognizer.plan_orchestration(rewritten, intents)
+            except Exception:
+                logger.exception("[OrchestratorService] 意图编排失败，降级为 independent")
+                relation, execution_order = "independent", []
+            _safe_update_span(orch_span, {
+                "relation": relation, "execution_order": execution_order,
+            })
+        # 按 execution_order 重排 intents（校验长度一致才应用，否则按原顺序）
+        if execution_order and len(execution_order) == len(intents):
+            intents = [intents[i] for i in execution_order]
+        intent_result = IntentResult(
+            rewritten_query=rewritten, intents=intents,
+            relation=relation, execution_order=execution_order,
+        )
         yield self._event({
             "type": "intents_recognized",
             "intents": [
@@ -746,7 +775,7 @@ class OrchestratorService:
             "relation": intent_result.relation,
         })
 
-        # ⑤ 选择编排器并加载各 agent 状态
+        # ⑥ 选择编排器并加载各 agent 状态
         mode = recognizer.get_orchestration_mode(intent_result)
         orchestrator = self._create_orchestrator(mode, agent_factory)
 
