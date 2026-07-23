@@ -17,25 +17,8 @@ from agentscope.state import AgentState
 from agentscope.tool import Toolkit
 
 from app.agents.base import AgentDefinition
-from agentscope.middleware import MiddlewareBase
 
 logger = logging.getLogger(__name__)
-
-class ChatTemplateKwargsMiddleware(MiddlewareBase):
-    """注入 chat_template_kwargs 到请求体"""
-    
-    def __init__(self, enable_thinking: bool = False):
-        self.enable_thinking = enable_thinking
-    
-    async def on_model_call(self, agent, input_kwargs, next_handler):
-        input_kwargs["extra_body"] = {
-            "chat_template_kwargs": {
-                "enable_thinking": self.enable_thinking,
-                "thinking": self.enable_thinking
-            },
-        }
-        return await next_handler(**input_kwargs)
-
 
 def load_agent_definitions(config_path: str) -> List[AgentDefinition]:
     """从 agent_config.yml 加载所有智能体定义。"""
@@ -153,7 +136,6 @@ class AgentRegistry:
             model=model,
             toolkit=toolkit,
             state=agent_state,
-            offloader=self._workspace,
-            middlewares=[ChatTemplateKwargsMiddleware(enable_thinking=False)],
+            offloader=self._workspace
         )
         return agent
