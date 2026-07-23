@@ -9,7 +9,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from agentscope.workspace import DockerWorkspace
 
@@ -68,7 +68,8 @@ class DockerWorkspaceManager:
             await self._evict_locked(wid)
 
     async def create_workspace(
-        self, user_id: str, session_id: str, skill_dirs: list[str]
+        self, user_id: str, session_id: str, skill_dirs: list[str],
+        langfuse_service: Optional[Any] = None,
     ) -> DockerWorkspace:
         wid = self._workspace_id(user_id)
         lock = await self._get_lock(wid)
@@ -103,7 +104,22 @@ class DockerWorkspaceManager:
                 skill_paths=valid or None,
                 default_mcps=[],
             )
-            await ws.initialize()
+            # 首次创建需拉起 Docker 容器（耗时），单独埋点 ws.initialize()
+            if langfuse_service:
+                with langfuse_service.start_span(
+                    "workspace-initialize",
+                    input={"user_id": user_id, "session_id": session_id},
+                ) as init_span:
+                    await ws.initialize()
+                    if init_span:
+                        try:
+                            init_span.update(output={
+                                "workspace_id": getattr(ws, "workspace_id", None),
+                            })
+                        except Exception:
+                            pass
+            else:
+                await ws.initialize()
             ws.workdir = session_dir
             self._cache[wid] = _Entry(ws, user_id, session_ids={session_id})
             logger.info(f"[workspace_manager] 创建工作区 wid={wid} skills={len(valid)}")

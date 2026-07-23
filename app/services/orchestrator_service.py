@@ -411,19 +411,13 @@ class OrchestratorService:
         with ws_ctx as ws_span:
             workspace = await self._workspace_manager.get_workspace(user_id_safe, session_id_safe)
             if workspace is None:
-                # 首次创建：单独记录 initialize 耗时（create_workspace 内部仅首次分支调 ws.initialize()）
-                with self._span(
-                    langfuse_service, "workspace-initialize",
-                    {"user_id": user_id_safe, "session_id": session_id_safe},
-                ) as init_span:
-                    workspace = await self._workspace_manager.create_workspace(
-                        user_id=user_id_safe,
-                        session_id=session_id_safe,
-                        skill_dirs=all_skill_dirs,
-                    )
-                    _safe_update_span(init_span, {
-                        "workspace_id": getattr(workspace, "workspace_id", None),
-                    })
+                # 首次创建：create_workspace 内部会在 ws.initialize() 处单独记录 workspace-initialize 子 span
+                workspace = await self._workspace_manager.create_workspace(
+                    user_id=user_id_safe,
+                    session_id=session_id_safe,
+                    skill_dirs=all_skill_dirs,
+                    langfuse_service=langfuse_service,
+                )
             if ws_span:
                 try:
                     ws_span.update(output={
