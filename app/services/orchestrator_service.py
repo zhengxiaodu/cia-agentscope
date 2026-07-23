@@ -348,6 +348,7 @@ class OrchestratorService:
         redis_client,
         session_id: Optional[str] = None,
         search_enabled: bool = True,
+        langfuse_service: Optional[Any] = None,
     ) -> tuple:
         """会话时构建临时组件：读 Redis 缓存（步骤 1-4 的产物）+ 步骤 5-8。
 
@@ -387,13 +388,31 @@ class OrchestratorService:
         all_skill_dirs = [s["directory"] for s in merged_skills]
         user_id_safe = user_id or "anonymous"
         session_id_safe = session_id or f"ephemeral-{user_id_safe}"
-        workspace = await self._workspace_manager.get_workspace(user_id_safe, session_id_safe)
-        if workspace is None:
-            workspace = await self._workspace_manager.create_workspace(
-                user_id=user_id_safe,
-                session_id=session_id_safe,
-                skill_dirs=all_skill_dirs,
+
+        # 环节埋点：工作区获取/创建子 span
+        ws_ctx = (
+            langfuse_service.start_span(
+                "workspace-load",
+                input={"user_id": user_id_safe, "session_id": session_id_safe},
             )
+            if langfuse_service
+            else _noop_ctx()
+        )
+        with ws_ctx as ws_span:
+            workspace = await self._workspace_manager.get_workspace(user_id_safe, session_id_safe)
+            if workspace is None:
+                workspace = await self._workspace_manager.create_workspace(
+                    user_id=user_id_safe,
+                    session_id=session_id_safe,
+                    skill_dirs=all_skill_dirs,
+                )
+            if ws_span:
+                try:
+                    ws_span.update(output={
+                        "workspace_id": getattr(workspace, "workspace_id", None),
+                    })
+                except Exception:
+                    pass
             
         from tools.chart_tools import render_bar_chart,render_line_chart,render_pie_chart,render_generic_card,render_metric_card,render_confirm_action,render_indicator_table,render_selectable_list
         from agentscope.tool import FunctionTool
@@ -490,6 +509,7 @@ class OrchestratorService:
                 redis_client=redis_client,
                 session_id=session_id,
                 search_enabled=search_enabled,
+                langfuse_service=langfuse_service,
             )
         )
 
