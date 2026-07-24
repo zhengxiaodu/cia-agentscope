@@ -35,10 +35,12 @@ router = APIRouter()
 _OPTIONAL_SKILLS = [
     {
         "name": "mineru",
+        "nickname": "文档解析",
         "description": "MinerU 文档解析技能，将用户上传的 pdf/docx/doc/表格/图片解析为 Markdown，适用于提取、总结、问答文档内容。",
     },
     {
         "name": "chart_renderer",
+        "nickname": "可视化图表",
         "description": "智能图表渲染技能，根据数据特征自动选择最合适的图表类型并通过工具渲染。",
     },
 ]
