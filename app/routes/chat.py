@@ -45,6 +45,7 @@ async def chat(request: Request, body: ChatRequest, user: dict = Depends(current
             agent_id=body.agent_id,
             request=request,
             search_enabled=body.search_enabled,
+            skills=body.skills,
         ):
             yield event
 

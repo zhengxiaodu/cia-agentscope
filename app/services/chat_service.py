@@ -371,6 +371,7 @@ async def generate_response(
     agent_id: Optional[str] = None,
     request=None,
     search_enabled: bool = True,
+    skills: List[str] = None,
 ) -> AsyncGenerator[str, None]:
     """根据消息列表生成流式回复（多智能体编排版本）。
 
@@ -412,6 +413,7 @@ async def generate_response(
             agent_id=agent_id,
             request=request,
             search_enabled=search_enabled,
+            skills=skills or [],
             langfuse_service=langfuse_service,
         ):
             yield event_str

@@ -41,6 +41,7 @@ class AgentRegistry:
         all_tools: list,
         all_skills_meta: list,
         create_model_fn,
+        extra_skill_names: Optional[List[str]] = None,
     ):
         """
         Args:
@@ -50,12 +51,16 @@ class AgentRegistry:
             all_skills_meta: 工作区内全部 skill 元信息
             create_model_fn: 工厂函数，签名 create_model_fn() -> OpenAIChatModel，
                              每次调用返回新的模型实例（流式模型不可复用）
+            extra_skill_names: 请求级附加技能名，union 到每个 agent 的绑定技能
+                               （无论该 agent 是否绑定该技能，都会组装进其 Toolkit）
         """
         self._defs: Dict[str, AgentDefinition] = {d.id: d for d in definitions}
         self._workspace = workspace
         self._all_tools = all_tools
         self._all_skills_meta = all_skills_meta
         self._create_model_fn = create_model_fn
+        # 请求级附加技能：组装 Toolkit 时与 agent 自身绑定技能取并集
+        self._extra_skill_names = set(extra_skill_names or [])
         # 缓存每个智能体对应的 Toolkit（按 skill 子集组装），避免重复筛选
         self._toolkits: Dict[str, Toolkit] = {}
 
@@ -69,16 +74,17 @@ class AgentRegistry:
     def _build_toolkit_for(self, definition: AgentDefinition) -> Toolkit:
         """根据智能体绑定的 skill 列表，筛选工具子集组装 Toolkit。
 
-        无 skill 的智能体（如 general_agent）返回空 Toolkit，即纯对话无工具。
+        有效绑定技能 = agent 自身绑定技能 ∪ 请求级附加技能（extra_skill_names）。
+        无任何绑定技能时返回空 Toolkit，即纯对话无工具。
         """
-        if not definition.skills:
+        # 有效绑定技能 = agent 自身绑定 ∪ 请求级附加技能
+        bound_skill_names = set(definition.skills) | self._extra_skill_names
+        if not bound_skill_names:
             return Toolkit(tools=[], skills_or_loaders=[])
-
-        # 按 skill name 匹配元信息，筛选对应工具
-        bound_skill_names = set(definition.skills)
 
         # 从 skill 元信息中筛选出绑定的 skill loader
         bound_loaders = []
+        matched_names = set()
         for meta in self._all_skills_meta:
             # skill 元信息通常含 name 字段
             meta_name = getattr(meta, "name", None) or (
@@ -86,6 +92,14 @@ class AgentRegistry:
             )
             if meta_name in bound_skill_names:
                 bound_loaders.append(meta)
+                matched_names.add(meta_name)
+
+        # 请求了但 workspace 未装载的技能 → 记 warning 跳过
+        missing = bound_skill_names - matched_names
+        if missing:
+            logger.warning(
+                f"[AgentRegistry] 技能未在 workspace 装载，已跳过: {sorted(missing)}"
+            )
 
         return Toolkit(tools=self._all_tools, skills_or_loaders=bound_loaders)
 

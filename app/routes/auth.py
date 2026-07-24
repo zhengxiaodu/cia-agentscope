@@ -31,6 +31,9 @@ from app.config import JWT_EXPIRE_HOURS, JWT_REFRESH_EXPIRE_DAYS
 
 router = APIRouter()
 
+# 可选技能（前端据此渲染技能开关；目前写死两个内置技能）
+_OPTIONAL_SKILLS = ["mineru", "chart_renderer"]
+
 
 def success_response(data: Any) -> Dict[str, Any]:
     return {"code": 200, "msg": "success", "data": data}
@@ -104,6 +107,7 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
         "user_info": user_info,
         "agent_access": permissions["agent_whitelist"],
         "skill_blacklist": permissions["skill_blacklist"],
+        "optional_skills": _OPTIONAL_SKILLS,
     })
 
 
@@ -178,6 +182,7 @@ async def _build_update_response(request: Request, user: dict, updates: dict) ->
         "user_info": user_info,
         "agent_access": permissions.get("agent_whitelist", []),
         "skill_blacklist": permissions.get("skill_blacklist", []),
+        "optional_skills": _OPTIONAL_SKILLS,
     })
 
 
@@ -250,4 +255,5 @@ async def refresh_token(request: Request, body: RefreshRequest):
         "user_info": user_info,
         "agent_access": permissions.get("agent_whitelist", []),
         "skill_blacklist": permissions.get("skill_blacklist", []),
+        "optional_skills": _OPTIONAL_SKILLS,
     })

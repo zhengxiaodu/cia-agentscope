@@ -359,6 +359,7 @@ class OrchestratorService:
         session_id: Optional[str] = None,
         search_enabled: bool = True,
         langfuse_service: Optional[Any] = None,
+        skills: Optional[List[str]] = None,
     ) -> tuple:
         """会话时构建临时组件：读 Redis 缓存（步骤 1-4 的产物）+ 步骤 5-8。
 
@@ -451,6 +452,7 @@ class OrchestratorService:
             all_tools=all_tools,
             all_skills_meta=all_skills_meta,
             create_model_fn=self._create_model_fn,
+            extra_skill_names=skills or [],
         )
         agent_factory = AgentFactory(registry)
 
@@ -646,6 +648,7 @@ class OrchestratorService:
         request: Optional[Request] = None,
         search_enabled: bool = True,
         langfuse_service: Optional[Any] = None,
+        skills: Optional[List[str]] = None,
     ) -> AsyncGenerator[str, None]:
         """编排主流程：改写 → 识别 → 选择编排器 → 执行。
 
@@ -684,6 +687,7 @@ class OrchestratorService:
                 session_id=session_id,
                 search_enabled=search_enabled,
                 langfuse_service=langfuse_service,
+                skills=skills or [],
             )
         )
 
