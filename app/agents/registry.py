@@ -146,7 +146,7 @@ class AgentRegistry:
 
         agent = Agent(
             name=definition.name,
-            system_prompt=definition.system_prompt + f"\n注意你当前只能在{self._workspace.workdir} 目录下读/写/编辑文件，绝不允许操作目录以外的文件!",
+            system_prompt=definition.system_prompt + f"\n注意当前工作区目录是{self._workspace.workdir}，用户所有附件（如果有）已上传到该目录下，你只能在该目录下读/写/编辑文件，绝不允许操作目录以外的文件！！",
             model=model,
             toolkit=toolkit,
             state=agent_state,
