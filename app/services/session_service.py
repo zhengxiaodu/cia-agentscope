@@ -14,7 +14,7 @@ class SessionService:
 
     async def get_or_create_session(self, session_id: Optional[str], user_id: str) -> str:
         """获取已有 session_id 或创建新会话。"""
-        if session_id and await self.dao.session_exists(session_id):
+        if session_id:
             return session_id
         return uuid.uuid4().hex
 
