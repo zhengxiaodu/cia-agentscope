@@ -429,9 +429,10 @@ class OrchestratorService:
             
         from tools.chart_tools import render_bar_chart,render_line_chart,render_pie_chart,render_generic_card,render_metric_card,render_confirm_action,render_indicator_table,render_selectable_list
         from agentscope.tool import FunctionTool
+        from tools.mineru_tools import mineru_parse_tool
         all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep(),FunctionTool(render_pie_chart),FunctionTool(render_bar_chart),
                      FunctionTool(render_line_chart),FunctionTool(render_generic_card),FunctionTool(render_metric_card),
-                     FunctionTool(render_confirm_action),FunctionTool(render_indicator_table),FunctionTool(render_selectable_list)]
+                     FunctionTool(render_confirm_action),FunctionTool(render_indicator_table),FunctionTool(render_selectable_list),mineru_parse_tool]
         
         all_skills_meta = await workspace.list_skills()
 
