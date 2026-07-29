@@ -447,13 +447,22 @@ class OrchestratorService:
 
         # ---- 6. 构建临时注册表 ----
         agent_defs = [AgentDefinition(**a) for a in merged_agents]
+
+        # 请求级附加技能：用户请求 skills ∪（search_enabled 时追加 bocha_search）
+        # bocha_search 追加到 extra 后会 union 到每个 agent；
+        # search_enabled=False 时 all_skills_meta 已移除 bocha_search，
+        # extra 中的声明匹配不到 loader 自动失效，行为不变
+        extra_skills = list(skills or [])
+        if search_enabled:
+            extra_skills.append(_SEARCH_SKILL_NAME)
+
         registry = AgentRegistry(
             definitions=agent_defs,
             workspace=workspace,
             all_tools=all_tools,
             all_skills_meta=all_skills_meta,
             create_model_fn=self._create_model_fn,
-            extra_skill_names=skills or [],
+            extra_skill_names=extra_skills,
         )
         agent_factory = AgentFactory(registry)
 
