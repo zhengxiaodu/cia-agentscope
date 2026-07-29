@@ -381,6 +381,10 @@ async def generate_response(
     history_messages = await _load_history_messages(session_service, session_id)
     full_messages = history_messages + messages
     final_output_parts: List[str] = []
+    # 兜底输出：当无 summary 时（如 pipeline 失败终止、react 无 action 终止），
+    # 用 pipeline_intercept.message / react_final.conclusion 作为 final_output，
+    # 保证失败轮次也能持久化 assistant 消息
+    final_fallback_parts: List[str] = []
 
     # ② 快照工作目录（用于结束后检测新文件）
     before_files: set = set()
@@ -427,6 +431,12 @@ async def generate_response(
                     if event_type == "summary":
                         final_output_parts.append(payload.get("content", ""))
 
+                    # 兜底收集失败终止事件的文本（仅当无 summary 时才启用）
+                    if event_type == "pipeline_intercept":
+                        final_fallback_parts.append(payload.get("message", ""))
+                    elif event_type == "react_final":
+                        final_fallback_parts.append(payload.get("conclusion", ""))
+
                     if event_type == "TOOL_RESULT_TEXT_DELTA":
                         delta = payload.get("delta", "")
                         for component in _extract_components_from_delta(delta):
@@ -435,6 +445,9 @@ async def generate_response(
                 logger.debug("[chat_service] 事件解析跳过", exc_info=True)
 
         final_output = "\n".join(final_output_parts).strip()
+        # 无 summary 时用失败终止事件文本兜底，保证失败轮次也有 assistant 记录
+        if not final_output:
+            final_output = "\n".join(p for p in final_fallback_parts if p).strip()
 
         # ⑤ 编排流结束立即生成推荐问题（前置，让前端尽快拿到）
         async for ev in _emit_recommended_questions(
