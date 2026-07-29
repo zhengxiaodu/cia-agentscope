@@ -27,10 +27,20 @@ class _Entry:
 
 
 class DockerWorkspaceManager:
-    def __init__(self, base_image: str, basedir: str, ttl: float):
+    def __init__(
+        self,
+        base_image: str,
+        basedir: str,
+        ttl: float,
+        pip_index_url: str = "",
+        pip_trusted_host: str = "",
+    ):
         self._base_image = base_image
         self._basedir = basedir
         self._ttl = ttl
+        # Python 包安装源（为空则不设置容器 env）
+        self._pip_index_url = pip_index_url
+        self._pip_trusted_host = pip_trusted_host
         self._cache: dict[str, _Entry] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._struct_lock = asyncio.Lock()
@@ -98,12 +108,20 @@ class DockerWorkspaceManager:
                     valid.append(d)
                 else:
                     logger.warning(f"[workspace_manager] 技能目录不存在，跳过: {d}")
-            ws = DockerWorkspace(
-                base_image=self._base_image,
-                workdir=session_dir,
-                skill_paths=valid or None,
-                default_mcps=[],
-            )
+            ws_kwargs = {
+                "base_image": self._base_image,
+                "workdir": session_dir,
+                "skill_paths": valid or None,
+                "default_mcps": [],
+            }
+            # 配置了 pip 源时注入容器环境变量（UV_INDEX_URL / PIP_INDEX_URL / PIP_TRUSTED_HOST）
+            if self._pip_index_url:
+                ws_kwargs["env"] = {
+                    "UV_INDEX_URL": self._pip_index_url,
+                    "PIP_INDEX_URL": self._pip_index_url,
+                    "PIP_TRUSTED_HOST": self._pip_trusted_host,
+                }
+            ws = DockerWorkspace(**ws_kwargs)
             # 首次创建需拉起 Docker 容器（耗时），单独埋点 ws.initialize()
             if langfuse_service:
                 with langfuse_service.start_span(
