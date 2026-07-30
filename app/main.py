@@ -1,4 +1,5 @@
 import os
+import asyncio
 import uvicorn
 import redis.asyncio as aioredis
 import aiomysql
@@ -111,6 +112,9 @@ async def lifespan(app: FastAPI):
         print("Langfuse service initialized")
     else:
         print("Langfuse service disabled (credentials not configured)")
+
+    # 会话取消标志注册表：session_id → asyncio.Event（/chat/stop 触发 set，生成器检测后中断）
+    app.state.chat_tasks: dict[str, asyncio.Event] = {}
 
     yield
 

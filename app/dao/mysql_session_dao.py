@@ -311,6 +311,29 @@ class SessionDAO:
                 )
                 await conn.commit()
 
+    async def mark_last_assistant_failed(
+        self, session_id: str, user_id: str
+    ) -> None:
+        """把该会话最新一条 assistant 消息的 success 强制置 0（用户中断时调用）。
+
+        _persist_conversation_history 内部读 orchestrator_service.last_success
+        （单例属性，并发会话会互相污染，中断时不可信），故落库后补此 UPDATE 保证正确。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "UPDATE messages SET success = 0 "
+                    "WHERE session_id = %s AND user_id = %s AND role = 'assistant' "
+                    "AND timestamp = ("
+                    "  SELECT max_ts FROM ("
+                    "    SELECT MAX(timestamp) AS max_ts FROM messages "
+                    "    WHERE session_id = %s AND user_id = %s AND role = 'assistant'"
+                    "  ) AS t"
+                    ")",
+                    (session_id, user_id, session_id, user_id),
+                )
+                await conn.commit()
+
     # ================================================================
     # Session 元信息
     # ================================================================

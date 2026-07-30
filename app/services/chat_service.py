@@ -10,6 +10,7 @@
 import json
 import logging
 import os
+import asyncio
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional
@@ -372,11 +373,17 @@ async def generate_response(
     request=None,
     search_enabled: bool = True,
     skills: List[str] = None,
+    cancel_event: Optional[asyncio.Event] = None,
 ) -> AsyncGenerator[str, None]:
     """根据消息列表生成流式回复（多智能体编排版本）。
 
     主流程：加载历史 → 快照 → 根span → 执行编排 → 推荐问题 → 持久化 → 文件检测 → trace收尾。
+    中断处理：cancel_event 被 set 时主动 raise CancelledError，进入 finally 保证
+    落库（success=False）+ flush trace + yield user_abort 事件。
     """
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     # ① 加载历史（限 3 轮）并合并当前输入
     history_messages = await _load_history_messages(session_service, session_id)
     full_messages = history_messages + messages
@@ -385,6 +392,8 @@ async def generate_response(
     # 用 pipeline_intercept.message / react_final.conclusion 作为 final_output，
     # 保证失败轮次也能持久化 assistant 消息
     final_fallback_parts: List[str] = []
+    final_output = ""
+    aborted = False
 
     # ② 快照工作目录（用于结束后检测新文件）
     before_files: set = set()
@@ -407,71 +416,106 @@ async def generate_response(
         if langfuse_service and langfuse_service.enabled
         else _noop_ctx()
     )
-    with root_span_ctx as root_obs:
-        # ④ 执行编排主流程，实时透传 SSE 事件
-        async for event_str in orchestrator_service.run(
-            full_messages,
-            session_id=session_id,
-            user_id=user_id,
-            session_service=session_service,
-            agent_id=agent_id,
-            request=request,
-            search_enabled=search_enabled,
-            skills=skills or [],
-            langfuse_service=langfuse_service,
-        ):
-            yield event_str
+    root_obs = None
+    try:
+        with root_span_ctx as root_obs:
+            # ④ 执行编排主流程，实时透传 SSE 事件
+            async for event_str in orchestrator_service.run(
+                full_messages,
+                session_id=session_id,
+                user_id=user_id,
+                session_service=session_service,
+                agent_id=agent_id,
+                request=request,
+                search_enabled=search_enabled,
+                skills=skills or [],
+                langfuse_service=langfuse_service,
+            ):
+                # 取消检查点：每个事件之间检测一次（LLM chunk 之间会回到本循环）
+                if _cancelled():
+                    aborted = True
+                    raise asyncio.CancelledError()
+                yield event_str
 
-            # 解析事件：提取 summary 收集输出 + 检测 CUSTOM_COMPONENT 并转发
-            try:
-                if event_str.startswith("data: ") and event_str.endswith("\n\n"):
-                    payload = json.loads(event_str[6:].strip())
-                    event_type = payload.get("type", "")
+                # 解析事件：提取 summary 收集输出 + 检测 CUSTOM_COMPONENT 并转发
+                try:
+                    if event_str.startswith("data: ") and event_str.endswith("\n\n"):
+                        payload = json.loads(event_str[6:].strip())
+                        event_type = payload.get("type", "")
 
-                    if event_type == "summary":
-                        final_output_parts.append(payload.get("content", ""))
+                        if event_type == "summary":
+                            final_output_parts.append(payload.get("content", ""))
 
-                    # 兜底收集失败终止事件的文本（仅当无 summary 时才启用）
-                    if event_type == "pipeline_intercept":
-                        final_fallback_parts.append(payload.get("message", ""))
-                    elif event_type == "react_final":
-                        final_fallback_parts.append(payload.get("conclusion", ""))
+                        # 兜底收集失败终止事件的文本（仅当无 summary 时才启用）
+                        if event_type == "pipeline_intercept":
+                            final_fallback_parts.append(payload.get("message", ""))
+                        elif event_type == "react_final":
+                            final_fallback_parts.append(payload.get("conclusion", ""))
 
-                    if event_type == "TOOL_RESULT_TEXT_DELTA":
-                        delta = payload.get("delta", "")
-                        for component in _extract_components_from_delta(delta):
-                            yield f"data: {json.dumps(component, ensure_ascii=False)}\n\n"
-            except Exception:
-                logger.debug("[chat_service] 事件解析跳过", exc_info=True)
+                        if event_type == "TOOL_RESULT_TEXT_DELTA":
+                            delta = payload.get("delta", "")
+                            for component in _extract_components_from_delta(delta):
+                                yield f"data: {json.dumps(component, ensure_ascii=False)}\n\n"
+                except Exception:
+                    logger.debug("[chat_service] 事件解析跳过", exc_info=True)
 
-        final_output = "\n".join(final_output_parts).strip()
-        # 无 summary 时用失败终止事件文本兜底，保证失败轮次也有 assistant 记录
-        if not final_output:
-            final_output = "\n".join(p for p in final_fallback_parts if p).strip()
+            final_output = "\n".join(final_output_parts).strip()
+            # 无 summary 时用失败终止事件文本兜底，保证失败轮次也有 assistant 记录
+            if not final_output:
+                final_output = "\n".join(p for p in final_fallback_parts if p).strip()
 
-        # ⑤ 编排流结束立即生成推荐问题（前置，让前端尽快拿到）
-        async for ev in _emit_recommended_questions(
-            orchestrator_service, messages, final_output, langfuse_service,
-        ):
+            # 编排流结束后的取消检查（避免后续步骤继续执行）
+            if _cancelled():
+                aborted = True
+                raise asyncio.CancelledError()
+
+            # ⑤ 编排流结束立即生成推荐问题（前置，让前端尽快拿到）
+            async for ev in _emit_recommended_questions(
+                orchestrator_service, messages, final_output, langfuse_service,
+            ):
+                yield ev
+
+            # ⑥ 持久化对话历史（用户输入 + 智能体输出）
+            await _persist_conversation_history(
+                orchestrator_service, session_service, session_id, user_id,
+                messages, final_output,
+            )
+
+            # ⑦ 检测本轮新文件
+            async for ev in _detect_and_emit_files(session_id, before_files, session_service):
+                yield ev
+
+            # 更新根 span 输出（context manager 退出时自动 end）
+            _safe_update_span(root_obs, {
+                "reply": final_output,
+                "session_id": session_id,
+                "user_id": user_id,
+            })
+    except asyncio.CancelledError:
+        # 中断时吞掉 CancelledError，进入 finally 做清理（不重新 raise，让流优雅结束）
+        aborted = True
+        logger.info(f"[chat_service] 会话被用户中断 session={session_id}")
+    finally:
+        # 中断时也落库：success 强制 False（绕开单例 last_success 污染）
+        if aborted:
+            if not final_output:
+                final_output = "\n".join(p for p in final_fallback_parts if p).strip()
+            await _persist_conversation_history(
+                orchestrator_service, session_service, session_id, user_id,
+                messages, final_output,
+            )
+            # _persist 内部读 orchestrator_service.last_success（单例，不可信），补 UPDATE 强制失败
+            if session_service and session_id and user_id:
+                try:
+                    await session_service.mark_last_assistant_failed(session_id, user_id)
+                except Exception:
+                    logger.warning("[chat_service] 标记中断消息失败状态失败", exc_info=True)
+
+        # ⑧ trace 收尾（保证 span 已 end + flush）
+        async for ev in _finalize_trace(langfuse_service, root_obs, session_service, session_id):
             yield ev
 
-        # ⑥ 持久化对话历史（用户输入 + 智能体输出）
-        await _persist_conversation_history(
-            orchestrator_service, session_service, session_id, user_id,
-            messages, final_output,
-        )
-
-        # ⑦ 检测本轮新文件
-        async for ev in _detect_and_emit_files(session_id, before_files, session_service):
-            yield ev
-
-        # 更新根 span 输出（context manager 退出时自动 end）
-        _safe_update_span(root_obs, {
-            "reply": final_output,
-            "session_id": session_id,
-            "user_id": user_id,
-        })
-
-    # ⑧ trace 收尾（with 外，保证 span 已 end）
-    async for ev in _finalize_trace(langfuse_service, root_obs, session_service, session_id):
-        yield ev
+        # 中断时给前端发送 user_abort 事件
+        if aborted:
+            abort_event = {"type": "user_abort", "session_id": session_id, "message": "用户已停止"}
+            yield f"data: {json.dumps(abort_event, ensure_ascii=False)}\n\n"
