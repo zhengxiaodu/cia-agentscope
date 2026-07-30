@@ -13,7 +13,7 @@
 import asyncio
 import json
 import logging
-from typing import AsyncGenerator, Dict, Optional, Union
+from typing import Any, AsyncGenerator, Dict, Optional, Union
 
 from agentscope.state import AgentState
 
@@ -70,6 +70,7 @@ class ReActOrchestrator(BaseOrchestrator):
         intent_result: IntentResult,
         session_id: Optional[str] = None,
         agent_states: Optional[Dict[str, AgentState]] = None,
+        langfuse_service: Optional[Any] = None,
     ) -> AsyncGenerator[str, None]:
         """执行 ReAct 循环。"""
         yield self._event({
@@ -133,7 +134,8 @@ class ReActOrchestrator(BaseOrchestrator):
             # 执行智能体（实时透传事件 + 提取 observation）
             observation = ""
             async for item in self._execute_action(
-                action_name, action_args, intent_result, session_id, agent_states
+                action_name, action_args, intent_result, session_id, agent_states,
+                langfuse_service,
             ):
                 if isinstance(item, TaskResult):
                     observation = item.output if item.success else f"执行失败: {item.output}"
@@ -218,6 +220,7 @@ class ReActOrchestrator(BaseOrchestrator):
         intent_result: IntentResult,
         session_id: Optional[str] = None,
         agent_states: Optional[Dict[str, AgentState]] = None,
+        langfuse_service: Optional[Any] = None,
     ) -> AsyncGenerator[Union[str, "TaskResult"], None]:
         """执行 ReAct 中选定的一步动作，实时 yield 事件，最后 yield TaskResult。
 
@@ -255,6 +258,7 @@ class ReActOrchestrator(BaseOrchestrator):
                 intent,
                 session_id=session_id,
                 agent_state=agent_state,
+                langfuse_service=langfuse_service,
             ):
                 if isinstance(item, TaskResult):
                     result = item

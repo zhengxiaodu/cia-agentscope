@@ -9,7 +9,7 @@
 import asyncio
 import json
 import logging
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from agentscope.state import AgentState
 
@@ -43,6 +43,7 @@ class ParallelOrchestrator(BaseOrchestrator):
         intent_result: IntentResult,
         session_id: Optional[str] = None,
         agent_states: Optional[Dict[str, AgentState]] = None,
+        langfuse_service: Optional[Any] = None,
     ) -> AsyncGenerator[str, None]:
         """并行执行所有意图，事件实时交错透传。"""
         intents = intent_result.intents
@@ -76,6 +77,7 @@ class ParallelOrchestrator(BaseOrchestrator):
                 async with asyncio.timeout(self._timeout):
                     async for item in self._run_single_agent(
                         intent, session_id=session_id, agent_state=agent_state,
+                        langfuse_service=langfuse_service,
                     ):
                         await queue.put(item)
             except asyncio.TimeoutError:

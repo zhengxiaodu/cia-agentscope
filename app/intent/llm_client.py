@@ -52,6 +52,7 @@ async def chat_complete(
         ],
         temperature=parameters.get("temperature", 0.1),
         max_tokens=parameters.get("max_tokens", 1024),
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}}
     )
     return response.choices[0].message.content or ""
 

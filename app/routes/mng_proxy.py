@@ -25,7 +25,7 @@ async def proxy_card_configs(request: Request, user: dict = Depends(current_user
     jwt_token = await _get_jwt_from_header(request)
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            f"{MNG_INTENT_URL}/api/presentation/cards",
+            f"{MNG_INTENT_URL}/api/presentation/cards/all",
             headers={"Authorization": f"Bearer {jwt_token}"},
         )
         return resp.json()
@@ -38,7 +38,7 @@ async def proxy_custom_component_configs(request: Request, user: dict = Depends(
     jwt_token = await _get_jwt_from_header(request)
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            f"{MNG_INTENT_URL}/api/presentation/custom-components",
+            f"{MNG_INTENT_URL}/api/presentation/custom-components/all",
             headers={"Authorization": f"Bearer {jwt_token}"},
         )
         return resp.json()

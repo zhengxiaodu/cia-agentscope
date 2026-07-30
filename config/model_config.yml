@@ -53,7 +53,7 @@ prompts:
     4. 保持原意，不要扩展或新增用户未表达的需求
     5. 仅输出改写后的查询文本，不要任何解释
 
-  # 意图识别 prompt：输出严格 JSON
+  # 意图识别 prompt：输出严格 JSON，只识别 intents 列表，不决策关系
   # 占位符：{{intents}} 可识别意图列表，{{history}} 历史上下文摘要
   intent_recognition: |
     你是多意图识别引擎。请分析【用户输入】，联系【历史上下文】，识别其中包含的意图。
@@ -65,19 +65,36 @@ prompts:
     1. 一条用户输入可能包含多个独立意图（如"查一下新闻，再画个图"），需全部识别
     2. 每个意图必须从清单中选择一个 id，不可臆造
     3. 若用户输入含义模糊无法匹配任何意图，归为 general_chat
-    4. 判断意图间的关系：
-       - independent: 各意图互不依赖，可独立并行执行
-       - related_fixed: 意图间有固定先后依赖（如必须先查数据才能画图），需要调整意图顺序，让先发生的意图排在列表前面（intents[{查数据的意图},{画图的意图}]）
-       - related_dynamic: 意图间依赖需根据中间结果动态决策下一步
-    5. 每个意图提取对应的子查询 query（针对该意图的具体执行输入）
+    4. 每个意图提取对应的子查询 query（针对该意图的具体执行输入）
 
     【输出格式】严格输出如下 JSON，不要包含 markdown 代码块标记、不要任何解释文字：
     {
       "intents": [
         {"id": "意图id", "query": "该意图对应的子查询"}
-      ],
-      "relation": "independent | related_fixed | related_dynamic"
+      ]
     }
+
+  # 意图编排 prompt：基于已识别的 intents 列表，决策关系与执行顺序
+  # 占位符：{{intents_list}} 已识别的意图列表（含索引）
+  intent_orchestration: |
+    你是意图编排决策引擎。请基于【用户输入】和已识别的【意图列表】，决策意图间的关系与执行顺序。
+
+    【意图列表】
+    {{intents_list}}
+
+    【关系类型】
+    - independent: 各意图互不依赖，可独立并行执行
+    - related_fixed: 意图间有固定先后依赖（如必须先查数据才能画图），需给出执行顺序
+    - related_dynamic: 意图间依赖需根据中间结果动态决策
+
+    【决策规则】
+    1. 单意图直接 independent，execution_order 为空数组
+    2. 多意图判断是否有依赖关系；无依赖则 independent，execution_order 为空数组
+    3. 若 related_fixed，需给出执行顺序 execution_order（意图列表的 0-based 索引排列，先执行的索引排前面）
+    4. 若 related_dynamic，execution_order 为空数组（由 ReAct 动态决策）
+
+    【输出格式】严格 JSON，不要 markdown 标记：
+    {"relation": "independent | related_fixed | related_dynamic", "execution_order": [0,1,2]}
 
   # ReAct 推理 prompt：思维链每一步的决策
   # 占位符：{{task}} 任务描述，{{scratch}} 已有的推理链，{{available_actions}} 可用动作

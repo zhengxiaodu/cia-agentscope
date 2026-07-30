@@ -76,6 +76,10 @@ WORKSPACE_TTL = float(os.getenv("WORKSPACE_TTL", "3600"))
 WORKSPACE_RETENTION_DAYS = int(os.getenv("WORKSPACE_RETENTION_DAYS", "7"))
 WORKSPACE_CLEANUP_INTERVAL_HOURS = int(os.getenv("WORKSPACE_CLEANUP_INTERVAL_HOURS", "24"))
 
+# Python 包安装源（为空则不设置容器 env）
+PIP_INDEX_URL = os.getenv("PIP_INDEX_URL", "")
+PIP_TRUSTED_HOST = os.getenv("PIP_TRUSTED_HOST", "")
+
 # 外部技能目录
 EXTERNAL_SKILLS_DIR = os.getenv("EXTERNAL_SKILLS_DIR", "")
 RAGFLOW_API_KEY = os.getenv("RAGFLOW_API_KEY", "")

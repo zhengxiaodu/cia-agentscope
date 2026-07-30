@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 
 import httpx
+from agentscope.message import TextBlock
 from agentscope.tool import FunctionTool, ToolChunk
 
 from app.config import MINERU_API_KEY, MINERU_BASE_URL
@@ -57,9 +58,9 @@ async def mineru_parse(
     """
     # 1. 配置校验
     if not MINERU_API_KEY:
-        return ToolChunk(text="错误：未配置 MINERU_API_KEY，请在 .env 中设置。")
+        return ToolChunk(content=[TextBlock(text="错误：未配置 MINERU_API_KEY，请在 .env 中设置。")], is_last=True)
     if not MINERU_BASE_URL:
-        return ToolChunk(text="错误：未配置 MINERU_BASE_URL，请在 .env 中设置。")
+        return ToolChunk(content=[TextBlock(text="错误：未配置 MINERU_BASE_URL，请在 .env 中设置。")], is_last=True)
 
     # 关键：x-api-key，非 Authorization
     headers = {"x-api-key": MINERU_API_KEY}
@@ -69,9 +70,9 @@ async def mineru_parse(
     try:
         local_path = _normalize_file_path(file_path)
     except ValueError as e:
-        return ToolChunk(text=f"错误：{e}")
+        return ToolChunk(content=[TextBlock(text=f"错误：{e}")], is_last=True)
     if not os.path.isfile(local_path):
-        return ToolChunk(text=f"错误：文件不存在：{local_path}")
+        return ToolChunk(content=[TextBlock(text=f"错误：文件不存在：{local_path}")], is_last=True)
 
     ext = Path(local_path).suffix.lower()
     if ext not in SUPPORTED_EXTENSIONS:
@@ -89,11 +90,12 @@ async def mineru_parse(
                 )
             if resp.status_code != 201:
                 return ToolChunk(
-                    text=f"MinerU 提交失败: HTTP {resp.status_code} - {resp.text}"
+                    content=[TextBlock(text=f"MinerU 提交失败: HTTP {resp.status_code} - {resp.text}")],
+                    is_last=True,
                 )
             task_id = resp.json().get("id")
             if not task_id:
-                return ToolChunk(text=f"MinerU 提交响应缺少 task id: {resp.text}")
+                return ToolChunk(content=[TextBlock(text=f"MinerU 提交响应缺少 task id: {resp.text}")], is_last=True)
             logger.info(
                 f"[mineru] 任务已提交: {task_id} ({os.path.basename(local_path)})"
             )
@@ -108,7 +110,8 @@ async def mineru_parse(
                 )
                 if r.status_code != 200:
                     return ToolChunk(
-                        text=f"MinerU 轮询失败: HTTP {r.status_code} - {r.text}"
+                        content=[TextBlock(text=f"MinerU 轮询失败: HTTP {r.status_code} - {r.text}")],
+                        is_last=True,
                     )
                 data = r.json()
                 status = data.get("status")
@@ -118,26 +121,28 @@ async def mineru_parse(
                     if not md:
                         # 兜底：result 为空时回传原始结构摘要
                         return ToolChunk(
-                            text=f"MinerU 解析完成但 md_content 为空，原始结果: {data}"
+                            content=[TextBlock(text=f"MinerU 解析完成但 md_content 为空，原始结果: {data}")],
+                            is_last=True,
                         )
-                    return ToolChunk(text=md)
+                    return ToolChunk(content=[TextBlock(text=md)], is_last=True)
                 if status == "failed":
                     err = data.get("error_message", "未知错误")
-                    return ToolChunk(text=f"MinerU 任务失败: {err}")
+                    return ToolChunk(content=[TextBlock(text=f"MinerU 任务失败: {err}")], is_last=True)
                 # pending / running → 继续等
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
 
         return ToolChunk(
-            text=f"MinerU 任务超时：{task_id} 在 {timeout}s 内未完成。"
+            content=[TextBlock(text=f"MinerU 任务超时：{task_id} 在 {timeout}s 内未完成。")],
+            is_last=True,
         )
 
     except httpx.HTTPError as e:
         logger.exception("[mineru] HTTP 请求异常")
-        return ToolChunk(text=f"MinerU 网络异常: {e}")
+        return ToolChunk(content=[TextBlock(text=f"MinerU 网络异常: {e}")], is_last=True)
     except Exception as e:
         logger.exception("[mineru] 解析异常")
-        return ToolChunk(text=f"MinerU 解析异常: {e}")
+        return ToolChunk(content=[TextBlock(text=f"MinerU 解析异常: {e}")], is_last=True)
 
 
 # 模块级 FunctionTool 包装（同 ragflow_retrieval 范式）

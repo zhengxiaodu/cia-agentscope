@@ -197,7 +197,7 @@ def merge_external_into_memory(
 
         agent_code = selected_agent.get("id", "")
         agent_name = selected_agent.get("name", "")
-        agent_prompt = selected_agent.get("prompt", "") or ""
+        agent_prompt = selected_agent.get("system_prompt", "") or ""
 
         # 解析该意图关联的 skills
         skills_data = ext.get("skills", [])

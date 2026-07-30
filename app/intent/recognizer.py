@@ -1,7 +1,7 @@
-"""意图识别器：LLM 单次调用输出结构化 JSON，联系上下文做多意图识别。"""
+"""意图识别器：两次 LLM 调用——先识别 intents 列表，再决策关系与执行顺序。"""
 import json
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 from openai import AsyncOpenAI
@@ -19,12 +19,12 @@ def load_intent_config(config_path: str) -> dict:
 
 
 class IntentRecognizer:
-    """意图识别引擎。
+    """意图识别引擎（两次 LLM 调用）。
 
-    根据【历史上下文 + 用户输入】，调用 LLM 一次输出结构化 JSON，
-    从 intent_config.yml 定义的意图清单中匹配，识别多意图及关系。
+    第一次：recognize_intents() —— 根据【历史上下文 + 用户输入】识别 intents 列表
+    第二次：plan_orchestration() —— 基于 intents 列表决策 relation + execution_order
 
-    降级策略：识别失败 → 返回 single general_chat 意图，保证可用性。
+    降级策略：任一步失败 → 返回 single general_chat + independent，保证可用性。
     """
 
     def __init__(
@@ -32,6 +32,7 @@ class IntentRecognizer:
         client: AsyncOpenAI,
         model_config: dict,
         recognition_prompt: str,
+        orchestration_prompt: str,
         intent_configs: List[IntentConfig],
         default_orchestration: dict,
     ):
@@ -40,12 +41,14 @@ class IntentRecognizer:
             client: AsyncOpenAI 客户端
             model_config: models.intent_recognizer 配置段
             recognition_prompt: 意图识别 prompt 模板（含 {{intents}} 占位符）
+            orchestration_prompt: 意图编排 prompt 模板（含 {{intents_list}} 占位符）
             intent_configs: 全部显式意图配置列表
             default_orchestration: default_orchestration 配置段
         """
         self._client = client
         self._model_config = model_config
         self._recognition_prompt = recognition_prompt
+        self._orchestration_prompt = orchestration_prompt
         self._intent_configs = intent_configs
         self._default_orchestration = default_orchestration
 
@@ -57,37 +60,36 @@ class IntentRecognizer:
             [f"- {ic.id}: {ic.name} — {ic.description}" for ic in intent_configs]
         )
 
-    async def recognize(
+    # ==================== 第一次 LLM：意图识别 ====================
+
+    async def recognize_intents(
         self,
         user_input: str,
         history: Optional[List[dict]] = None,
-    ) -> IntentResult:
-        """识别意图。
+    ) -> List[Intent]:
+        """第一次 LLM 调用：识别 intents 列表（不决策关系）。
 
         Args:
             user_input: 用户输入（已改写或原始）
             history: 历史对话上下文
 
         Returns:
-            IntentResult：包含改写查询、意图列表、关系
+            识别出的意图列表（已回填 agent 映射）；失败降级为单条 general_chat
         """
         try:
-            raw_json = await self._call_llm(user_input, history)
-            return self._parse_result(raw_json, user_input)
+            raw_json = await self._call_recognition_llm(user_input, history)
+            return self._parse_intents(raw_json, user_input)
         except Exception:
             logger.exception("[IntentRecognizer] 意图识别失败，降级为 general_chat")
-            return self._fallback(user_input)
+            return [
+                Intent(id="general_chat", query=user_input, agent="general_agent")
+            ]
 
     def _build_recognition_prompt(self, user_input: str, history: Optional[List[dict]]) -> str:
-        """拼接完整的意图识别 prompt。"""
-        # 填充模板占位符
-        prompt = self._recognition_prompt
-        prompt = prompt.replace("{{intents}}", self._intents_desc)
+        """拼接意图识别 prompt（填 {{intents}} + 历史上下文 + 用户输入）。"""
+        prompt = self._recognition_prompt.replace("{{intents}}", self._intents_desc)
 
-        # 用户消息
         user_msg = f"【用户输入】\n{user_input}"
-
-        # 附加历史上下文
         if history:
             recent = history[-6:]
             context_str = "\n".join(
@@ -97,57 +99,129 @@ class IntentRecognizer:
 
         return prompt + user_msg
 
-    async def _call_llm(self, user_input: str, history: Optional[List[dict]]) -> dict:
-        """调用 LLM 进行意图识别，返回解析后的 JSON dict。"""
+    async def _call_recognition_llm(self, user_input: str, history: Optional[List[dict]]) -> dict:
+        """调用 LLM 识别 intents，返回解析后的 JSON dict。"""
         user_prompt = self._build_recognition_prompt(user_input, history)
-
         raw_text = await chat_complete(
             self._client,
             self._model_config,
             system_prompt="你是一个严格输出 JSON 的意图识别引擎，不要输出任何非 JSON 内容。",
             user_prompt=user_prompt,
         )
-
         data = extract_json(raw_text)
         if data is None:
             raise ValueError(f"LLM 输出无法解析为 JSON: {raw_text[:200]}")
         return data
 
-    def _parse_result(self, data: dict, original_query: str) -> IntentResult:
-        """将 LLM 输出的 JSON dict 解析为 IntentResult，回填 agent 映射。"""
-        # 解析意图列表
+    def _parse_intents(self, data: dict, original_query: str) -> List[Intent]:
+        """将 LLM 输出解析为 Intent 列表，回填 agent 映射。"""
         raw_intents = data.get("intents", [])
         intents: List[Intent] = []
         for item in raw_intents:
             intent_id = item.get("id", "general_chat")
             intent_id = self._normalize_intent_id(intent_id)
             intent_config = self._intent_map.get(intent_id)
-
-            intent = Intent(
+            intents.append(Intent(
                 id=intent_id,
                 query=item.get("query", original_query),
                 params=item.get("params", {}),
                 agent=intent_config.agent if intent_config else "general_agent",
-            )
-            intents.append(intent)
+            ))
+        if not intents:
+            intents.append(Intent(
+                id="general_chat", query=original_query, agent="general_agent",
+            ))
+        return intents
 
-        # 解析关系
+    # ==================== 第二次 LLM：意图编排 ====================
+
+    async def plan_orchestration(
+        self,
+        user_input: str,
+        intents: List[Intent],
+    ) -> Tuple[str, List[int]]:
+        """第二次 LLM 调用：基于已识别 intents 决策 relation + execution_order。
+
+        Args:
+            user_input: 用户输入（供 LLM 判断意图依赖关系）
+            intents: 第一次识别出的意图列表
+
+        Returns:
+            (relation, execution_order)；失败降级为 ("independent", [])
+        """
+        try:
+            raw_json = await self._call_orchestration_llm(user_input, intents)
+            return self._parse_orchestration(raw_json, len(intents))
+        except Exception:
+            logger.exception("[IntentRecognizer] 意图编排失败，降级为 independent")
+            return ("independent", [])
+
+    def _build_orchestration_prompt(self, user_input: str, intents: List[Intent]) -> str:
+        """拼接意图编排 prompt（填 {{intents_list}} + 用户输入）。"""
+        intents_list = "\n".join(
+            f"[{i}] id={intent.id}, query={intent.query}"
+            for i, intent in enumerate(intents)
+        )
+        prompt = self._orchestration_prompt.replace("{{intents_list}}", intents_list)
+        return prompt + f"\n【用户输入】\n{user_input}"
+
+    async def _call_orchestration_llm(self, user_input: str, intents: List[Intent]) -> dict:
+        """调用 LLM 决策编排，返回解析后的 JSON dict。"""
+        user_prompt = self._build_orchestration_prompt(user_input, intents)
+        raw_text = await chat_complete(
+            self._client,
+            self._model_config,
+            system_prompt="你是一个严格输出 JSON 的意图编排决策引擎，不要输出任何非 JSON 内容。",
+            user_prompt=user_prompt,
+        )
+        data = extract_json(raw_text)
+        if data is None:
+            raise ValueError(f"LLM 输出无法解析为 JSON: {raw_text[:200]}")
+        return data
+
+    def _parse_orchestration(self, data: dict, intents_count: int) -> Tuple[str, List[int]]:
+        """解析 relation + execution_order，校验长度一致性。"""
         relation = data.get("relation", "independent")
         if relation not in ("independent", "related_fixed", "related_dynamic"):
             relation = "independent"
 
-        # 单意图但 LLM 未识别到任何意图 → 兜底
-        if not intents:
-            intents.append(Intent(
-                id="general_chat",
-                query=original_query,
-                agent="general_agent",
-            ))
+        raw_order = data.get("execution_order", [])
+        execution_order: List[int] = []
+        if isinstance(raw_order, list):
+            # 校验：长度需与 intents 一致、索引在范围内、无重复
+            if len(raw_order) == intents_count and all(
+                isinstance(i, int) and 0 <= i < intents_count for i in raw_order
+            ) and len(set(raw_order)) == intents_count:
+                execution_order = raw_order
+            else:
+                logger.warning(
+                    f"[IntentRecognizer] execution_order {raw_order} 与 intents 数量 "
+                    f"{intents_count} 不符或索引非法，忽略按原顺序执行"
+                )
+        return (relation, execution_order)
 
+    # ==================== 兼容入口 + 辅助 ====================
+
+    async def recognize(
+        self,
+        user_input: str,
+        history: Optional[List[dict]] = None,
+    ) -> IntentResult:
+        """原子化识别入口：内部依次调 recognize_intents + plan_orchestration。
+
+        供需要一次性得到完整 IntentResult 的场景使用。
+        run() 通常显式调两步以支持独立 span/进度事件。
+        """
+        intents = await self.recognize_intents(user_input, history)
+        relation, execution_order = await self.plan_orchestration(user_input, intents)
+        # 按 execution_order 重排 intents（若有效）
+        if execution_order:
+            intents = [intents[i] for i in execution_order]
         return IntentResult(
-            rewritten_query=data.get("rewritten_query", original_query),
+            rewritten_query=user_input,
             intents=intents,
             relation=relation,
+            execution_order=execution_order,
         )
 
     def _normalize_intent_id(self, intent_id: str) -> str:
@@ -157,26 +231,12 @@ class IntentRecognizer:
         logger.warning(f"[IntentRecognizer] 未知意图 id={intent_id}，降级为 general_chat")
         return "general_chat"
 
-    def _fallback(self, original_query: str) -> IntentResult:
-        """降级兜底：返回 single general_chat。"""
-        return IntentResult(
-            rewritten_query=original_query,
-            intents=[
-                Intent(id="general_chat", query=original_query, agent="general_agent")
-            ],
-            relation="independent",
-        )
-
     def get_orchestration_mode(self, result: IntentResult) -> str:
         """根据 IntentResult 的 relation 决定编排模式。
 
         Returns:
             "parallel" | "pipeline" | "react"
         """
-        # relation 直接决定编排模式：
-        # - independent: 无关联/单意图简单任务 → 并行
-        # - related_fixed: 有关联固定顺序 → 流水线
-        # - related_dynamic: 有关联动态决策（含复杂意图多步推理）→ ReAct
         mapping = {
             "independent": self._default_orchestration.get(
                 "multi_independent" if result.is_multi_intent else "single_intent",

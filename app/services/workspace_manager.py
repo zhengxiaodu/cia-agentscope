@@ -9,7 +9,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from agentscope.workspace import DockerWorkspace
 
@@ -27,10 +27,20 @@ class _Entry:
 
 
 class DockerWorkspaceManager:
-    def __init__(self, base_image: str, basedir: str, ttl: float):
+    def __init__(
+        self,
+        base_image: str,
+        basedir: str,
+        ttl: float,
+        pip_index_url: str = "",
+        pip_trusted_host: str = "",
+    ):
         self._base_image = base_image
         self._basedir = basedir
         self._ttl = ttl
+        # Python 包安装源（为空则不设置容器 env）
+        self._pip_index_url = pip_index_url
+        self._pip_trusted_host = pip_trusted_host
         self._cache: dict[str, _Entry] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._struct_lock = asyncio.Lock()
@@ -68,7 +78,8 @@ class DockerWorkspaceManager:
             await self._evict_locked(wid)
 
     async def create_workspace(
-        self, user_id: str, session_id: str, skill_dirs: list[str]
+        self, user_id: str, session_id: str, skill_dirs: list[str],
+        langfuse_service: Optional[Any] = None,
     ) -> DockerWorkspace:
         wid = self._workspace_id(user_id)
         lock = await self._get_lock(wid)
@@ -97,13 +108,36 @@ class DockerWorkspaceManager:
                     valid.append(d)
                 else:
                     logger.warning(f"[workspace_manager] 技能目录不存在，跳过: {d}")
-            ws = DockerWorkspace(
-                base_image=self._base_image,
-                workdir=session_dir,
-                skill_paths=valid or None,
-                default_mcps=[],
-            )
-            await ws.initialize()
+            ws_kwargs = {
+                "base_image": self._base_image,
+                "workdir": session_dir,
+                "skill_paths": valid or None,
+                "default_mcps": [],
+            }
+            # 配置了 pip 源时注入容器环境变量（UV_INDEX_URL / PIP_INDEX_URL / PIP_TRUSTED_HOST）
+            if self._pip_index_url:
+                ws_kwargs["env"] = {
+                    "UV_INDEX_URL": self._pip_index_url,
+                    "PIP_INDEX_URL": self._pip_index_url,
+                    "PIP_TRUSTED_HOST": self._pip_trusted_host,
+                }
+            ws = DockerWorkspace(**ws_kwargs)
+            # 首次创建需拉起 Docker 容器（耗时），单独埋点 ws.initialize()
+            if langfuse_service:
+                with langfuse_service.start_span(
+                    "workspace-initialize",
+                    input={"user_id": user_id, "session_id": session_id},
+                ) as init_span:
+                    await ws.initialize()
+                    if init_span:
+                        try:
+                            init_span.update(output={
+                                "workspace_id": getattr(ws, "workspace_id", None),
+                            })
+                        except Exception:
+                            pass
+            else:
+                await ws.initialize()
             ws.workdir = session_dir
             self._cache[wid] = _Entry(ws, user_id, session_ids={session_id})
             logger.info(f"[workspace_manager] 创建工作区 wid={wid} skills={len(valid)}")

@@ -18,6 +18,8 @@ from app.config import (
     WORKSPACE_TTL,
     WORKSPACE_RETENTION_DAYS,
     WORKSPACE_CLEANUP_INTERVAL_HOURS,
+    PIP_INDEX_URL,
+    PIP_TRUSTED_HOST,
 )
 from app.services.chat_service import load_model_config
 from app.services.orchestrator_service import OrchestratorService
@@ -43,6 +45,8 @@ async def lifespan(app: FastAPI):
         base_image=WORKSPACE_BASE_IMAGE,
         basedir=WORKSPACE_BASEDIR,
         ttl=WORKSPACE_TTL,
+        pip_index_url=PIP_INDEX_URL,
+        pip_trusted_host=PIP_TRUSTED_HOST,
     )
     app.state.workspace_manager = workspace_manager
     await workspace_manager.start_sweeper()

@@ -31,6 +31,20 @@ from app.config import JWT_EXPIRE_HOURS, JWT_REFRESH_EXPIRE_DAYS
 
 router = APIRouter()
 
+# 可选技能（前端据此渲染技能开关；目前写死两个内置技能，描述取自 skill_config.yml）
+_OPTIONAL_SKILLS = [
+    {
+        "name": "mineru",
+        "nickname": "文档解析",
+        "description": "MinerU 文档解析技能，将用户上传的 pdf/docx/doc/表格/图片解析为 Markdown，适用于提取、总结、问答文档内容。",
+    },
+    {
+        "name": "chart_renderer",
+        "nickname": "可视化图表",
+        "description": "智能图表渲染技能，根据数据特征自动选择最合适的图表类型并通过工具渲染。",
+    },
+]
+
 
 def success_response(data: Any) -> Dict[str, Any]:
     return {"code": 200, "msg": "success", "data": data}
@@ -104,6 +118,7 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
         "user_info": user_info,
         "agent_access": permissions["agent_whitelist"],
         "skill_blacklist": permissions["skill_blacklist"],
+        "optional_skills": _OPTIONAL_SKILLS,
     })
 
 
@@ -178,6 +193,7 @@ async def _build_update_response(request: Request, user: dict, updates: dict) ->
         "user_info": user_info,
         "agent_access": permissions.get("agent_whitelist", []),
         "skill_blacklist": permissions.get("skill_blacklist", []),
+        "optional_skills": _OPTIONAL_SKILLS,
     })
 
 
@@ -250,4 +266,5 @@ async def refresh_token(request: Request, body: RefreshRequest):
         "user_info": user_info,
         "agent_access": permissions.get("agent_whitelist", []),
         "skill_blacklist": permissions.get("skill_blacklist", []),
+        "optional_skills": _OPTIONAL_SKILLS,
     })
