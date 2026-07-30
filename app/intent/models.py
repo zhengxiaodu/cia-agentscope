@@ -52,8 +52,12 @@ class IntentResult(BaseModel):
 
 
 class IntentConfig(BaseModel):
-    """显式意图配置（来自 intent_config.yml）。"""
+    """显式意图配置（来自 intent_config.yml 或 mng 外部意图）。"""
     id: str
     name: str
     description: str = ""
     agent: str
+    # 意图层级：1=一级意图, 2=二级意图, None=基础意图（视为一级）
+    level: Optional[int] = None
+    # 父意图 code（仅二级意图有，指向一级意图的 id）
+    parent_code: Optional[str] = None
