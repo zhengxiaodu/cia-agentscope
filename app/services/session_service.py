@@ -30,6 +30,10 @@ class SessionService:
         """将最新 trace_id 保存到会话元信息。"""
         await self.dao.save_latest_trace_id(session_id, trace_id)
 
+    async def mark_last_assistant_failed(self, session_id: str, user_id: str) -> None:
+        """把该会话最新一条 assistant 消息标记为失败（用户中断时调用）。"""
+        await self.dao.mark_last_assistant_failed(session_id, user_id)
+
     async def load_messages(self, session_id: str) -> list[dict]:
         """加载多智能体对话历史（纯消息列表形式）。"""
         return await self.dao.load_messages(session_id)

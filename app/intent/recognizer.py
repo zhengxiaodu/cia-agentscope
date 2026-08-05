@@ -55,10 +55,30 @@ class IntentRecognizer:
         # 构建 id → IntentConfig
         self._intent_map: Dict[str, IntentConfig] = {ic.id: ic for ic in intent_configs}
 
-        # 预渲染 prompt 中的意图清单文本（供 LLM 参考）
-        self._intents_desc = "\n".join(
-            [f"- {ic.id}: {ic.name} — {ic.description}" for ic in intent_configs]
-        )
+        # 构建意图树：{一级id: {"config": IntentConfig, "children": [IntentConfig, ...]}}
+        # 两遍扫描：第一遍收集所有一级意图（level != 2 或 parent_code 为空，含基础意图 level=None）
+        self._tree: Dict[str, dict] = {}
+        for ic in intent_configs:
+            if ic.level != 2 or not ic.parent_code:
+                self._tree[ic.id] = {"config": ic, "children": []}
+        # 第二遍：挂载二级意图到父节点；父不存在则作为一级兜底
+        for ic in intent_configs:
+            if ic.level == 2 and ic.parent_code:
+                parent = self._tree.get(ic.parent_code)
+                if parent:
+                    parent["children"].append(ic)
+                else:
+                    # 父意图缺失，兜底作为一级
+                    self._tree[ic.id] = {"config": ic, "children": []}
+
+        # 预渲染树形意图清单（供 LLM 分层判断）
+        lines = []
+        for parent_id, node in self._tree.items():
+            cfg = node["config"]
+            lines.append(f"- 一级意图 {parent_id}: {cfg.name} — {cfg.description}")
+            for child in node["children"]:
+                lines.append(f"  - 二级意图 {child.id}: {child.name} — {child.description}")
+        self._intents_desc = "\n".join(lines)
 
     # ==================== 第一次 LLM：意图识别 ====================
 

@@ -241,6 +241,8 @@ def merge_external_into_memory(
             "name": intent_name,
             "description": intent_description, # 外部意图没有独立 description，用 name
             "agent": agent_code,        # intent.agent = agent.code
+            "level": ext.get("level"),
+            "parent_code": ext.get("parentCode"),
         })
 
         # 构建 agent_config 格式（参考 agent_config.yml 中的 agent 条目）
