@@ -2,7 +2,7 @@
 
 ## Summary
 
-policy_qa 工具当前把 `answer` + `citations` 格式化为文本放入 `ToolChunk` 返回给模型，导致 citations 的原始 JSON 结构丢失。本方案用 `contextvars.ContextVar` 在工具执行时捕获原始 citations，在 agent 事件循环结束后 emit 一个自定义 `policy_qa_citations` SSE 事件，前端可通过监听该事件类型获取完整的 citations JSON 对象。
+policy_qa 工具当前把 `answer` + 简化引用（无 content）格式化为文本放入 `ToolChunk` 返回给模型，但 citations 的完整 JSON（含很长的 `content` 字段）会丢失。本方案用 `contextvars.ContextVar` 在工具执行时捕获**完整原始 citations**，在 agent 事件循环结束后 emit 一个自定义 `policy_qa_citations` SSE 事件，前端可通过监听该事件类型获取完整的 citations JSON（含 content）；给模型的 ToolChunk 文本保持现状（answer + 简化引用，不含 content），不增加模型上下文负担。
 
 ## Current State Analysis
 
@@ -12,7 +12,8 @@ policy_qa 工具当前把 `answer` + `citations` 格式化为文本放入 `ToolC
 - [app/orchestrator/base.py:163-165](file:///workspace/app/orchestrator/base.py#L163-L165)：`_event(data: dict) -> str` helper，将 dict 序列化为 SSE 字符串。
 
 ### policy_qa 工具现状
-- [tools/policy_qa_tools.py](file:///workspace/tools/policy_qa_tools.py)：`create_policy_qa_tool` 返回的闭包工具，成功调用后把 `answer` + `_format_citations(citations)` 拼成文本放入 `ToolChunk`。citations 原始 JSON 仅在工具内部局部变量 `data` 中存在，函数返回后丢失。
+- [tools/policy_qa_tools.py:92-112](file:///workspace/tools/policy_qa_tools.py#L92-L112)：`_format_citations` **已不含 content 字段**，只格式化 position/document_name/page_start/page_end/dataset_name —— 给模型的文本已无 content，不增加上下文负担。
+- [tools/policy_qa_tools.py](file:///workspace/tools/policy_qa_tools.py)：`create_policy_qa_tool` 返回的闭包工具，成功调用后把 `answer` + `_format_citations(citations)` 拼成文本放入 `ToolChunk`。**完整 citations 原始 JSON（含 content）仅在工具内部局部变量 `citations` 中存在，函数返回后丢失**，前端无法获取。
 
 ### 两处需要 emit 的位置
 1. [base.py:150](file:///workspace/app/orchestrator/base.py#L150)：`yield result` 之前（编排器路径：parallel/pipeline/react）
@@ -52,19 +53,21 @@ def consume_policy_qa_citations() -> list:
         return []
 ```
 
-**修改 policy_qa 闭包内部**：在成功解析响应后、`return _build_result(content)` 之前，调用 `_set_citations(citations)`：
+**修改 policy_qa 闭包内部**：在成功解析响应后、`return _build_result(content)` 之前，调用 `_set_citations(citations)` 捕获**完整原始 citations（含 content）**：
 ```python
-# 4. 格式化输出：回答正文 + 引用来源
+# 4. 格式化输出：回答正文 + 简化引用（无 content，不增加模型上下文负担）
 content = answer
 citations_text = _format_citations(citations)
 if citations_text:
     content += "\n\n--- 引用来源 ---\n" + citations_text
 
-# 捕获原始 citations 供 orchestrator emit 自定义事件
+# 捕获完整原始 citations（含 content）供 orchestrator emit 自定义事件给前端
 _set_citations(citations)
 
 return _build_result(content)
 ```
+
+**关键**：给模型的 `ToolChunk` 文本只含简化引用（`_format_citations` 已无 content），完整 citations JSON（含 content）通过 ContextVar 旁路传给前端事件流，**不进入模型上下文**。
 
 **注**：错误/无权限/未命中路径不调用 `_set_citations`（保持默认空列表），不会 emit 无意义事件。多次调用 policy_qa 时，ContextVar 后者覆盖前者（可接受，一次 reply 通常只调一次）。
 
@@ -152,7 +155,7 @@ def _emit_pending_tool_extras() -> list[str]:
 2. **emit 时机**：在 `reply_stream` 循环结束后 emit，确保 citations 在 agent 完整回复后才发送，时序明确。若 agent 一次 reply 多次调用 policy_qa，ContextVar 后者覆盖前者（一次 reply 通常只调一次，可接受）。
 3. **不硬耦合**：base.py 的 `_emit_pending_tool_extras` 用 `try/except` 包裹导入，policy_qa_tools 不存在或导入失败时静默跳过，不影响主流程。未来其他工具也可复用此机制扩展。
 4. **错误路径不 emit**：policy_qa 工具在无权限/未命中/异常路径不调用 `_set_citations`，ContextVar 保持默认空列表，`consume` 返回空，不 emit 无意义事件。
-5. **citations 仍保留在 ToolChunk 文本中**：给模型看的格式化引用文本不变（模型需要引用来源生成回答），citations JSON 是**额外**发给前端的，不影响模型行为。
+5. **citations 分流**：给模型的 `ToolChunk` 文本只含简化引用（`_format_citations` 已无 content，不增加上下文负担）；完整 citations JSON（含 content）通过 ContextVar 旁路传给前端事件流，**不进入模型上下文**。
 6. **两处 emit 点**：base.py（编排器路径）和 orchestrator_service.py（单 agent 路径）都需要处理，复用同一 helper。
 
 ## Verification

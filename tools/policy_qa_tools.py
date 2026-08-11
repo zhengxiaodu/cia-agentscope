@@ -11,6 +11,7 @@
 """
 import json
 import logging
+from contextvars import ContextVar
 from typing import Optional
 
 import httpx
@@ -21,6 +22,33 @@ from app.config import POLICY_QA_BASE_URL, POLICY_QA_KB_MAP
 from app.services.auth_service import get_user_permissions
 
 logger = logging.getLogger(__name__)
+
+# 捕获 policy_qa 工具执行期间的完整 citations（含 content），供 orchestrator emit 自定义事件。
+# 给模型的 ToolChunk 文本只含简化引用（无 content），完整 citations 通过此 ContextVar 旁路传给前端。
+_policy_qa_citations: ContextVar[list] = ContextVar(
+    "_policy_qa_citations", default=None
+)
+
+
+def _set_citations(citations: list) -> None:
+    """工具执行成功时调用，捕获原始完整 citations JSON（含 content）。"""
+    _policy_qa_citations.set(citations or [])
+
+
+def consume_policy_qa_citations() -> list:
+    """读取并清空捕获的 citations。
+
+    供 orchestrator 在 agent 事件循环结束后调用，emit 自定义事件给前端。
+    返回空列表表示本次无 policy_qa 调用或无 citations。
+    """
+    try:
+        citations = _policy_qa_citations.get()
+        if citations:
+            _policy_qa_citations.set(None)
+            return citations
+        return []
+    except Exception:
+        return []
 
 # 默认请求超时（秒）：检索 + 模型生成需数秒，留足余量
 _DEFAULT_TIMEOUT = 120.0
@@ -195,6 +223,10 @@ def create_policy_qa_tool(user_id: str, redis_client) -> FunctionTool:
             citations_text = _format_citations(citations)
             if citations_text:
                 content += "\n\n--- 引用来源 ---\n" + citations_text
+
+            # 捕获完整原始 citations（含 content）供 orchestrator emit 自定义事件给前端
+            # 给模型的 ToolChunk 文本只含简化引用（无 content），不增加模型上下文负担
+            _set_citations(citations)
 
             return _build_result(content)
 
