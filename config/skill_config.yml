@@ -8,9 +8,9 @@ skills:
   - name: card_interaction
     directory: ../skills/card_interaction
     description: "个性化交互卡片技能，用于展示需要用户交互的个性化卡片组件。"
-  - name: ragflow_retrieval
-    directory: ../skills/ragflow_retrieval
-    description: "使用ragflow知识库检索公司内部制度知识"
+  - name: policy_qa
+    directory: ../skills/policy_qa
+    description: "调用制度问答 API，基于知识库回答制度/政策/法规类问题。"
   - name: mineru
     directory: ../skills/mineru
     description: "MinerU 文档解析技能，将用户上传的 pdf/docx/doc/表格/图片解析为 Markdown，适用于提取、总结、问答文档内容。"

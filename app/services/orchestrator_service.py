@@ -435,6 +435,7 @@ class OrchestratorService:
         )
         from agentscope.tool import FunctionTool
         from tools.mineru_tools import mineru_parse_tool
+        from tools.policy_qa_tools import create_policy_qa_tool
 
         # 工具层：根据后端选择 agentscope 原生工具 / OpenSandbox 桥接工具
         _chart_tools = [
@@ -443,6 +444,8 @@ class OrchestratorService:
             FunctionTool(render_metric_card), FunctionTool(render_confirm_action),
             FunctionTool(render_indicator_table), FunctionTool(render_selectable_list),
         ]
+        # 制度问答工具（宿主侧 FunctionTool，知识库 ID 由用户权限自动映射，不依赖工作区后端）
+        policy_qa_tool = create_policy_qa_tool(user_id=user_id, redis_client=redis_client)
         if WORKSPACE_BACKEND == "opensandbox":
             from app.services.opensandbox_adapter import OpenSandboxToolAdapter
             from app.services.opensandbox_tool_bridge import create_opensandbox_tools
@@ -450,13 +453,13 @@ class OrchestratorService:
             adapter = OpenSandboxToolAdapter(
                 workspace, workdir=f"/data/workspaces/{session_id_safe}"
             )
-            all_tools = create_opensandbox_tools(adapter) + _chart_tools + [mineru_parse_tool]
+            all_tools = create_opensandbox_tools(adapter) + _chart_tools + [mineru_parse_tool, policy_qa_tool]
             # 技能列表由管理器扫描沙箱内 /workspace/skills/ 获取
             all_skills_meta = await self._workspace_manager.list_skills(
                 user_id=user_id_safe, session_id=session_id_safe
             )
         else:
-            all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep()] + _chart_tools + [mineru_parse_tool]
+            all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep()] + _chart_tools + [mineru_parse_tool, policy_qa_tool]
             all_skills_meta = await workspace.list_skills()
 
         # 按请求开关显隐联网搜索技能（workspace 始终装载全部技能，此处按轮次过滤）
