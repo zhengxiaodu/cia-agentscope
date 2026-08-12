@@ -125,10 +125,17 @@ class BaseOrchestrator(ABC):
         apply = None
 
         # 环节埋点：每次智能体调用子 span
+        # 从 agent 对象读取 system_prompt（agentscope ReActAgent 通过 sys_prompt 属性暴露）
+        agent_sys_prompt = getattr(agent, "sys_prompt", None) or ""
         span_ctx = (
             langfuse_service.start_span(
                 f"agent-{agent_id}",
-                input={"intent": intent.id, "query": intent.query},
+                input={
+                    "intent": intent.id,
+                    "query": intent.query,
+                    "system_prompt": agent_sys_prompt,
+                    "user_message": user_content,
+                },
             )
             if langfuse_service
             else _noop_ctx()

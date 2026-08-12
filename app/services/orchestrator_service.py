@@ -747,11 +747,11 @@ class OrchestratorService:
             {"original": user_input, "history_len": len(history)},
         ) as rw_span:
             try:
-                rewritten = await rewriter.rewrite(user_input, history)
+                rewritten, rw_prompts = await rewriter.rewrite(user_input, history)
             except Exception:
                 logger.exception("[OrchestratorService] 查询改写失败，使用原始输入")
-                rewritten = user_input
-            _safe_update_span(rw_span, {"rewritten": rewritten})
+                rewritten, rw_prompts = user_input, {}
+            _safe_update_span(rw_span, {"rewritten": rewritten, "prompts": rw_prompts})
 
         yield self._event({
             "type": "query_rewritten",
@@ -769,12 +769,14 @@ class OrchestratorService:
             {"query": rewritten, "history_len": len(history)},
         ) as rec_span:
             try:
-                intents = await recognizer.recognize_intents(rewritten, history)
+                intents, rec_prompts = await recognizer.recognize_intents(rewritten, history)
             except Exception:
                 logger.exception("[OrchestratorService] 意图识别失败，降级为 general_chat")
                 intents = [Intent(id="general_chat", query=rewritten, agent="general_agent")]
+                rec_prompts = {}
             _safe_update_span(rec_span, {
                 "intents": [{"id": i.id, "agent": i.agent} for i in intents],
+                "prompts": rec_prompts,
             })
         yield self._event({
             "type": "intent_step", "phase": "recognition", "status": "done",
@@ -791,12 +793,13 @@ class OrchestratorService:
             {"intents_count": len(intents)},
         ) as orch_span:
             try:
-                relation, execution_order = await recognizer.plan_orchestration(rewritten, intents)
+                relation, execution_order, orch_prompts = await recognizer.plan_orchestration(rewritten, intents)
             except Exception:
                 logger.exception("[OrchestratorService] 意图编排失败，降级为 independent")
-                relation, execution_order = "independent", []
+                relation, execution_order, orch_prompts = "independent", [], {}
             _safe_update_span(orch_span, {
                 "relation": relation, "execution_order": execution_order,
+                "prompts": orch_prompts,
             })
         # 按 execution_order 重排 intents（校验长度一致才应用，否则按原顺序）
         if execution_order and len(execution_order) == len(intents):
