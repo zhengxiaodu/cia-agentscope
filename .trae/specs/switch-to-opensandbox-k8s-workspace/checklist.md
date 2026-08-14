@@ -1,0 +1,27 @@
+# Checklist
+
+- [x] `app/config.py` 存在 `WORKSPACE_BACKEND` 配置项（默认 `docker`）
+- [x] `app/config.py` 存在 7 个 OpenSandbox 连接/沙箱配置项（DOMAIN/API_KEY/PROTOCOL/USE_SERVER_PROXY/IMAGE/RESOURCE_CPU/RESOURCE_MEMORY）
+- [x] `app/config.py` 存在 2 个预热池配置项（POOL_SIZE/POOL_REFILL）
+- [x] `app/services/opensandbox_workspace_manager.py` 定义 `OpenSandboxWorkspaceManager` 类，含 `create_workspace`/`get_workspace`/`close`/`close_all`/`start_sweeper`/`stop_sweeper`/`list_skills`/`list_tools`/`workdir`
+- [x] `OpenSandboxWorkspaceManager` 实现创建重试（指数退避，最多 3 次）
+- [x] `OpenSandboxWorkspaceManager` 实现崩溃恢复（`echo 1` 探测 + 自动重建）
+- [x] `OpenSandboxWorkspaceManager` 实现降级保护（连续 5 次失败降级，60s 恢复探测）
+- [x] `OpenSandboxWorkspaceManager` 实现预热池（`_warm_up`/`_acquire_from_pool`/`_refill_one`/`_destroy_pool`）
+- [x] `OpenSandboxWorkspaceManager` 通过 `_inject_skills` 将宿主技能目录写入沙箱 `/workspace/skills/`
+- [x] `app/services/opensandbox_adapter.py` 定义 `OpenSandboxToolAdapter`，含 bash/read/write/edit/glob/grep/ensure_dir/list_dir + workdir 属性
+- [x] `app/services/opensandbox_tool_bridge.py` 定义 `create_opensandbox_tools(adapter)`，返回 6 个 FunctionTool（Bash/Read/Write/Edit/Glob/Grep）
+- [x] `app/main.py` 根据 `WORKSPACE_BACKEND` 条件构造 `OpenSandboxWorkspaceManager`（含 `ConnectionConfig`）或 `DockerWorkspaceManager`
+- [x] `app/main.py` opensandbox 分支打印 `[opensandbox]` 标识日志，docker 分支打印 `[docker]` 标识日志
+- [x] `app/main.py` 保留现有 `chat_tasks` 注册表、langfuse、session_service、PIP 配置等不变
+- [x] `app/main.py` 关闭阶段 `stop_sweeper` + `close_all` 对两种后端均生效
+- [x] `app/services/orchestrator_service.py` 导入 `WORKSPACE_BACKEND`
+- [x] `app/services/orchestrator_service.py` `_build_request_components` 中 opensandbox 分支使用 `create_opensandbox_tools(adapter)` + 保留 mineru_parse_tool 与图表/卡片 FunctionTool
+- [x] `app/services/orchestrator_service.py` `_build_request_components` 中 docker 分支保持现状（agentscope 原生工具 + mineru + 图表/卡片）
+- [x] `app/services/orchestrator_service.py` 技能列表获取双后端分支（`manager.list_skills()` / `workspace.list_skills()`）
+- [x] `app/services/orchestrator_service.py` 保留 langfuse 工作区 span（ws_ctx/ws_span）与 extra_skills 逻辑不变
+- [x] `.env.example` 新增 OpenSandbox 配置段 + `WORKSPACE_BACKEND=docker`，保留现有 PIP 配置
+- [x] `requirements.txt` 新增 `opensandbox>=0.1.13` 与 `opensandbox-code-interpreter>=0.1.0`
+- [x] `deploy/opensandbox/` 存在 namespace/rbac/resource-quota/api-key-secret/server-deployment/server-config/sync_images/README
+- [x] 所有改动 Python 文件通过 `ast.parse` 语法校验
+- [x] `WORKSPACE_BACKEND` 未设置时（默认 docker）行为与改动前完全一致（docker 后端代码未被破坏）

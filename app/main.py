@@ -14,6 +14,7 @@ from app.config import (
     MYSQL_USER,
     MYSQL_PASSWORD,
     MYSQL_DATABASE,
+    WORKSPACE_BACKEND,
     WORKSPACE_BASE_IMAGE,
     WORKSPACE_BASEDIR,
     WORKSPACE_TTL,
@@ -21,6 +22,15 @@ from app.config import (
     WORKSPACE_CLEANUP_INTERVAL_HOURS,
     PIP_INDEX_URL,
     PIP_TRUSTED_HOST,
+    OPENSANDBOX_DOMAIN,
+    OPENSANDBOX_API_KEY,
+    OPENSANDBOX_PROTOCOL,
+    OPENSANDBOX_USE_SERVER_PROXY,
+    OPENSANDBOX_IMAGE,
+    OPENSANDBOX_RESOURCE_CPU,
+    OPENSANDBOX_RESOURCE_MEMORY,
+    OPENSANDBOX_POOL_SIZE,
+    OPENSANDBOX_POOL_REFILL,
 )
 from app.services.chat_service import load_model_config
 from app.services.orchestrator_service import OrchestratorService
@@ -41,20 +51,50 @@ async def lifespan(app: FastAPI):
     model_config = load_model_config(MODEL_CONFIG_PATH)
     app.state.model_config = model_config
 
-    # ---- Docker 工作区管理器 ----
-    workspace_manager = DockerWorkspaceManager(
-        base_image=WORKSPACE_BASE_IMAGE,
-        basedir=WORKSPACE_BASEDIR,
-        ttl=WORKSPACE_TTL,
-        pip_index_url=PIP_INDEX_URL,
-        pip_trusted_host=PIP_TRUSTED_HOST,
-    )
+    # ---- 工作区管理器（根据 WORKSPACE_BACKEND 选择后端） ----
+    if WORKSPACE_BACKEND == "opensandbox":
+        from datetime import timedelta
+        from opensandbox.config import ConnectionConfig
+        from app.services.opensandbox_workspace_manager import OpenSandboxWorkspaceManager
+
+        osb_config = ConnectionConfig(
+            domain=OPENSANDBOX_DOMAIN,
+            protocol=OPENSANDBOX_PROTOCOL,
+            api_key=OPENSANDBOX_API_KEY or None,
+            use_server_proxy=OPENSANDBOX_USE_SERVER_PROXY,
+            request_timeout=timedelta(seconds=120),
+        )
+        workspace_manager = OpenSandboxWorkspaceManager(
+            connection_config=osb_config,
+            base_image=OPENSANDBOX_IMAGE,
+            basedir="/data/workspaces",
+            ttl=WORKSPACE_TTL,
+            resource={"cpu": OPENSANDBOX_RESOURCE_CPU, "memory": OPENSANDBOX_RESOURCE_MEMORY},
+            ready_timeout=timedelta(seconds=120),
+            pool_size=OPENSANDBOX_POOL_SIZE,
+            pool_refill=OPENSANDBOX_POOL_REFILL,
+        )
+        print(
+            f"Workspace manager initialized [opensandbox] "
+            f"(domain={OPENSANDBOX_DOMAIN}, image={OPENSANDBOX_IMAGE}, ttl={WORKSPACE_TTL}, "
+            f"pool_size={OPENSANDBOX_POOL_SIZE})"
+        )
+    else:
+        workspace_manager = DockerWorkspaceManager(
+            base_image=WORKSPACE_BASE_IMAGE,
+            basedir=WORKSPACE_BASEDIR,
+            ttl=WORKSPACE_TTL,
+            pip_index_url=PIP_INDEX_URL,
+            pip_trusted_host=PIP_TRUSTED_HOST,
+        )
+        print(
+            f"Workspace manager initialized [docker] "
+            f"(image={WORKSPACE_BASE_IMAGE}, basedir={WORKSPACE_BASEDIR}, ttl={WORKSPACE_TTL})"
+        )
+
     app.state.workspace_manager = workspace_manager
+    app.state.workspace_backend = WORKSPACE_BACKEND
     await workspace_manager.start_sweeper()
-    print(
-        f"Workspace manager initialized "
-        f"(image={WORKSPACE_BASE_IMAGE}, basedir={WORKSPACE_BASEDIR}, ttl={WORKSPACE_TTL})"
-    )
 
     # ---- 工作区定时清理服务 ----
     cleanup_service = WorkspaceCleanupService(

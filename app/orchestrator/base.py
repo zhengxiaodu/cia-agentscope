@@ -23,6 +23,30 @@ def _noop_ctx() -> Iterator[None]:
     yield None
 
 
+def _emit_pending_tool_extras() -> list[str]:
+    """检查并 emit 工具执行期间捕获的额外数据（如 policy_qa 的完整 citations）。
+
+    返回 SSE 事件字符串列表（可能为空）。导入失败时静默跳过，
+    保证 base.py 不硬依赖 policy_qa_tools 模块。
+    """
+    events: list[str] = []
+    try:
+        from tools.policy_qa_tools import consume_policy_qa_citations
+        citations = consume_policy_qa_citations()
+        if citations:
+            events.append(
+                "data: "
+                + json.dumps(
+                    {"type": "policy_qa_citations", "citations": citations},
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
+    except Exception:
+        pass
+    return events
+
+
 class TaskResult(BaseModel):
     """单个意图执行完毕后的结果。
 
@@ -101,10 +125,17 @@ class BaseOrchestrator(ABC):
         apply = None
 
         # 环节埋点：每次智能体调用子 span
+        # 从 agent 对象读取 system_prompt（agentscope ReActAgent 通过 sys_prompt 属性暴露）
+        agent_sys_prompt = getattr(agent, "sys_prompt", None) or ""
         span_ctx = (
             langfuse_service.start_span(
                 f"agent-{agent_id}",
-                input={"intent": intent.id, "query": intent.query},
+                input={
+                    "intent": intent.id,
+                    "query": intent.query,
+                    "system_prompt": agent_sys_prompt,
+                    "user_message": user_content,
+                },
             )
             if langfuse_service
             else _noop_ctx()
@@ -146,6 +177,10 @@ class BaseOrchestrator(ABC):
                     })
                 except Exception:
                     pass
+
+        # emit 工具执行期间捕获的额外数据（如 policy_qa 的完整 citations）
+        for ev in _emit_pending_tool_extras():
+            yield ev
 
         yield result
 

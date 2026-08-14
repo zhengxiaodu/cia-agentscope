@@ -86,7 +86,7 @@ class IntentRecognizer:
         self,
         user_input: str,
         history: Optional[List[dict]] = None,
-    ) -> List[Intent]:
+    ) -> Tuple[List[Intent], dict]:
         """第一次 LLM 调用：识别 intents 列表（不决策关系）。
 
         Args:
@@ -94,16 +94,17 @@ class IntentRecognizer:
             history: 历史对话上下文
 
         Returns:
-            识别出的意图列表（已回填 agent 映射）；失败降级为单条 general_chat
+            (识别出的意图列表, {"system_prompt": ..., "user_prompt": ...})；
+            失败降级为 (单条 general_chat, {})。
         """
         try:
-            raw_json = await self._call_recognition_llm(user_input, history)
-            return self._parse_intents(raw_json, user_input)
+            raw_json, prompts = await self._call_recognition_llm(user_input, history)
+            return self._parse_intents(raw_json, user_input), prompts
         except Exception:
             logger.exception("[IntentRecognizer] 意图识别失败，降级为 general_chat")
             return [
                 Intent(id="general_chat", query=user_input, agent="general_agent")
-            ]
+            ], {}
 
     def _build_recognition_prompt(self, user_input: str, history: Optional[List[dict]]) -> str:
         """拼接意图识别 prompt（填 {{intents}} + 历史上下文 + 用户输入）。"""
@@ -119,19 +120,20 @@ class IntentRecognizer:
 
         return prompt + user_msg
 
-    async def _call_recognition_llm(self, user_input: str, history: Optional[List[dict]]) -> dict:
-        """调用 LLM 识别 intents，返回解析后的 JSON dict。"""
+    async def _call_recognition_llm(self, user_input: str, history: Optional[List[dict]]) -> Tuple[dict, dict]:
+        """调用 LLM 识别 intents，返回解析后的 JSON dict 和提示词。"""
+        system_prompt = "你是一个严格输出 JSON 的意图识别引擎，不要输出任何非 JSON 内容。"
         user_prompt = self._build_recognition_prompt(user_input, history)
         raw_text = await chat_complete(
             self._client,
             self._model_config,
-            system_prompt="你是一个严格输出 JSON 的意图识别引擎，不要输出任何非 JSON 内容。",
+            system_prompt=system_prompt,
             user_prompt=user_prompt,
         )
         data = extract_json(raw_text)
         if data is None:
             raise ValueError(f"LLM 输出无法解析为 JSON: {raw_text[:200]}")
-        return data
+        return data, {"system_prompt": system_prompt, "user_prompt": user_prompt}
 
     def _parse_intents(self, data: dict, original_query: str) -> List[Intent]:
         """将 LLM 输出解析为 Intent 列表，回填 agent 映射。"""
@@ -159,7 +161,7 @@ class IntentRecognizer:
         self,
         user_input: str,
         intents: List[Intent],
-    ) -> Tuple[str, List[int]]:
+    ) -> Tuple[str, List[int], dict]:
         """第二次 LLM 调用：基于已识别 intents 决策 relation + execution_order。
 
         Args:
@@ -167,14 +169,15 @@ class IntentRecognizer:
             intents: 第一次识别出的意图列表
 
         Returns:
-            (relation, execution_order)；失败降级为 ("independent", [])
+            (relation, execution_order, {"system_prompt": ..., "user_prompt": ...})；
+            失败降级为 ("independent", [], {})。
         """
         try:
-            raw_json = await self._call_orchestration_llm(user_input, intents)
-            return self._parse_orchestration(raw_json, len(intents))
+            raw_json, prompts = await self._call_orchestration_llm(user_input, intents)
+            return (*self._parse_orchestration(raw_json, len(intents)), prompts)
         except Exception:
             logger.exception("[IntentRecognizer] 意图编排失败，降级为 independent")
-            return ("independent", [])
+            return ("independent", [], {})
 
     def _build_orchestration_prompt(self, user_input: str, intents: List[Intent]) -> str:
         """拼接意图编排 prompt（填 {{intents_list}} + 用户输入）。"""
@@ -185,19 +188,20 @@ class IntentRecognizer:
         prompt = self._orchestration_prompt.replace("{{intents_list}}", intents_list)
         return prompt + f"\n【用户输入】\n{user_input}"
 
-    async def _call_orchestration_llm(self, user_input: str, intents: List[Intent]) -> dict:
-        """调用 LLM 决策编排，返回解析后的 JSON dict。"""
+    async def _call_orchestration_llm(self, user_input: str, intents: List[Intent]) -> Tuple[dict, dict]:
+        """调用 LLM 决策编排，返回解析后的 JSON dict 和提示词。"""
+        system_prompt = "你是一个严格输出 JSON 的意图编排决策引擎，不要输出任何非 JSON 内容。"
         user_prompt = self._build_orchestration_prompt(user_input, intents)
         raw_text = await chat_complete(
             self._client,
             self._model_config,
-            system_prompt="你是一个严格输出 JSON 的意图编排决策引擎，不要输出任何非 JSON 内容。",
+            system_prompt=system_prompt,
             user_prompt=user_prompt,
         )
         data = extract_json(raw_text)
         if data is None:
             raise ValueError(f"LLM 输出无法解析为 JSON: {raw_text[:200]}")
-        return data
+        return data, {"system_prompt": system_prompt, "user_prompt": user_prompt}
 
     def _parse_orchestration(self, data: dict, intents_count: int) -> Tuple[str, List[int]]:
         """解析 relation + execution_order，校验长度一致性。"""
@@ -232,8 +236,8 @@ class IntentRecognizer:
         供需要一次性得到完整 IntentResult 的场景使用。
         run() 通常显式调两步以支持独立 span/进度事件。
         """
-        intents = await self.recognize_intents(user_input, history)
-        relation, execution_order = await self.plan_orchestration(user_input, intents)
+        intents, _ = await self.recognize_intents(user_input, history)
+        relation, execution_order, _ = await self.plan_orchestration(user_input, intents)
         # 按 execution_order 重排 intents（若有效）
         if execution_order:
             intents = [intents[i] for i in execution_order]

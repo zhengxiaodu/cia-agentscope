@@ -1,0 +1,16 @@
+- [ ] `OpenSandboxWorkspaceManager.list_session_files(user_id, session_id)` 通过 `find . -type f` 返回相对路径集合，跳过 `data`/`skills`/`.mcp`，沙箱不存在/异常返回空集合不抛
+- [ ] `OpenSandboxWorkspaceManager.read_session_file(user_id, session_id, rel_path)` 文本走 `sbx.files.read_file`，二进制走 base64 解码，文件不存在返回 None
+- [ ] `OpenSandboxWorkspaceManager.stat_session_file(user_id, session_id, rel_path)` 通过 `stat -c %s` 返回字节大小，不存在返回 None
+- [ ] `chat_service._detect_and_emit_files` 接受 `workspace_manager`/`workspace_backend`/`user_id` 参数
+- [ ] OpenSandbox 后端检测走 `manager.list_session_files` + `manager.stat_session_file`，Docker 后端走原 `snapshot` + `build_file_meta`
+- [ ] `generate_response` 调用处透传 `app.state.workspace_manager` / `app.state.workspace_backend` / `user_id`
+- [ ] `files_generated` 事件 payload 结构 `{type, files:[{name,path,url,size,media_type}]}` 未改变
+- [ ] `append_session_files` 持久化逻辑未改变
+- [ ] `files.py` 从 `request.app.state` 读取 `workspace_manager` / `workspace_backend`
+- [ ] 越权校验改为规范化相对路径校验（禁止 `..` / 绝对路径），逃逸返回 403
+- [ ] OpenSandbox 下载分支走 `manager.read_session_file` 返回 `Response(content, ...)`，文件不存在返回 404
+- [ ] OpenSandbox inline 分支返回内容 + 正确 Content-Type（文本 `text/...; charset=utf-8`，图片 image mime），`Content-Disposition: inline`
+- [ ] pdf/docx 等不支持预览的类型在 inline 模式返回 415
+- [ ] Docker 后端下载路径保持原 `FileResponse` 不变
+- [ ] Docker 后端默认行为（`WORKSPACE_BACKEND` 未设置）与改动前完全一致
+- [ ] `python -m py_compile` 通过 `opensandbox_workspace_manager.py`、`chat_service.py`、`files.py`

@@ -2,7 +2,7 @@
 import logging
 import re
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from openai import AsyncOpenAI
 
@@ -50,7 +50,7 @@ class QueryRewriter:
         self._model_config = model_config
         self._rewrite_prompt = rewrite_prompt
 
-    async def rewrite(self, user_input: str, history: Optional[List[dict]] = None) -> str:
+    async def rewrite(self, user_input: str, history: Optional[List[dict]] = None) -> Tuple[str, dict]:
         """改写用户输入。
 
         Args:
@@ -58,12 +58,13 @@ class QueryRewriter:
             history: 历史对话上下文 [{role, content}, ...]，可选
 
         Returns:
-            改写后的查询；无上下文且不含时间代词或失败时原样返回
+            (改写后的查询, {"system_prompt": ..., "user_prompt": ...})；
+            无需改写或失败时返回 (原始输入, {})。
         """
         # 无上下文时，仅在含时间代词时才改写（避免每条首条消息都调 LLM）
         if not history:
             if not _TIME_KEYWORDS_PATTERN.search(user_input):
-                return user_input
+                return user_input, {}
 
         # 拼接最近若干轮上下文摘要
         recent = history[-6:] if history else []  # 最近 3 轮（user+assistant）
@@ -92,8 +93,8 @@ class QueryRewriter:
             # 改写为空则降级
             if rewritten:
                 logger.info(f"[QueryRewriter] 原始: {user_input} → 改写: {rewritten}")
-                return rewritten
+                return rewritten, {"system_prompt": system_prompt, "user_prompt": user_prompt}
         except Exception:
             logger.exception("[QueryRewriter] 改写失败，使用原始输入")
 
-        return user_input
+        return user_input, {}

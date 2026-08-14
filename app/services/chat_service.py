@@ -13,7 +13,7 @@ import os
 import asyncio
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional
+from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional, Tuple
 
 import yaml
 from agentscope.credential import OpenAICredential
@@ -49,17 +49,21 @@ async def _generate_recommended_questions(
     orchestrator_service,
     user_input: str,
     final_output: str,
-) -> List[str]:
+) -> Tuple[List[str], dict]:
     """调用 LLM 根据本轮问答生成 3 个推荐问题。
 
     复用 orchestrator 的 _intent_client / _intent_model_cfg。
     任何异常都吞掉返回空列表，确保不影响主流程。
+
+    Returns:
+        (推荐问题列表, {"system_prompt": ..., "user_prompt": ...})；
+        失败时返回 ([], {})。
     """
     try:
         client = getattr(orchestrator_service, "_intent_client", None)
         model_config = getattr(orchestrator_service, "_intent_model_cfg", None)
         if not client or not model_config or not final_output:
-            return []
+            return [], {}
 
         system_prompt = (
             "你是一个推荐问题生成助手。根据用户的提问和助手的回答，"
@@ -72,16 +76,16 @@ async def _generate_recommended_questions(
         text = await chat_complete(client, model_config, system_prompt, user_prompt)
         data = extract_json(text)
         if not isinstance(data, dict):
-            return []
+            return [], {}
         questions = data.get("questions", [])
         if not isinstance(questions, list):
-            return []
+            return [], {}
         # 最多 3 个，过滤空白与非字符串
         cleaned = [str(q).strip() for q in questions if q and str(q).strip()]
-        return cleaned[:3]
+        return cleaned[:3], {"system_prompt": system_prompt, "user_prompt": user_prompt}
     except Exception:
         logger.debug("[chat_service] 生成推荐问题失败", exc_info=True)
-        return []
+        return [], {}
 
 
 def _extract_user_input(messages: List[Dict[str, Any]]) -> str:
@@ -155,10 +159,10 @@ async def _emit_recommended_questions(
             else _noop_ctx()
         )
         with root_span_ctx as rec_obs:
-            questions = await _generate_recommended_questions(
+            questions, rq_prompts = await _generate_recommended_questions(
                 orchestrator_service, user_input, final_output
             )
-            _safe_update_span(rec_obs, {"questions": questions})
+            _safe_update_span(rec_obs, {"questions": questions, "prompts": rq_prompts})
 
         rec_event = json.dumps(
             {"type": "recommended_questions", "questions": questions},

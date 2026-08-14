@@ -32,6 +32,7 @@ from app.config import (
     SKILL_CONFIG_PATH,
     EXTERNAL_SKILLS_DIR,
     JWT_EXPIRE_HOURS,
+    WORKSPACE_BACKEND,
 )
 from app.agents.base import AgentDefinition
 from app.agents.factory import AgentFactory
@@ -427,14 +428,39 @@ class OrchestratorService:
                 except Exception:
                     pass
             
-        from tools.chart_tools import render_bar_chart,render_line_chart,render_pie_chart,render_generic_card,render_metric_card,render_confirm_action,render_indicator_table,render_selectable_list
+        from tools.chart_tools import (
+            render_bar_chart, render_line_chart, render_pie_chart,
+            render_generic_card, render_metric_card, render_confirm_action,
+            render_indicator_table, render_selectable_list,
+        )
         from agentscope.tool import FunctionTool
         from tools.mineru_tools import mineru_parse_tool
-        all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep(),FunctionTool(render_pie_chart),FunctionTool(render_bar_chart),
-                     FunctionTool(render_line_chart),FunctionTool(render_generic_card),FunctionTool(render_metric_card),
-                     FunctionTool(render_confirm_action),FunctionTool(render_indicator_table),FunctionTool(render_selectable_list),mineru_parse_tool]
-        
-        all_skills_meta = await workspace.list_skills()
+        from tools.policy_qa_tools import create_policy_qa_tool
+
+        # 工具层：根据后端选择 agentscope 原生工具 / OpenSandbox 桥接工具
+        _chart_tools = [
+            FunctionTool(render_pie_chart), FunctionTool(render_bar_chart),
+            FunctionTool(render_line_chart), FunctionTool(render_generic_card),
+            FunctionTool(render_metric_card), FunctionTool(render_confirm_action),
+            FunctionTool(render_indicator_table), FunctionTool(render_selectable_list),
+        ]
+        # 制度问答工具（宿主侧 FunctionTool，知识库 ID 由用户权限自动映射，不依赖工作区后端）
+        policy_qa_tool = create_policy_qa_tool(user_id=user_id, redis_client=redis_client)
+        if WORKSPACE_BACKEND == "opensandbox":
+            from app.services.opensandbox_adapter import OpenSandboxToolAdapter
+            from app.services.opensandbox_tool_bridge import create_opensandbox_tools
+            # workspace 此处是 OpenSandbox Sandbox 实例
+            adapter = OpenSandboxToolAdapter(
+                workspace, workdir=f"/data/workspaces/{session_id_safe}"
+            )
+            all_tools = create_opensandbox_tools(adapter) + _chart_tools + [mineru_parse_tool, policy_qa_tool]
+            # 技能列表由管理器扫描沙箱内 /workspace/skills/ 获取
+            all_skills_meta = await self._workspace_manager.list_skills(
+                user_id=user_id_safe, session_id=session_id_safe
+            )
+        else:
+            all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep()] + _chart_tools + [mineru_parse_tool, policy_qa_tool]
+            all_skills_meta = await workspace.list_skills()
 
         # 按请求开关显隐联网搜索技能（workspace 始终装载全部技能，此处按轮次过滤）
         if not search_enabled:
@@ -622,6 +648,11 @@ class OrchestratorService:
                     session_service, session_id, user_id, agent_id, final_state,
                 )
 
+                # emit 工具执行期间捕获的额外数据（如 policy_qa 的完整 citations）
+                from app.orchestrator.base import _emit_pending_tool_extras
+                for ev in _emit_pending_tool_extras():
+                    yield ev
+
                 # 记录本轮参与的 agent_id + 成功标志
                 self._last_agent_ids = [agent_id]
                 self._last_success = True
@@ -716,11 +747,11 @@ class OrchestratorService:
             {"original": user_input, "history_len": len(history)},
         ) as rw_span:
             try:
-                rewritten = await rewriter.rewrite(user_input, history)
+                rewritten, rw_prompts = await rewriter.rewrite(user_input, history)
             except Exception:
                 logger.exception("[OrchestratorService] 查询改写失败，使用原始输入")
-                rewritten = user_input
-            _safe_update_span(rw_span, {"rewritten": rewritten})
+                rewritten, rw_prompts = user_input, {}
+            _safe_update_span(rw_span, {"rewritten": rewritten, "prompts": rw_prompts})
 
         yield self._event({
             "type": "query_rewritten",
@@ -738,12 +769,14 @@ class OrchestratorService:
             {"query": rewritten, "history_len": len(history)},
         ) as rec_span:
             try:
-                intents = await recognizer.recognize_intents(rewritten, history)
+                intents, rec_prompts = await recognizer.recognize_intents(rewritten, history)
             except Exception:
                 logger.exception("[OrchestratorService] 意图识别失败，降级为 general_chat")
                 intents = [Intent(id="general_chat", query=rewritten, agent="general_agent")]
+                rec_prompts = {}
             _safe_update_span(rec_span, {
                 "intents": [{"id": i.id, "agent": i.agent} for i in intents],
+                "prompts": rec_prompts,
             })
         yield self._event({
             "type": "intent_step", "phase": "recognition", "status": "done",
@@ -760,12 +793,13 @@ class OrchestratorService:
             {"intents_count": len(intents)},
         ) as orch_span:
             try:
-                relation, execution_order = await recognizer.plan_orchestration(rewritten, intents)
+                relation, execution_order, orch_prompts = await recognizer.plan_orchestration(rewritten, intents)
             except Exception:
                 logger.exception("[OrchestratorService] 意图编排失败，降级为 independent")
-                relation, execution_order = "independent", []
+                relation, execution_order, orch_prompts = "independent", [], {}
             _safe_update_span(orch_span, {
                 "relation": relation, "execution_order": execution_order,
+                "prompts": orch_prompts,
             })
         # 按 execution_order 重排 intents（校验长度一致才应用，否则按原顺序）
         if execution_order and len(execution_order) == len(intents):
