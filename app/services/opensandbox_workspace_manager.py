@@ -445,6 +445,139 @@ class OpenSandboxWorkspaceManager:
             return entry.workdir
         return self._basedir
 
+    # ---- 会话文件访问（复用 OpenSandboxToolAdapter）----
+    async def _get_adapter(self, user_id: str, session_id: str):
+        """获取会话对应的 OpenSandboxToolAdapter。
+
+        复用 create_workspace 获取沙箱（带重试/降级保护），
+        构造 adapter 并设置 workdir 为会话工作目录。
+        """
+        from app.services.opensandbox_adapter import OpenSandboxToolAdapter
+        sbx = await self.create_workspace(user_id, session_id)
+        return OpenSandboxToolAdapter(sbx, workdir=self._session_dir(session_id))
+
+    # 文本类后缀（小写，无点）
+    _TEXT_EXTS = {
+        "md", "markdown", "txt", "text", "json", "csv", "log",
+        "py", "js", "ts", "jsx", "tsx", "java", "c", "cc", "cpp", "h", "hpp",
+        "go", "rs", "rb", "php", "sh", "bash", "yml", "yaml", "xml", "html",
+        "htm", "css", "sql", "ini", "conf", "toml", "env",
+    }
+
+    @staticmethod
+    def _is_text_rel(rel_path: str) -> bool:
+        ext = os.path.splitext(rel_path)[1].lstrip(".").lower()
+        return ext in OpenSandboxWorkspaceManager._TEXT_EXTS
+
+    @staticmethod
+    def _normalize_rel(rel_path: str) -> str | None:
+        """规范化相对路径，禁止 .. 和绝对路径；返回 POSIX 风格相对路径或 None（非法）。"""
+        if not rel_path:
+            return None
+        if os.path.isabs(rel_path):
+            return None
+        rel = rel_path.replace("\\", "/").lstrip("/")
+        if rel.startswith("..") or "/.." in rel or rel == "..":
+            return None
+        return rel
+
+    async def list_session_files(self, user_id: str, session_id: str) -> set[str]:
+        """列出会话工作目录下所有文件的相对路径集合（POSIX /）。
+
+        跳过顶层 data/skills 目录和 .mcp 文件；沙箱不存在/目录为空/异常返回空集合。
+        """
+        try:
+            adapter = await self._get_adapter(user_id, session_id)
+            session_dir = self._session_dir(session_id)
+            result = await adapter.bash(
+                f"cd {session_dir} && find . -type f 2>/dev/null || true"
+            )
+            stdout = result.get("stdout", "") if isinstance(result, dict) else ""
+            files: set[str] = set()
+            for line in stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                # 去掉 ./ 前缀
+                rel = line[2:] if line.startswith("./") else line
+                rel = rel.lstrip("/")
+                if not rel:
+                    continue
+                # 跳过顶层 data/skills 目录
+                top = rel.split("/", 1)[0]
+                if top in ("data", "skills"):
+                    continue
+                # 跳过 .mcp 文件
+                if rel == ".mcp" or rel.endswith("/.mcp"):
+                    continue
+                files.add(rel)
+            return files
+        except Exception:
+            logger.warning(
+                f"[opensandbox_ws] list_session_files 失败 "
+                f"user={user_id} session={session_id}",
+                exc_info=True,
+            )
+            return set()
+
+    async def read_session_file(
+        self, user_id: str, session_id: str, rel_path: str
+    ) -> bytes | None:
+        """读取会话文件字节。文本走 adapter.read，二进制走 base64 解码。
+
+        文件不存在返回 None；rel_path 非法（含 .. / 绝对路径）返回 None。
+        """
+        rel = self._normalize_rel(rel_path)
+        if rel is None:
+            return None
+        try:
+            adapter = await self._get_adapter(user_id, session_id)
+            abs_path = f"{self._session_dir(session_id)}/{rel}"
+            if self._is_text_rel(rel):
+                text = await adapter.read(abs_path)
+                return text.encode("utf-8") if isinstance(text, str) else bytes(text)
+            # 二进制：base64 解码
+            result = await adapter.bash(f"base64 -w0 {abs_path} 2>/dev/null || true")
+            stdout = result.get("stdout", "") if isinstance(result, dict) else ""
+            stdout = stdout.strip()
+            if not stdout:
+                return None
+            import base64
+            return base64.b64decode(stdout)
+        except Exception:
+            logger.warning(
+                f"[opensandbox_ws] read_session_file 失败 "
+                f"user={user_id} session={session_id} rel={rel_path}",
+                exc_info=True,
+            )
+            return None
+
+    async def stat_session_file(
+        self, user_id: str, session_id: str, rel_path: str
+    ) -> int | None:
+        """返回文件字节大小；文件不存在返回 None。"""
+        rel = self._normalize_rel(rel_path)
+        if rel is None:
+            return None
+        try:
+            adapter = await self._get_adapter(user_id, session_id)
+            abs_path = f"{self._session_dir(session_id)}/{rel}"
+            result = await adapter.bash(
+                f"stat -c %s {abs_path} 2>/dev/null || true"
+            )
+            stdout = result.get("stdout", "") if isinstance(result, dict) else ""
+            stdout = stdout.strip()
+            if not stdout or not stdout.isdigit():
+                return None
+            return int(stdout)
+        except Exception:
+            logger.warning(
+                f"[opensandbox_ws] stat_session_file 失败 "
+                f"user={user_id} session={session_id} rel={rel_path}",
+                exc_info=True,
+            )
+            return None
+
     async def close(self, workspace_id: str) -> None:
         await self._evict(workspace_id)
 

@@ -242,18 +242,43 @@ async def _detect_and_emit_files(
     session_id: Optional[str],
     before_files: set,
     session_service: Any,
+    workspace_manager: Any = None,
+    workspace_backend: str = "docker",
+    user_id: str = "",
 ) -> AsyncGenerator[str, None]:
-    """检测本轮新文件并 yield files_generated 事件，随后持久化文件元信息。"""
+    """检测本轮新文件并 yield files_generated 事件，随后持久化文件元信息。
+
+    OpenSandbox 后端走 workspace_manager.list_session_files/stat_session_file；
+    Docker 后端走原 file_change_detector.snapshot/build_file_meta。
+    """
+    import mimetypes
+
     files_payload = []
     try:
-        after_files = snapshot(os.path.join(WORKSPACE_BASEDIR, session_id)) if session_id else set()
-        new_files = diff(before_files, after_files)
-        for rel_path in new_files:
-            meta = build_file_meta(
-                os.path.join(WORKSPACE_BASEDIR, session_id), rel_path, session_id
-            )
-            if meta is not None:
-                files_payload.append(meta)
+        if workspace_backend == "opensandbox" and workspace_manager is not None and session_id:
+            after_files = await workspace_manager.list_session_files(user_id, session_id)
+            new_files = diff(before_files, after_files)
+            for rel_path in new_files:
+                size = await workspace_manager.stat_session_file(user_id, session_id, rel_path)
+                if size is None:
+                    continue
+                media_type = mimetypes.guess_type(rel_path)[0] or "application/octet-stream"
+                files_payload.append({
+                    "name": os.path.basename(rel_path),
+                    "path": rel_path,
+                    "url": f"/files/{session_id}/{rel_path}",
+                    "size": size,
+                    "media_type": media_type,
+                })
+        else:
+            after_files = snapshot(os.path.join(WORKSPACE_BASEDIR, session_id)) if session_id else set()
+            new_files = diff(before_files, after_files)
+            for rel_path in new_files:
+                meta = build_file_meta(
+                    os.path.join(WORKSPACE_BASEDIR, session_id), rel_path, session_id
+                )
+                if meta is not None:
+                    files_payload.append(meta)
     except Exception:
         logger.warning("[chat_service] 检测新文件失败", exc_info=True)
     yield f"data: {json.dumps({'type': 'files_generated', 'files': files_payload}, ensure_ascii=False)}\n\n"
@@ -378,6 +403,8 @@ async def generate_response(
     search_enabled: bool = True,
     skills: List[str] = None,
     cancel_event: Optional[asyncio.Event] = None,
+    workspace_manager: Any = None,
+    workspace_backend: str = "docker",
 ) -> AsyncGenerator[str, None]:
     """根据消息列表生成流式回复（多智能体编排版本）。
 
@@ -403,7 +430,10 @@ async def generate_response(
     before_files: set = set()
     if session_id:
         try:
-            before_files = snapshot(os.path.join(WORKSPACE_BASEDIR, session_id))
+            if workspace_backend == "opensandbox" and workspace_manager is not None:
+                before_files = await workspace_manager.list_session_files(user_id, session_id)
+            else:
+                before_files = snapshot(os.path.join(WORKSPACE_BASEDIR, session_id))
         except Exception:
             logger.warning("[chat_service] 快照 session 工作目录失败", exc_info=True)
 
@@ -486,7 +516,12 @@ async def generate_response(
             )
 
             # ⑦ 检测本轮新文件
-            async for ev in _detect_and_emit_files(session_id, before_files, session_service):
+            async for ev in _detect_and_emit_files(
+                session_id, before_files, session_service,
+                workspace_manager=workspace_manager,
+                workspace_backend=workspace_backend,
+                user_id=user_id or "",
+            ):
                 yield ev
 
             # 更新根 span 输出（context manager 退出时自动 end）
