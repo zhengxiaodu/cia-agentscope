@@ -129,6 +129,7 @@ class IntentRecognizer:
             self._model_config,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            stage="llm-intent-recognition",
         )
         data = extract_json(raw_text)
         if data is None:
@@ -197,6 +198,7 @@ class IntentRecognizer:
             self._model_config,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            stage="llm-intent-orchestration",
         )
         data = extract_json(raw_text)
         if data is None:

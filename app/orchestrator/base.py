@@ -64,6 +64,7 @@ class TaskResult(BaseModel):
     output: str = ""
     events: List[str] = Field(default_factory=list)
     final_state: Optional[dict] = None
+    metadata: Optional[dict] = None
 
 
 class BaseOrchestrator(ABC):
@@ -141,16 +142,19 @@ class BaseOrchestrator(ABC):
             else _noop_ctx()
         )
         with span_ctx as agent_span:
+            from app.utils.agent_event_tracer import AgentEventTracer
+            from app.utils.agent_event_stream import iter_agent_events
+            tracer = AgentEventTracer(langfuse_service, agent_id)
             try:
-                async for event in agent.reply_stream(user_msg):
-                    if isinstance(event, ReplyStartEvent):
-                        apply = AssistantMsg(name=event.name, content=[], id=event.reply_id)
+                def _on_reply_start(ev):
+                    nonlocal apply
+                    apply = AssistantMsg(name=ev.name, content=[], id=ev.reply_id)
 
-                    if isinstance(event, AgentEvent):
-                        if apply:
-                            apply.append_event(event)
-                        # 实时透传事件给上层
-                        yield f"data: {event.model_dump_json()}\n\n"
+                async for event in iter_agent_events(agent, user_msg, tracer, _on_reply_start):
+                    if apply:
+                        apply.append_event(event)
+                    # 实时透传事件给上层
+                    yield f"data: {event.model_dump_json()}\n\n"
 
                 # 提取文本输出
                 if apply:
@@ -168,12 +172,15 @@ class BaseOrchestrator(ABC):
                 logger.exception(f"[Orchestrator] 智能体 {agent_id} 执行异常")
                 result.success = False
                 result.output = f"执行出错: {str(e)}"
+            finally:
+                tracer.close()
 
             if agent_span:
                 try:
                     agent_span.update(output={
                         "output": result.output,
                         "success": result.success,
+                        **tracer.summary(),
                     })
                 except Exception:
                     pass

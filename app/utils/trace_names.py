@@ -24,6 +24,7 @@ class TraceName(StrEnum):
     # ---- 执行层 ----
     AGENT_RUN = "agent-{agent_id}"
     REACT_STEP = "react-step-{step}"
+    ORCHESTRATE_PIPELINE = "orchestrate-pipeline"
 
     # ---- LLM（generation 类型）----
     LLM_QUERY_REWRITE = "llm-query-rewrite"

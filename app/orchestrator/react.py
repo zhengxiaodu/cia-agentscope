@@ -13,6 +13,7 @@
 import asyncio
 import json
 import logging
+import time
 from typing import Any, AsyncGenerator, Dict, Optional, Union
 
 from agentscope.state import AgentState
@@ -23,6 +24,7 @@ from app.agents.factory import AgentFactory
 from app.intent.models import IntentResult
 from app.orchestrator.base import BaseOrchestrator, TaskResult
 from app.intent.llm_client import chat_complete, extract_json
+from app.utils.trace_names import TraceName
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,24 @@ class ReActOrchestrator(BaseOrchestrator):
         self._last_results = []
 
         for step in range(1, self._max_steps + 1):
+            step_t0 = time.perf_counter()
+
+            def _emit_step_span(action="", is_final=False, observation_preview="", exceeded=False):
+                if not (langfuse_service and getattr(langfuse_service, "enabled", False)):
+                    return
+                try:
+                    obs = langfuse_service.start_observation(
+                        name=TraceName.REACT_STEP.format(step=step), as_type="span",
+                        input={"step": step, "max_steps": self._max_steps})
+                    out = {"action": action, "isFinal": is_final,
+                           "observationPreview": observation_preview[:200],
+                           "durationMs": int((time.perf_counter() - step_t0) * 1000)}
+                    if exceeded:
+                        out["exceeded"] = True
+                    langfuse_service.end_observation(obs, output=out)
+                except Exception:
+                    pass
+
             yield self._event({
                 "type": "react_step",
                 "step": step,
@@ -97,6 +117,7 @@ class ReActOrchestrator(BaseOrchestrator):
 
             if thought.get("is_final"):
                 conclusion = thought.get("conclusion", "")
+                _emit_step_span(action="final", is_final=True, observation_preview=conclusion)
                 yield self._event({
                     "type": "react_final",
                     "step": step,
@@ -113,6 +134,7 @@ class ReActOrchestrator(BaseOrchestrator):
             action = thought.get("next_action")
             if not action:
                 logger.warning(f"[ReAct] 第 {step} 步无 action，终止循环")
+                _emit_step_span(action="", is_final=True, observation_preview="无法确定下一步动作")
                 yield self._event({
                     "type": "react_final",
                     "step": step,
@@ -152,13 +174,22 @@ class ReActOrchestrator(BaseOrchestrator):
             )
             scratch += step_record
 
+            _emit_step_span(action=action_name, is_final=False, observation_preview=observation)
             yield self._event({
                 "type": "react_observe",
                 "step": step,
                 "observation_preview": observation[:200],
             })
 
-        # 步数超限兜底
+        # 步数超限兜底：补一条 exceeded span
+        if langfuse_service and getattr(langfuse_service, "enabled", False):
+            try:
+                obs = langfuse_service.start_observation(
+                    name=TraceName.REACT_STEP.format(step=self._max_steps), as_type="span",
+                    input={"exceeded": True, "max_steps": self._max_steps})
+                langfuse_service.end_observation(obs, output={"exceeded": True, "maxSteps": self._max_steps})
+            except Exception:
+                pass
         yield self._event({
             "type": "react_timeout",
             "max_steps": self._max_steps,
@@ -204,6 +235,7 @@ class ReActOrchestrator(BaseOrchestrator):
             self._think_model_config,
             system_prompt="你是一个 ReAct 推理引擎，严格输出 JSON。",
             user_prompt=prompt,
+            stage="llm-react-think",
         )
 
         data = extract_json(raw_text)

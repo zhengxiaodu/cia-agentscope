@@ -9,6 +9,7 @@
 import asyncio
 import json
 import logging
+import traceback
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from agentscope.state import AgentState
@@ -96,6 +97,10 @@ class ParallelOrchestrator(BaseOrchestrator):
                     agent_id=agent_id,
                     success=False,
                     output=f"执行异常: {str(e)}",
+                    metadata={
+                        "errorClass": f"{type(e).__module__}.{type(e).__name__}",
+                        "traceback": traceback.format_exc()[-1000:],
+                    },
                 ))
             finally:
                 await queue.put(SENTINEL)

@@ -624,16 +624,20 @@ class OrchestratorService:
             f"agent-{agent_id}",
             {"intent": intent.id, "query": user_input},
         ) as agent_span:
+            from app.utils.agent_event_tracer import AgentEventTracer
+            from app.utils.agent_event_stream import iter_agent_events
+            tracer = AgentEventTracer(langfuse_service, agent_id)
             try:
-                async for event in agent.reply_stream(user_msg):
-                    if isinstance(event, ReplyStartEvent):
-                        apply = AssistantMsg(
-                            name=event.name, content=[], id=event.reply_id
-                        )
-                    if isinstance(event, AgentEvent):
-                        if apply:
-                            apply.append_event(event)
-                        yield f"data: {event.model_dump_json()}\n\n"
+                def _on_reply_start(ev):
+                    nonlocal apply
+                    apply = AssistantMsg(
+                        name=ev.name, content=[], id=ev.reply_id
+                    )
+
+                async for event in iter_agent_events(agent, user_msg, tracer, _on_reply_start):
+                    if apply:
+                        apply.append_event(event)
+                    yield f"data: {event.model_dump_json()}\n\n"
 
                 if apply:
                     text_parts = []
@@ -660,6 +664,7 @@ class OrchestratorService:
                 _safe_update_span(agent_span, {
                     "output": final_output_parts[0] if final_output_parts else "",
                     "success": True,
+                    **tracer.summary(),
                 })
             except Exception as e:
                 logger.exception(
@@ -671,6 +676,8 @@ class OrchestratorService:
                     "message": f"执行出错: {str(e)}",
                 })
                 return
+            finally:
+                tracer.close()
 
         # yield summary 事件
         if final_output_parts:
@@ -748,10 +755,12 @@ class OrchestratorService:
         ) as rw_span:
             try:
                 rewritten, rw_prompts = await rewriter.rewrite(user_input, history)
-            except Exception:
+                _rw_extra = {}
+            except Exception as e:
                 logger.exception("[OrchestratorService] 查询改写失败，使用原始输入")
                 rewritten, rw_prompts = user_input, {}
-            _safe_update_span(rw_span, {"rewritten": rewritten, "prompts": rw_prompts})
+                _rw_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
+            _safe_update_span(rw_span, {"rewritten": rewritten, "prompts": rw_prompts, **_rw_extra})
 
         yield self._event({
             "type": "query_rewritten",
@@ -770,13 +779,15 @@ class OrchestratorService:
         ) as rec_span:
             try:
                 intents, rec_prompts = await recognizer.recognize_intents(rewritten, history)
-            except Exception:
+                _rec_extra = {}
+            except Exception as e:
                 logger.exception("[OrchestratorService] 意图识别失败，降级为 general_chat")
                 intents = [Intent(id="general_chat", query=rewritten, agent="general_agent")]
                 rec_prompts = {}
+                _rec_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
             _safe_update_span(rec_span, {
                 "intents": [{"id": i.id, "agent": i.agent} for i in intents],
-                "prompts": rec_prompts,
+                "prompts": rec_prompts, **_rec_extra,
             })
         yield self._event({
             "type": "intent_step", "phase": "recognition", "status": "done",
@@ -794,12 +805,14 @@ class OrchestratorService:
         ) as orch_span:
             try:
                 relation, execution_order, orch_prompts = await recognizer.plan_orchestration(rewritten, intents)
-            except Exception:
+                _orch_extra = {}
+            except Exception as e:
                 logger.exception("[OrchestratorService] 意图编排失败，降级为 independent")
                 relation, execution_order, orch_prompts = "independent", [], {}
+                _orch_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
             _safe_update_span(orch_span, {
                 "relation": relation, "execution_order": execution_order,
-                "prompts": orch_prompts,
+                "prompts": orch_prompts, **_orch_extra,
             })
         # 按 execution_order 重排 intents（校验长度一致才应用，否则按原顺序）
         if execution_order and len(execution_order) == len(intents):

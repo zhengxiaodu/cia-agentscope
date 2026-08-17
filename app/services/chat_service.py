@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import asyncio
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional, Tuple
@@ -45,6 +46,11 @@ def _estimate_tokens(content: str) -> int:
     return int(chinese_count * 1.5 + ascii_count * 0.25)
 
 
+def _compute_ttft_marker(event_type: str) -> bool:
+    """判断某事件类型是否是首个用户可见内容事件（用于 TTFT 计时）。"""
+    return event_type in ("TEXT_BLOCK_DELTA", "summary")
+
+
 async def _generate_recommended_questions(
     orchestrator_service,
     user_input: str,
@@ -73,7 +79,7 @@ async def _generate_recommended_questions(
         )
         user_prompt = f"用户提问：{user_input}\n\n助手回答：{final_output}"
 
-        text = await chat_complete(client, model_config, system_prompt, user_prompt)
+        text = await chat_complete(client, model_config, system_prompt, user_prompt, stage="llm-recommended-questions")
         data = extract_json(text)
         if not isinstance(data, dict):
             return [], {}
@@ -436,6 +442,9 @@ async def generate_response(
     final_fallback_parts: List[str] = []
     final_output = ""
     aborted = False
+    t0 = time.perf_counter()
+    ttft_ms = None
+    aborted_at_ms = None
 
     # ② 快照工作目录（用于结束后检测新文件）
     before_files: set = set()
@@ -491,6 +500,7 @@ async def generate_response(
                 # 取消检查点：每个事件之间检测一次（LLM chunk 之间会回到本循环）
                 if _cancelled():
                     aborted = True
+                    aborted_at_ms = int((time.perf_counter() - t0) * 1000)
                     raise asyncio.CancelledError()
                 yield event_str
 
@@ -499,6 +509,9 @@ async def generate_response(
                     if event_str.startswith("data: ") and event_str.endswith("\n\n"):
                         payload = json.loads(event_str[6:].strip())
                         event_type = payload.get("type", "")
+
+                        if ttft_ms is None and _compute_ttft_marker(event_type):
+                            ttft_ms = int((time.perf_counter() - t0) * 1000)
 
                         if event_type == "summary":
                             final_output_parts.append(payload.get("content", ""))
@@ -524,6 +537,7 @@ async def generate_response(
             # 编排流结束后的取消检查（避免后续步骤继续执行）
             if _cancelled():
                 aborted = True
+                aborted_at_ms = int((time.perf_counter() - t0) * 1000)
                 raise asyncio.CancelledError()
 
             # ⑤ 编排流结束立即生成推荐问题（前置，让前端尽快拿到）
@@ -552,10 +566,16 @@ async def generate_response(
                 "reply": final_output,
                 "session_id": session_id,
                 "user_id": user_id,
+                "ttftMs": ttft_ms,
+                "totalMs": int((time.perf_counter() - t0) * 1000),
+                "aborted": aborted,
+                "abortedAtMs": aborted_at_ms,
             })
     except asyncio.CancelledError:
         # 中断时吞掉 CancelledError，进入 finally 做清理（不重新 raise，让流优雅结束）
         aborted = True
+        if aborted_at_ms is None:
+            aborted_at_ms = int((time.perf_counter() - t0) * 1000)
         logger.info(f"[chat_service] 会话被用户中断 session={session_id}")
     finally:
         # 中断时也落库：success 强制 False（绕开单例 last_success 污染）
