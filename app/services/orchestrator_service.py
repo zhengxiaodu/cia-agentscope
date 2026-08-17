@@ -522,29 +522,63 @@ class OrchestratorService:
             return langfuse_service.start_span(name, input=input_dict)
         return _noop_ctx()
 
+    @staticmethod
+    def _migrate_legacy_enum_values(state_dict: dict) -> dict:
+        """修正历史脏数据中枚举被 str() 序列化的问题。
+
+        根因：早期保存使用 model_dump() + json.dumps(default=str)，枚举实例
+        （如 PermissionMode.BYPASS）被 str() 转成 "PermissionMode.BYPASS"
+        而非 "bypass"，导致反序列化时 PermissionMode("PermissionMode.BYPASS")
+        抛 ValueError。此处检测并修正为合法的枚举值。
+        """
+        if not isinstance(state_dict, dict):
+            return state_dict
+
+        # permission_context.mode: "PermissionMode.BYPASS" → "bypass"
+        perm = state_dict.get("permission_context")
+        if isinstance(perm, dict):
+            mode = perm.get("mode")
+            if isinstance(mode, str) and mode.startswith("PermissionMode."):
+                perm["mode"] = mode.split(".", 1)[1].lower()
+        return state_dict
+
     async def _load_agent_state(
         self,
         session_service: Any,
         session_id: Optional[str],
         agent_id: str,
     ) -> Optional[AgentState]:
-        """加载单个 agent 的 AgentState：从 session_service 读取 + trim 截断 + 异常兜底。
+        """加载单个 agent 的 AgentState：从 session_service 读取 + 历史脏数据迁移
+        + trim 截断 + 异常兜底。
 
         session_service 为空或读取失败均返回 None（调用方创建新状态）。
+        反序列化失败时记录 warning（含异常栈），便于定位 schema 不兼容问题。
         """
         if not (session_service and session_id):
             return None
         try:
             state_dict = await session_service.load_agent_state(session_id, agent_id)
-            if state_dict:
-                # 截断 context 为最近 N 条，控制模型输入 token
-                state_dict = self._trim_state_context(state_dict)
-                return AgentState.model_validate(state_dict)
         except Exception:
-            logger.debug(
-                f"[OrchestratorService] 无法加载 {agent_id} 状态，将新建"
+            logger.warning(
+                f"[OrchestratorService] 读取 {agent_id} 状态失败，将新建",
+                exc_info=True,
             )
-        return None
+            return None
+        if not state_dict:
+            return None
+
+        # 历史脏数据迁移：修正 "PermissionMode.BYPASS" → "bypass" 等
+        state_dict = self._migrate_legacy_enum_values(state_dict)
+        # 截断 context 为最近 N 条，控制模型输入 token
+        state_dict = self._trim_state_context(state_dict)
+        try:
+            return AgentState.model_validate(state_dict)
+        except Exception:
+            logger.warning(
+                f"[OrchestratorService] 反序列化 {agent_id} 状态失败，将新建",
+                exc_info=True,
+            )
+            return None
 
     async def _persist_agent_state(
         self,
@@ -646,8 +680,8 @@ class OrchestratorService:
                             text_parts.append(getattr(block, "text", str(block)))
                     final_output_parts.append("\n".join(text_parts).strip())
 
-                # 保存 AgentState
-                final_state = agent.state.model_dump()
+                # 保存 AgentState（mode="json" 确保枚举等类型序列化为值，避免落库后无法反序列化）
+                final_state = agent.state.model_dump(mode="json")
                 await self._persist_agent_state(
                     session_service, session_id, user_id, agent_id, final_state,
                 )

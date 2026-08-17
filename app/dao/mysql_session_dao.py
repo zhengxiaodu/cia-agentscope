@@ -617,7 +617,7 @@ class SessionDAO:
         """
         now = datetime.now(timezone.utc)
         state_json = json.dumps(
-            state.model_dump(),
+            state.model_dump(mode="json"),
             ensure_ascii=False,
             default=str,
         )

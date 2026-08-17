@@ -165,7 +165,8 @@ class BaseOrchestrator(ABC):
                     result.output = "\n".join(text_parts).strip()
 
                 # 捕获执行后的 AgentState（用于后续持久化）
-                result.final_state = agent.state.model_dump()
+                # mode="json" 确保枚举等类型序列化为值，避免落库后无法反序列化
+                result.final_state = agent.state.model_dump(mode="json")
 
                 result.success = True
             except Exception as e:
