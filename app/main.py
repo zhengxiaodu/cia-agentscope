@@ -44,9 +44,17 @@ from app.services.action_audit_service import ActionAuditService
 from app.services.langfuse_service import LangfuseService
 from app.routes import auth, chat, feedback, files, health, mng_proxy, sessions, upload, action_audit
 
+import logging
+from app.utils.logging_setup import setup_logging
+
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # P0-2: 结构化日志初始化（必须在所有业务初始化之前，保证后续日志可被采集）
+    setup_logging()
+
     # 初始化模型配置
     model_config = load_model_config(MODEL_CONFIG_PATH)
     app.state.model_config = model_config
@@ -74,10 +82,10 @@ async def lifespan(app: FastAPI):
             pool_size=OPENSANDBOX_POOL_SIZE,
             pool_refill=OPENSANDBOX_POOL_REFILL,
         )
-        print(
-            f"Workspace manager initialized [opensandbox] "
-            f"(domain={OPENSANDBOX_DOMAIN}, image={OPENSANDBOX_IMAGE}, ttl={WORKSPACE_TTL}, "
-            f"pool_size={OPENSANDBOX_POOL_SIZE})"
+        logger.info(
+            "Workspace manager initialized [opensandbox] "
+            "(domain=%s, image=%s, ttl=%s, pool_size=%s)",
+            OPENSANDBOX_DOMAIN, OPENSANDBOX_IMAGE, WORKSPACE_TTL, OPENSANDBOX_POOL_SIZE,
         )
     else:
         workspace_manager = DockerWorkspaceManager(
@@ -87,9 +95,10 @@ async def lifespan(app: FastAPI):
             pip_index_url=PIP_INDEX_URL,
             pip_trusted_host=PIP_TRUSTED_HOST,
         )
-        print(
-            f"Workspace manager initialized [docker] "
-            f"(image={WORKSPACE_BASE_IMAGE}, basedir={WORKSPACE_BASEDIR}, ttl={WORKSPACE_TTL})"
+        logger.info(
+            "Workspace manager initialized [docker] "
+            "(image=%s, basedir=%s, ttl=%s)",
+            WORKSPACE_BASE_IMAGE, WORKSPACE_BASEDIR, WORKSPACE_TTL,
         )
 
     app.state.workspace_manager = workspace_manager
@@ -103,16 +112,17 @@ async def lifespan(app: FastAPI):
         interval_hours=WORKSPACE_CLEANUP_INTERVAL_HOURS,
     )
     cleanup_service.start()
-    print(
-        f"Workspace cleanup service started "
-        f"(retention={WORKSPACE_RETENTION_DAYS}天, interval={WORKSPACE_CLEANUP_INTERVAL_HOURS}小时)"
+    logger.info(
+        "Workspace cleanup service started "
+        "(retention=%d天, interval=%d小时)",
+        WORKSPACE_RETENTION_DAYS, WORKSPACE_CLEANUP_INTERVAL_HOURS,
     )
 
     # 初始化多智能体编排服务（加载智能体定义 + skill + 意图识别器）
     app.state.orchestrator_service = await OrchestratorService.create(
         model_config, workspace_manager
     )
-    print("Orchestrator service initialized (multi-agent + multi-intent)")
+    logger.info("Orchestrator service initialized (multi-agent + multi-intent)")
 
     # ---- Redis（保留，用于其他需求） ----
     redis_client = aioredis.from_url(
@@ -120,7 +130,7 @@ async def lifespan(app: FastAPI):
         decode_responses=False,
     )
     app.state.redis_client = redis_client
-    print(f"Redis client initialized ({REDIS_URL})")
+    logger.info("Redis client initialized (%s)", REDIS_URL)
 
     # ---- MySQL 连接池（会话持久化） ----
     mysql_pool = await aiomysql.create_pool(
@@ -141,17 +151,20 @@ async def lifespan(app: FastAPI):
     action_audit_dao = ActionAuditDAO(mysql_pool)
     app.state.action_audit_dao = action_audit_dao
     app.state.action_audit_service = ActionAuditService(action_audit_dao)
-    print(
-        f"Session service initialized "
-        f"(MySQL: {MYSQL_USER}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE})"
+    logger.info(
+        "Session service initialized "
+        "(MySQL: %s@%s:%s/%s)",
+        MYSQL_USER, MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE,
     )
 
     # 初始化 Langfuse 追踪服务（非强依赖）
     app.state.langfuse_service = LangfuseService()
+    from app.services.langfuse_service import set_current_langfuse
+    set_current_langfuse(app.state.langfuse_service)
     if app.state.langfuse_service.enabled:
-        print("Langfuse service initialized")
+        logger.info("Langfuse service initialized")
     else:
-        print("Langfuse service disabled (credentials not configured)")
+        logger.info("Langfuse service disabled (credentials not configured)")
 
     # 会话取消标志注册表：session_id → asyncio.Event（/chat/stop 触发 set，生成器检测后中断）
     app.state.chat_tasks: dict[str, asyncio.Event] = {}
@@ -161,19 +174,26 @@ async def lifespan(app: FastAPI):
     # 关闭工作区管理器（停清扫 + 销毁全部容器）
     await workspace_manager.stop_sweeper()
     await workspace_manager.close_all()
-    print("Workspace manager closed")
+    logger.info("Workspace manager closed")
 
     cleanup_service.stop()
-    print("Workspace cleanup service stopped")
+    logger.info("Workspace cleanup service stopped")
 
     # 关闭 MySQL 连接池
     mysql_pool.close()
     await mysql_pool.wait_closed()
-    print("MySQL pool closed")
+    logger.info("MySQL pool closed")
 
     # 关闭 Redis 连接
     await redis_client.close()
-    print("Redis connection closed")
+    logger.info("Redis connection closed")
+
+    # P0-4: Langfuse 批量缓冲区落盘，避免滚动发布丢失未上报 trace
+    try:
+        app.state.langfuse_service.flush()
+        logger.info("Langfuse service flushed")
+    except Exception:
+        logger.warning("Langfuse flush on shutdown failed", exc_info=True)
 
 
 app = FastAPI(lifespan=lifespan)

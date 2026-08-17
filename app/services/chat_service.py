@@ -296,25 +296,32 @@ async def _finalize_trace(
     root_obs: Any,
     session_service: Any,
     session_id: Optional[str],
+    already_emitted: bool = False,
 ) -> AsyncGenerator[str, None]:
-    """Langfuse trace 收尾：flush + yield trace_ready + 保存 trace_id 到 Redis。
+    """Langfuse trace 收尾：flush + （可选）yield trace_ready + 保存 trace_id。
 
     在根 span context manager 之外执行，保证 span 已 end。
+    already_emitted=True 时跳过 trace_ready 下发与 trace_id 保存（已在流首处理），
+    但仍执行 flush。
     """
-    trace_id = None
     if langfuse_service and langfuse_service.enabled:
         try:
             langfuse_service.flush()
-            trace_id = root_obs.trace_id if root_obs else None
         except Exception:
             pass
 
-    trace_event = json.dumps({"type": "trace_ready", "trace_id": trace_id})
-    yield f"data: {trace_event}\n\n"
+    if not already_emitted:
+        trace_id = None
+        try:
+            trace_id = root_obs.trace_id if root_obs else None
+        except Exception:
+            pass
+        trace_event = json.dumps({"type": "trace_ready", "trace_id": trace_id})
+        yield f"data: {trace_event}\n\n"
 
-    # 保存 trace_id 到 Redis 元信息
-    if session_service and session_id and trace_id:
-        await session_service.save_latest_trace_id(session_id, trace_id)
+        # 保存 trace_id 到 Redis 元信息
+        if session_service and session_id and trace_id:
+            await session_service.save_latest_trace_id(session_id, trace_id)
 
 
 def load_model_config(config_path: str = MODEL_CONFIG_PATH) -> dict:
@@ -455,8 +462,20 @@ async def generate_response(
         else _noop_ctx()
     )
     root_obs = None
+    trace_emitted = False
     try:
         with root_span_ctx as root_obs:
+            # P0-3: 流首即下发真实 trace_id（span 内即可读），前端可立即关联反馈
+            trace_id = getattr(root_obs, "trace_id", None) if root_obs else None
+            if trace_id:
+                trace_emitted = True
+                yield f"data: {json.dumps({'type': 'trace_ready', 'trace_id': trace_id})}\n\n"
+                # 流首保存 trace_id（替代原 finalize 阶段保存，供反馈关联）
+                if session_service and session_id:
+                    try:
+                        await session_service.save_latest_trace_id(session_id, trace_id)
+                    except Exception:
+                        logger.warning("[chat_service] 流首保存 trace_id 失败", exc_info=True)
             # ④ 执行编排主流程，实时透传 SSE 事件
             async for event_str in orchestrator_service.run(
                 full_messages,
@@ -555,7 +574,10 @@ async def generate_response(
                     logger.warning("[chat_service] 标记中断消息失败状态失败", exc_info=True)
 
         # ⑧ trace 收尾（保证 span 已 end + flush）
-        async for ev in _finalize_trace(langfuse_service, root_obs, session_service, session_id):
+        async for ev in _finalize_trace(
+            langfuse_service, root_obs, session_service, session_id,
+            already_emitted=trace_emitted,
+        ):
             yield ev
 
         # 中断时给前端发送 user_abort 事件
