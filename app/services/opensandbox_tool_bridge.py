@@ -68,8 +68,11 @@ def create_opensandbox_tools(adapter: OpenSandboxToolAdapter) -> list:
         """
         try:
             # 确保父目录存在
-            parent = file_path.rsplit("/", 1)[0] if "/" in file_path else "."
+            # parent = file_path.rsplit("/", 1)[0] if "/" in file_path else "."
+            parent = adapter._workdir
             await adapter.ensure_dir(parent)
+            filename = file_path.rsplit("/", 1)[1] if "/" in file_path else file_path
+            file_path = parent + "/" + filename
             await adapter.write(file_path, content)
             return _text_chunk(f"Successfully wrote to {file_path}")
         except Exception as e:
@@ -84,6 +87,9 @@ def create_opensandbox_tools(adapter: OpenSandboxToolAdapter) -> list:
             new_text: The replacement text.
         """
         try:
+            parent = adapter._workdir
+            filename = file_path.rsplit("/", 1)[1] if "/" in file_path else file_path
+            file_path = parent + "/" + filename
             await adapter.edit(file_path, old_text, new_text)
             return _text_chunk(f"Successfully edited {file_path}")
         except Exception as e:

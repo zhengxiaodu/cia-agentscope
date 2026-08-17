@@ -59,6 +59,8 @@ async def chat(request: Request, body: ChatRequest, user: dict = Depends(current
                 search_enabled=body.search_enabled,
                 skills=body.skills,
                 cancel_event=cancel_event,
+                workspace_manager=getattr(request.app.state, "workspace_manager", None),
+                workspace_backend=getattr(request.app.state, "workspace_backend", "docker"),
             ):
                 yield event
         finally:

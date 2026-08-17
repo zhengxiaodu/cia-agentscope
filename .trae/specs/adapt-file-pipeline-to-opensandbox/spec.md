@@ -6,7 +6,7 @@ OpenSandbox 后端下，智能体生成的文件只存在于沙箱内 `/data/wor
 
 ## What Changes
 
-- 在 `OpenSandboxWorkspaceManager` 上新增会话文件访问能力：`list_session_files` / `read_session_file` / `stat_session_file`，下沉到 SDK 沙箱内读取
+- 在 `OpenSandboxWorkspaceManager` 上新增会话文件访问能力：`list_session_files` / `read_session_file` / `stat_session_file`，**复用已有的 `OpenSandboxToolAdapter`**（封装了 `sbx.commands.run` / `sbx.files.read_file` / `sbx.files.search`），不在 manager 内直接调 SDK
 - `chat_service._detect_and_emit_files` 检测路径按后端分支：OpenSandbox 走管理器新方法，Docker 走原宿主机 `snapshot`
 - `files.py` 下载/读取路径按后端分支：OpenSandbox 走管理器 `read_session_file`，Docker 走原 `FileResponse`
 - 新增 `GET /files/{session_id}/{path}?mode=inline` 内联读取（返回内容 + 正确 Content-Type），供前端预览面板使用
@@ -17,28 +17,33 @@ OpenSandbox 后端下，智能体生成的文件只存在于沙箱内 `/data/wor
 
 - Affected specs: `detect-and-stream-new-files`（检测链路）、`persist-and-return-session-files`（持久化链路，事件结构不变）、`switch-to-opensandbox-k8s-workspace`（管理器能力扩展）
 - Affected code:
-  - `app/services/opensandbox_workspace_manager.py`（新增 3 个方法）
-  - `app/services/chat_service.py`（`_detect_and_emit_files` 双后端分支 + 透传 `workspace_manager`/`workspace_backend`）
+  - `app/services/opensandbox_workspace_manager.py`（新增 3 个方法，内部构造 `OpenSandboxToolAdapter` 复用其 bash/read）
+  - `app/services/opensandbox_adapter.py`（可能补充 `read_bytes` 用于二进制读取，若现有 `read` 仅返回 str）
+  - `app/services/chat_service.py`（`_detect_and_emit_files` 双后端分支 + 透传 `workspace_manager`/`workspace_backend`/`user_id`）
   - `app/routes/files.py`（下载/内联双后端分支 + 越权校验重写）
-  - `app/main.py`（把 `workspace_manager`/`workspace_backend` 注入 `app.state` 供 files 路由读取）
+  - `app/main.py`（确认 `app.state.workspace_manager`/`workspace_backend` 已注入，供 files 路由读取）
 
 ## ADDED Requirements
 
 ### Requirement: OpenSandbox 会话文件访问能力
 
-`OpenSandboxWorkspaceManager` SHALL 提供 `list_session_files` / `read_session_file` / `stat_session_file` 三个方法，通过 SDK 在沙箱内读取文件，供检测和下载链路调用。
+`OpenSandboxWorkspaceManager` SHALL 提供 `list_session_files` / `read_session_file` / `stat_session_file` 三个方法，**复用 `OpenSandboxToolAdapter`**（已封装 `sbx.commands.run` / `sbx.files.read_file` / `sbx.files.search`），不在 manager 内直接调 SDK。
 
 #### Scenario: 列出会话文件
 - **WHEN** 调用 `list_session_files(user_id, session_id)`
-- **THEN** 返回该会话工作目录下所有文件的相对路径集合（POSIX `/` 分隔），跳过顶层 `data`/`skills` 目录和 `.mcp` 文件；沙箱不存在或目录为空返回空集合，不抛异常
+- **THEN** 通过 `OpenSandboxToolAdapter.bash("cd /data/workspaces/{sid} && find . -type f")` 执行，解析 stdout 为相对路径集合（去掉 `./` 前缀，POSIX `/`）；跳过顶层 `data`/`skills` 目录和 `.mcp` 文件；沙箱不存在/目录为空/异常返回空集合，记 warning 不抛
 
-#### Scenario: 读取文件字节
-- **WHEN** 调用 `read_session_file(user_id, session_id, rel_path)`
-- **THEN** 返回文件字节内容；文本走 `sbx.files.read_file`，二进制（图片等）走 `sbx.commands.run("base64 ...")` 解码；文件不存在返回 None
+#### Scenario: 读取文本文件
+- **WHEN** 调用 `read_session_file(user_id, session_id, rel_path)` 且文件为文本类（md/txt/json/csv/log/代码等）
+- **THEN** 通过 `OpenSandboxToolAdapter.read(abs_path)` 读取，返回 bytes（encode）；文件不存在返回 None
+
+#### Scenario: 读取二进制文件
+- **WHEN** 调用 `read_session_file(user_id, session_id, rel_path)` 且文件为二进制（图片等）
+- **THEN** 通过 `OpenSandboxToolAdapter.bash("base64 -w0 {abs_path}")` 读取 base64，解码为 bytes；文件不存在返回 None
 
 #### Scenario: 查询文件大小
 - **WHEN** 调用 `stat_session_file(user_id, session_id, rel_path)`
-- **THEN** 返回文件字节大小（int）；文件不存在返回 None
+- **THEN** 通过 `OpenSandboxToolAdapter.bash("stat -c %s {abs_path}")` 解析字节大小（int）；文件不存在返回 None
 
 ### Requirement: OpenSandbox 后端文件检测
 
@@ -76,4 +81,4 @@ OpenSandbox 后端下，智能体生成的文件只存在于沙箱内 `/data/wor
 
 ### Requirement: 文件检测与下载链路后端感知
 
-原 `detect-and-stream-new-files` 和 `persist-and-return-session-files` 的实现假设文件在宿主机文件系统。现修改为按 `WORKSPACE_BACKEND` 分支：OpenSandbox 后端走管理器沙箱内读取，Docker 后端走原宿主机路径。`files_generated` 事件结构、`session_files` 表、`append_session_files` 持久化逻辑均不变（前端契约零改动）。
+原 `detect-and-stream-new-files` 和 `persist-and-return-session-files` 的实现假设文件在宿主机文件系统。现修改为按 `WORKSPACE_BACKEND` 分支：OpenSandbox 后端走管理器沙箱内读取（复用 `OpenSandboxToolAdapter`），Docker 后端走原宿主机路径。`files_generated` 事件结构、`session_files` 表、`append_session_files` 持久化逻辑均不变（前端契约零改动）。
