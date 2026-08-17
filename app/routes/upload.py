@@ -1,6 +1,9 @@
 import os
+import uuid
 
+from agentscope.message import DataBlock, URLSource
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Request
+from pydantic import AnyUrl
 
 from app.dependencies import current_user
 from app.services.file_service import FileService
@@ -44,14 +47,35 @@ async def upload_file(
     if not session_id:
         session_service = request.app.state.session_service
         session_id = await session_service.get_or_create_session(None, user_id)
-    workdir = os.path.join(WORKSPACE_BASEDIR, session_id)
-    file_service = FileService(workdir=workdir)
-    datablock = await file_service.save_upload(
-        session_id=session_id,
-        filename=file.filename or "unknown",
-        content=content,
-        media_type=media_type,
-    )
+
+    workspace_backend = getattr(request.app.state, "workspace_backend", "docker")
+    workspace_manager = getattr(request.app.state, "workspace_manager", None)
+
+    if workspace_backend == "opensandbox" and workspace_manager is not None:
+        # OpenSandbox 后端：写入沙箱工作路径 adapter.workdir（/data/workspaces/{session_id}）
+        adapter = await workspace_manager._get_adapter(user_id, session_id)
+        filename = file.filename or "unknown"
+        unique_name = f"{uuid.uuid4().hex}_{filename}"
+        target_path = f"{adapter.workdir}/{unique_name}"
+        await adapter.upload(target_path, content)
+        datablock = DataBlock(
+            id=uuid.uuid4().hex,
+            name=filename,
+            source=URLSource(
+                url=AnyUrl(f"sandbox://{session_id}/{unique_name}"),
+                media_type=media_type,
+            ),
+        )
+    else:
+        # Docker 后端：原宿主机落盘逻辑
+        workdir = os.path.join(WORKSPACE_BASEDIR, session_id)
+        file_service = FileService(workdir=workdir)
+        datablock = await file_service.save_upload(
+            session_id=session_id,
+            filename=file.filename or "unknown",
+            content=content,
+            media_type=media_type,
+        )
 
     return UploadResponse(
         code=200,
