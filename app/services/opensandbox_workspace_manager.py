@@ -22,6 +22,8 @@ from opensandbox import Sandbox
 from opensandbox.config import ConnectionConfig
 from opensandbox.models.filesystem import WriteEntry
 
+from agentscope.skill import Skill
+
 logger = logging.getLogger(__name__)
 
 # ---- 高可用配置常量 ----
@@ -391,11 +393,12 @@ class OpenSandboxWorkspaceManager:
             return entry.sandbox
 
     # ---- 兼容 agentscope workspace 接口 ----
-    async def list_skills(self, user_id: str = "", session_id: str = "") -> list[dict]:
+    async def list_skills(self, user_id: str = "", session_id: str = "") -> list[Skill]:
         """列出沙箱内已注入的技能元数据。
 
         扫描沙箱内 /workspace/skills/ 目录，读取每个技能的 SKILL.md 提取名称和描述。
-        返回格式兼容 agentscope workspace.list_skills() 的 dict 列表。
+        返回 agentscope Skill 对象列表，与 agentscope workspace.list_skills() 接口一致
+        （Toolkit.skills_or_loaders 仅接受 str | Skill | SkillLoaderBase，不接受 dict）。
         """
         wid = self._workspace_id(user_id) if user_id else None
         entry = self._cache.get(wid) if wid else None
@@ -416,7 +419,7 @@ class OpenSandboxWorkspaceManager:
             stdout_lines = [m.text for m in result.logs.stdout]
             if not stdout_lines:
                 return []
-            skills = []
+            skills: list[Skill] = []
             for line in stdout_lines:
                 skill_name = line.strip()
                 if not skill_name:
@@ -431,11 +434,15 @@ class OpenSandboxWorkspaceManager:
                     (ln.strip() for ln in desc_lines if ln.strip()),
                     skill_name,
                 )
-                skills.append({
-                    "name": skill_name,
-                    "description": desc,
-                    "directory": f"/workspace/skills/{skill_name}",
-                })
+                skills.append(Skill(
+                    name=skill_name,
+                    description=desc,
+                    dir=f"/workspace/skills/{skill_name}",
+                    # markdown 暂不读取完整内容，skill_instruction_template
+                    # 只用 name/description/dir；如需完整内容可后续按需加载
+                    markdown="",
+                    updated_at=0.0,
+                ))
             return skills
         except Exception:
             logger.exception("[opensandbox_ws] list_skills 失败")
