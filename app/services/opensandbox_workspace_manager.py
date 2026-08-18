@@ -410,22 +410,30 @@ class OpenSandboxWorkspaceManager:
             result = await entry.sandbox.commands.run(
                 "ls /workspace/skills/ 2>/dev/null || echo ''"
             )
-            stdout = "".join(m.text for m in result.logs.stdout).strip()
-            if not stdout:
+            # 注意：SDK 的 logs.stdout 是 Message 列表，每条 m.text 是一行
+            # （本身不含换行符），不能先 join 再 split，否则多行被拼成一个字符串。
+            # 直接遍历 Message 列表取每条的 text。
+            stdout_lines = [m.text for m in result.logs.stdout]
+            if not stdout_lines:
                 return []
             skills = []
-            for skill_name in stdout.split("\n"):
-                skill_name = skill_name.strip()
+            for line in stdout_lines:
+                skill_name = line.strip()
                 if not skill_name:
                     continue
                 # 尝试读取 SKILL.md 获取描述
                 desc_result = await entry.sandbox.commands.run(
                     f"head -5 /workspace/skills/{skill_name}/SKILL.md 2>/dev/null || echo ''"
                 )
-                desc = "".join(m.text for m in desc_result.logs.stdout).strip()
+                desc_lines = [m.text for m in desc_result.logs.stdout]
+                # 取第一行非空作为描述（SKILL.md 首行通常是标题或简介）
+                desc = next(
+                    (ln.strip() for ln in desc_lines if ln.strip()),
+                    skill_name,
+                )
                 skills.append({
                     "name": skill_name,
-                    "description": desc.split("\n")[0] if desc else skill_name,
+                    "description": desc,
                     "directory": f"/workspace/skills/{skill_name}",
                 })
             return skills
