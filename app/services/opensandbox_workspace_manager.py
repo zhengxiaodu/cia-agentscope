@@ -447,13 +447,17 @@ class OpenSandboxWorkspaceManager:
 
     # ---- 会话文件访问（复用 OpenSandboxToolAdapter）----
     async def _get_adapter(self, user_id: str, session_id: str):
-        """获取会话对应的 OpenSandboxToolAdapter。
+        """获取会话对应的 OpenSandboxToolAdapter（纯读取，不触发创建）。
 
-        复用 create_workspace 获取沙箱（带重试/降级保护），
-        构造 adapter 并设置 workdir 为会话工作目录。
+        通过 get_workspace 查询已有沙箱；沙箱不存在/已过期/已崩溃时
+        返回 None，由调用方决定返回空集合或 None。沙箱的唯一创建入口
+        在 orchestrator_service.run() 内的 get_workspace → create_workspace，
+        避免文件快照等只读操作产生"提前创建沙箱"的副作用。
         """
+        sbx = await self.get_workspace(user_id, session_id)
+        if sbx is None:
+            return None
         from app.services.opensandbox_adapter import OpenSandboxToolAdapter
-        sbx = await self.create_workspace(user_id, session_id)
         return OpenSandboxToolAdapter(sbx, workdir=self._session_dir(session_id))
 
     # 文本类后缀（小写，无点）
@@ -488,6 +492,8 @@ class OpenSandboxWorkspaceManager:
         """
         try:
             adapter = await self._get_adapter(user_id, session_id)
+            if adapter is None:
+                return set()
             session_dir = self._session_dir(session_id)
             result = await adapter.bash(
                 f"cd {session_dir} && find . -type f 2>/dev/null || true"
@@ -532,6 +538,8 @@ class OpenSandboxWorkspaceManager:
             return None
         try:
             adapter = await self._get_adapter(user_id, session_id)
+            if adapter is None:
+                return None
             abs_path = f"{self._session_dir(session_id)}/{rel}"
             if self._is_text_rel(rel):
                 text = await adapter.read(abs_path)
@@ -561,6 +569,8 @@ class OpenSandboxWorkspaceManager:
             return None
         try:
             adapter = await self._get_adapter(user_id, session_id)
+            if adapter is None:
+                return None
             abs_path = f"{self._session_dir(session_id)}/{rel}"
             result = await adapter.bash(
                 f"stat -c %s {abs_path} 2>/dev/null || true"
