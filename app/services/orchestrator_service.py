@@ -686,10 +686,20 @@ class OrchestratorService:
                     session_service, session_id, user_id, agent_id, final_state,
                 )
 
-                # emit 工具执行期间捕获的额外数据（如 policy_qa 的完整 citations）
-                from app.orchestrator.base import _emit_pending_tool_extras
-                for ev in _emit_pending_tool_extras():
-                    yield ev
+                # emit 工具执行期间捕获的 citations（从 ToolResultEndEvent.metadata 累积）
+                citations = tracer.consume_citations()
+                if citations:
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "policy_qa_citations",
+                                "citations": citations,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
 
                 # 记录本轮参与的 agent_id + 成功标志
                 self._last_agent_ids = [agent_id]

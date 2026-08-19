@@ -39,18 +39,52 @@ class AgentEventTracer:
         self.tool_calls = 0
         self.tool_failures = 0
         self.exceed_max_iters = False
+        # 累积从 ToolResultEndEvent.metadata 提取的 citations，
+        # 供调用方 emit 自定义事件流。独立于 langfuse 启用状态。
+        self._collected_citations: list = []
 
     @property
     def _enabled(self) -> bool:
         return bool(self._lf is not None and getattr(self._lf, "enabled", False))
 
     def on_event(self, event: Any) -> None:
+        # citations 累积不依赖 langfuse 启用状态，先于埋点逻辑执行
+        self._collect_citations(event)
         if not self._enabled:
             return
         try:
             self._dispatch(event)
         except Exception:
             logger.debug("[AgentEventTracer] 事件埋点失败", exc_info=True)
+
+    def _collect_citations(self, event: Any) -> None:
+        """从 ToolResultEndEvent.metadata 提取 citations 累积。
+
+        agentscope 主路径会把 ToolChunk.metadata 透传到
+        ToolResultEndEvent.metadata，任何工具把 citations 写进
+        ToolChunk.metadata 都能在此被提取。
+        """
+        try:
+            if not isinstance(event, ToolResultEndEvent):
+                return
+            meta = getattr(event, "metadata", None) or {}
+            meta_citations = meta.get("citations") if isinstance(meta, dict) else None
+            if isinstance(meta_citations, list) and meta_citations:
+                self._collected_citations.extend(meta_citations)
+        except Exception:
+            logger.debug("[AgentEventTracer] 提取 citations 失败", exc_info=True)
+
+    def consume_citations(self) -> list:
+        """返回并清空累积的 citations（供调用方 emit 自定义事件流）。
+
+        在 agent 事件流结束后调用；tracer.close() 不影响此方法
+        （close 只关闭 langfuse observation，不清空 citations）。
+        """
+        if not self._collected_citations:
+            return []
+        result = self._collected_citations
+        self._collected_citations = []
+        return result
 
     def close(self) -> None:
         if not self._enabled:

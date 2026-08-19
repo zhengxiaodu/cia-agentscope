@@ -21,8 +21,9 @@ class FakeToolStart:
 
 
 class FakeToolEnd:
-    def __init__(self, tcid, state):
+    def __init__(self, tcid, state, metadata=None):
         self.tool_call_id = tcid; self.state = state
+        self.metadata = metadata if metadata is not None else {}
 
 
 def _tracer():
@@ -94,3 +95,57 @@ def test_disabled_is_noop():
     t.on_event(object())
     t.close()
     lf.start_observation.assert_not_called()
+
+
+# ---- citations 累积（从 ToolResultEndEvent.metadata 提取）----
+
+
+def test_citations_accumulated_from_metadata(monkeypatch):
+    """带 citations 的 ToolResultEndEvent 应被累积。"""
+    import app.utils.agent_event_tracer as m
+    monkeypatch.setattr(m, "ToolResultEndEvent", FakeToolEnd)
+    t, _ = _tracer()
+    cites = [{"position": 1, "document_name": "docA", "content": "..."}]
+    t.on_event(FakeToolEnd("c1", "ok", metadata={"citations": cites}))
+    assert t.consume_citations() == cites
+
+
+def test_citations_accumulated_even_when_langfuse_disabled(monkeypatch):
+    """langfuse 未启用时 citations 仍应累积（独立于埋点逻辑）。"""
+    import app.utils.agent_event_tracer as m
+    monkeypatch.setattr(m, "ToolResultEndEvent", FakeToolEnd)
+    lf = MagicMock(); lf.enabled = False
+    t = AgentEventTracer(lf, "agent-x")
+    cites = [{"position": 1, "document_name": "docB"}]
+    t.on_event(FakeToolEnd("c1", "ok", metadata={"citations": cites}))
+    assert t.consume_citations() == cites
+
+
+def test_citations_not_collected_without_metadata(monkeypatch):
+    """无 metadata 或无 citations 字段的事件不影响累积。"""
+    import app.utils.agent_event_tracer as m
+    monkeypatch.setattr(m, "ToolResultEndEvent", FakeToolEnd)
+    t, _ = _tracer()
+    t.on_event(FakeToolEnd("c1", "ok"))  # 默认空 metadata
+    t.on_event(FakeToolEnd("c2", "ok", metadata={"other": "x"}))  # 无 citations
+    assert t.consume_citations() == []
+
+
+def test_consume_citations_clears_after_read(monkeypatch):
+    """consume_citations 二次调用返回空。"""
+    import app.utils.agent_event_tracer as m
+    monkeypatch.setattr(m, "ToolResultEndEvent", FakeToolEnd)
+    t, _ = _tracer()
+    t.on_event(FakeToolEnd("c1", "ok", metadata={"citations": [{"a": 1}]}))
+    assert t.consume_citations() == [{"a": 1}]
+    assert t.consume_citations() == []
+
+
+def test_citations_aggregated_across_multiple_tool_calls(monkeypatch):
+    """多次工具调用的 citations 应聚合（extend）。"""
+    import app.utils.agent_event_tracer as m
+    monkeypatch.setattr(m, "ToolResultEndEvent", FakeToolEnd)
+    t, _ = _tracer()
+    t.on_event(FakeToolEnd("c1", "ok", metadata={"citations": [{"i": 1}]}))
+    t.on_event(FakeToolEnd("c2", "ok", metadata={"citations": [{"i": 2}]}))
+    assert t.consume_citations() == [{"i": 1}, {"i": 2}]
