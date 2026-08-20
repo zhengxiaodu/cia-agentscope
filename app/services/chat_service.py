@@ -23,6 +23,10 @@ from agentscope.model import OpenAIChatModel
 from app.config import MODEL_CONFIG_PATH, WORKSPACE_BASEDIR
 from app.services.file_change_detector import snapshot, diff, build_file_meta
 from app.services.langfuse_service import LangfuseService
+from app.services.sensitive_service import (
+    build_message_replace_event,
+    check_sensitive,
+)
 from app.intent.llm_client import chat_complete, extract_json
 
 logger = logging.getLogger(__name__)
@@ -428,9 +432,12 @@ async def generate_response(
 ) -> AsyncGenerator[str, None]:
     """根据消息列表生成流式回复（多智能体编排版本）。
 
-    主流程：加载历史 → 快照 → 根span → 执行编排 → 推荐问题 → 持久化 → 文件检测 → trace收尾。
+    主流程：加载历史 → 快照 → 根span → 执行编排 → 输出敏感检测 →
+    推荐问题 → 持久化 → 文件检测 → trace收尾。
     中断处理：cancel_event 被 set 时主动 raise CancelledError，进入 finally 保证
     落库（success=False）+ flush trace + yield user_abort 事件。
+    敏感拦截：final_output 命中敏感时 yield message_replace 事件并跳过推荐问题，
+    持久化与文件检测仍执行（用户输入检测在 routes/chat.py 创建工作区之前完成）。
     """
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -543,11 +550,24 @@ async def generate_response(
                 aborted_at_ms = int((time.perf_counter() - t0) * 1000)
                 raise asyncio.CancelledError()
 
+            # 安全敏感检测：编排输出 final_output（推荐问题生成之前）
+            # 命中则发送 message_replace 事件并跳过推荐问题（停止后续流式输出）；
+            # 持久化与文件检测仍执行，保证会话数据完整；
+            # 服务未配置或异常时兜底放行，不影响主流程
+            output_blocked = False
+            if final_output:
+                sens_result = await check_sensitive(final_output, stage="output")
+                if sens_result["blocked"]:
+                    output_blocked = True
+                    replace_event = build_message_replace_event(sens_result, stage="output")
+                    yield f"data: {json.dumps(replace_event, ensure_ascii=False)}\n\n"
+
             # ⑤ 编排流结束立即生成推荐问题（前置，让前端尽快拿到）
-            async for ev in _emit_recommended_questions(
-                orchestrator_service, messages, final_output, langfuse_service,
-            ):
-                yield ev
+            if not output_blocked:
+                async for ev in _emit_recommended_questions(
+                    orchestrator_service, messages, final_output, langfuse_service,
+                ):
+                    yield ev
 
             # ⑥ 持久化对话历史（用户输入 + 智能体输出）
             await _persist_conversation_history(
@@ -573,6 +593,7 @@ async def generate_response(
                 "totalMs": int((time.perf_counter() - t0) * 1000),
                 "aborted": aborted,
                 "abortedAtMs": aborted_at_ms,
+                "sensitiveBlocked": output_blocked,
             })
     except asyncio.CancelledError:
         # 中断时吞掉 CancelledError，进入 finally 做清理（不重新 raise，让流优雅结束）

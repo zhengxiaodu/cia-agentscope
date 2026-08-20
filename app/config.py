@@ -119,3 +119,11 @@ POLICY_QA_KB_MAP = os.getenv("POLICY_QA_KB_MAP", "")
 # MinerU 文档解析配置（鉴权头为 x-api-key，非 Authorization）
 MINERU_API_KEY = os.getenv("MINERU_API_KEY", "")
 MINERU_BASE_URL = os.getenv("MINERU_BASE_URL", "")
+
+# ---- 安全敏感内容检测配置 ----
+# 敏感检测服务地址（本地词典 + MiniCPM5 语义模型），留空则关闭检测
+SENSITIVE_SERVICE_URL = os.getenv("SENSITIVE_SERVICE_URL", "")
+# 语义风险阈值（0.0-1.0），默认 0.7
+SENSITIVE_THRESHOLD = float(os.getenv("SENSITIVE_THRESHOLD", "0.7"))
+# 调用超时（秒），超时兜底放行
+SENSITIVE_TIMEOUT = float(os.getenv("SENSITIVE_TIMEOUT", "5"))
