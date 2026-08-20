@@ -13,6 +13,7 @@ from app.services.sensitive_service import (
     build_message_replace_event,
     check_sensitive,
 )
+from app.utils.sse_events import Stage, stage_status_event
 from app.dao.user_dao import fire_notify_mng_active
 
 router = APIRouter()
@@ -53,12 +54,18 @@ async def chat(request: Request, body: ChatRequest, user: dict = Depends(current
             # 安全敏感检测：用户输入（创建工作区/编排之前）
             # 命中则发送 message_replace 事件并结束流，不进入主流程；
             # 服务未配置或异常时兜底放行，不影响正常对话
+            yield stage_status_event(
+                Stage.INPUT_SENSITIVE_CHECK, "started", "正在进行输入内容安全检验...",
+            )
             user_input = _extract_user_input(body.messages)
             sens_result = await check_sensitive(user_input, stage="input")
             if sens_result["blocked"]:
                 replace_event = build_message_replace_event(sens_result, stage="input")
                 yield f"data: {json.dumps(replace_event, ensure_ascii=False)}\n\n"
                 return
+            yield stage_status_event(
+                Stage.INPUT_SENSITIVE_CHECK, "done", "输入内容安全检验通过",
+            )
 
             # 再发送聊天流式事件（多智能体编排 / 单智能体直接问答）
             async for event in generate_response(
