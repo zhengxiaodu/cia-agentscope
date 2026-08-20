@@ -88,6 +88,7 @@ class QueryRewriter:
                 self._model_config,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
+                stage="llm-query-rewrite",
             )
             rewritten = rewritten.strip()
             # 改写为空则降级

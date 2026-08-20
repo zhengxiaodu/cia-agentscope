@@ -38,15 +38,18 @@ class LangfuseService:
         name: str = "chat-response",
         as_type: str = "span",
         input: Any = None,
+        model: Optional[str] = None,
+        metadata: Optional[dict] = None,
     ) -> Optional[Any]:
         if not self._enabled or not self._client:
             return None
         try:
-            return self._client.start_observation(
-                name=name,
-                as_type=as_type,
-                input=input,
-            )
+            kwargs: dict = {"name": name, "as_type": as_type, "input": input}
+            if model:
+                kwargs["model"] = model
+            if metadata:
+                kwargs["metadata"] = metadata
+            return self._client.start_observation(**kwargs)
         except Exception as e:
             logger.warning("Langfuse start_observation failed: %s", e)
             return None
@@ -55,11 +58,21 @@ class LangfuseService:
         self,
         observation,
         output: Any = None,
+        usage_details: Optional[dict] = None,
+        level: Optional[str] = None,
+        status_message: Optional[str] = None,
     ) -> None:
         if not self._enabled or not observation:
             return
         try:
-            observation.update(output=output)
+            kwargs: dict = {"output": output}
+            if usage_details:
+                kwargs["usage_details"] = usage_details
+            if level:
+                kwargs["level"] = level
+            if status_message:
+                kwargs["status_message"] = status_message
+            observation.update(**kwargs)
             observation.end()
         except Exception as e:
             logger.warning("Langfuse end_observation failed: %s", e)
@@ -121,3 +134,19 @@ class LangfuseService:
         except Exception as e:
             logger.warning("Langfuse create_score failed: %s", e)
             return False
+
+
+# ---- 模块级单例访问器 ----
+
+_current_instance: Optional["LangfuseService"] = None
+
+
+def set_current_langfuse(svc: "LangfuseService") -> None:
+    """在 main.py lifespan 中注册，供 chat_complete 等不便无法逐层传参的场景使用。"""
+    global _current_instance
+    _current_instance = svc
+
+
+def get_current_langfuse() -> Optional["LangfuseService"]:
+    """取当前已注册的 LangfuseService 实例，未注册返回 None。"""
+    return _current_instance

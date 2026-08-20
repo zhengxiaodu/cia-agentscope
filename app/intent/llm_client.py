@@ -10,6 +10,8 @@ from typing import Any, Dict, Optional
 
 from openai import AsyncOpenAI
 
+from app.services.langfuse_service import get_current_langfuse
+
 logger = logging.getLogger(__name__)
 
 
@@ -29,14 +31,19 @@ async def chat_complete(
     model_config: dict,
     system_prompt: str,
     user_prompt: str,
+    stage: str = "llm-call",
 ) -> str:
     """非流式补全，返回完整文本。
+
+    内部创建 Langfuse generation observation，携带真实 token usage。
+    observation 通过 OTel 上下文自动挂在当前活跃 span 之下，调用方无需传 langfuse_service。
 
     Args:
         client: AsyncOpenAI 客户端
         model_config: models.xxx 配置段
         system_prompt: 系统提示
         user_prompt: 用户输入
+        stage: 埋点名称（对应 TraceName 的 LLM_* 成员）
 
     Returns:
         模型输出的完整文本
@@ -44,17 +51,41 @@ async def chat_complete(
     model_name = model_config.get("model_name", "deepseek-chat")
     parameters = model_config.get("parameters", {})
 
-    response = await client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=parameters.get("temperature", 0.1),
-        max_tokens=parameters.get("max_tokens", 1024),
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}}
-    )
-    return response.choices[0].message.content or ""
+    lf = get_current_langfuse()
+    obs = None
+    if lf is not None and getattr(lf, "enabled", False):
+        obs = lf.start_observation(
+            name=stage, as_type="generation", model=model_name,
+            input=[{"role": "system", "content": system_prompt},
+                   {"role": "user", "content": user_prompt}],
+        )
+    try:
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=parameters.get("temperature", 0.1),
+            max_tokens=parameters.get("max_tokens", 1024),
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+        )
+        text = response.choices[0].message.content or ""
+        if obs is not None and lf is not None:
+            usage = getattr(response, "usage", None)
+            lf.end_observation(
+                obs, output=text,
+                usage_details={
+                    "input": getattr(usage, "prompt_tokens", 0),
+                    "output": getattr(usage, "completion_tokens", 0),
+                } if usage else None,
+            )
+        return text
+    except Exception as e:
+        if obs is not None and lf is not None:
+            lf.end_observation(obs, output={"error": str(e)[:500]},
+                               level="ERROR", status_message=type(e).__name__)
+        raise
 
 
 def extract_json(text: str) -> Optional[Dict[str, Any]]:

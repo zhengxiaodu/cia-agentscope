@@ -22,6 +22,8 @@ from opensandbox import Sandbox
 from opensandbox.config import ConnectionConfig
 from opensandbox.models.filesystem import WriteEntry
 
+from agentscope.skill import Skill
+
 logger = logging.getLogger(__name__)
 
 # ---- 高可用配置常量 ----
@@ -391,11 +393,12 @@ class OpenSandboxWorkspaceManager:
             return entry.sandbox
 
     # ---- 兼容 agentscope workspace 接口 ----
-    async def list_skills(self, user_id: str = "", session_id: str = "") -> list[dict]:
+    async def list_skills(self, user_id: str = "", session_id: str = "") -> list[Skill]:
         """列出沙箱内已注入的技能元数据。
 
         扫描沙箱内 /workspace/skills/ 目录，读取每个技能的 SKILL.md 提取名称和描述。
-        返回格式兼容 agentscope workspace.list_skills() 的 dict 列表。
+        返回 agentscope Skill 对象列表，与 agentscope workspace.list_skills() 接口一致
+        （Toolkit.skills_or_loaders 仅接受 str | Skill | SkillLoaderBase，不接受 dict）。
         """
         wid = self._workspace_id(user_id) if user_id else None
         entry = self._cache.get(wid) if wid else None
@@ -410,24 +413,36 @@ class OpenSandboxWorkspaceManager:
             result = await entry.sandbox.commands.run(
                 "ls /workspace/skills/ 2>/dev/null || echo ''"
             )
-            stdout = "".join(m.text for m in result.logs.stdout).strip()
-            if not stdout:
+            # 注意：SDK 的 logs.stdout 是 Message 列表，每条 m.text 是一行
+            # （本身不含换行符），不能先 join 再 split，否则多行被拼成一个字符串。
+            # 直接遍历 Message 列表取每条的 text。
+            stdout_lines = [m.text for m in result.logs.stdout]
+            if not stdout_lines:
                 return []
-            skills = []
-            for skill_name in stdout.split("\n"):
-                skill_name = skill_name.strip()
+            skills: list[Skill] = []
+            for line in stdout_lines:
+                skill_name = line.strip()
                 if not skill_name:
                     continue
                 # 尝试读取 SKILL.md 获取描述
                 desc_result = await entry.sandbox.commands.run(
                     f"head -5 /workspace/skills/{skill_name}/SKILL.md 2>/dev/null || echo ''"
                 )
-                desc = "".join(m.text for m in desc_result.logs.stdout).strip()
-                skills.append({
-                    "name": skill_name,
-                    "description": desc.split("\n")[0] if desc else skill_name,
-                    "directory": f"/workspace/skills/{skill_name}",
-                })
+                desc_lines = [m.text for m in desc_result.logs.stdout]
+                # 取第一行非空作为描述（SKILL.md 首行通常是标题或简介）
+                desc = next(
+                    (ln.strip() for ln in desc_lines if ln.strip()),
+                    skill_name,
+                )
+                skills.append(Skill(
+                    name=skill_name,
+                    description=desc,
+                    dir=f"/workspace/skills/{skill_name}",
+                    # markdown 暂不读取完整内容，skill_instruction_template
+                    # 只用 name/description/dir；如需完整内容可后续按需加载
+                    markdown="",
+                    updated_at=0.0,
+                ))
             return skills
         except Exception:
             logger.exception("[opensandbox_ws] list_skills 失败")
@@ -447,13 +462,17 @@ class OpenSandboxWorkspaceManager:
 
     # ---- 会话文件访问（复用 OpenSandboxToolAdapter）----
     async def _get_adapter(self, user_id: str, session_id: str):
-        """获取会话对应的 OpenSandboxToolAdapter。
+        """获取会话对应的 OpenSandboxToolAdapter（纯读取，不触发创建）。
 
-        复用 create_workspace 获取沙箱（带重试/降级保护），
-        构造 adapter 并设置 workdir 为会话工作目录。
+        通过 get_workspace 查询已有沙箱；沙箱不存在/已过期/已崩溃时
+        返回 None，由调用方决定返回空集合或 None。沙箱的唯一创建入口
+        在 orchestrator_service.run() 内的 get_workspace → create_workspace，
+        避免文件快照等只读操作产生"提前创建沙箱"的副作用。
         """
+        sbx = await self.get_workspace(user_id, session_id)
+        if sbx is None:
+            return None
         from app.services.opensandbox_adapter import OpenSandboxToolAdapter
-        sbx = await self.create_workspace(user_id, session_id)
         return OpenSandboxToolAdapter(sbx, workdir=self._session_dir(session_id))
 
     # 文本类后缀（小写，无点）
@@ -488,6 +507,8 @@ class OpenSandboxWorkspaceManager:
         """
         try:
             adapter = await self._get_adapter(user_id, session_id)
+            if adapter is None:
+                return set()
             session_dir = self._session_dir(session_id)
             result = await adapter.bash(
                 f"cd {session_dir} && find . -type f 2>/dev/null || true"
@@ -532,6 +553,8 @@ class OpenSandboxWorkspaceManager:
             return None
         try:
             adapter = await self._get_adapter(user_id, session_id)
+            if adapter is None:
+                return None
             abs_path = f"{self._session_dir(session_id)}/{rel}"
             if self._is_text_rel(rel):
                 text = await adapter.read(abs_path)
@@ -561,6 +584,8 @@ class OpenSandboxWorkspaceManager:
             return None
         try:
             adapter = await self._get_adapter(user_id, session_id)
+            if adapter is None:
+                return None
             abs_path = f"{self._session_dir(session_id)}/{rel}"
             result = await adapter.bash(
                 f"stat -c %s {abs_path} 2>/dev/null || true"

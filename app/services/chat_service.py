@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import asyncio
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional, Tuple
@@ -22,6 +23,10 @@ from agentscope.model import OpenAIChatModel
 from app.config import MODEL_CONFIG_PATH, WORKSPACE_BASEDIR
 from app.services.file_change_detector import snapshot, diff, build_file_meta
 from app.services.langfuse_service import LangfuseService
+from app.services.sensitive_service import (
+    build_message_replace_event,
+    check_sensitive,
+)
 from app.intent.llm_client import chat_complete, extract_json
 
 logger = logging.getLogger(__name__)
@@ -43,6 +48,11 @@ def _estimate_tokens(content: str) -> int:
     chinese_count = sum(1 for c in content if ord(c) > 127)
     ascii_count = len(content) - chinese_count
     return int(chinese_count * 1.5 + ascii_count * 0.25)
+
+
+def _compute_ttft_marker(event_type: str) -> bool:
+    """判断某事件类型是否是首个用户可见内容事件（用于 TTFT 计时）。"""
+    return event_type in ("TEXT_BLOCK_DELTA", "summary")
 
 
 async def _generate_recommended_questions(
@@ -73,7 +83,7 @@ async def _generate_recommended_questions(
         )
         user_prompt = f"用户提问：{user_input}\n\n助手回答：{final_output}"
 
-        text = await chat_complete(client, model_config, system_prompt, user_prompt)
+        text = await chat_complete(client, model_config, system_prompt, user_prompt, stage="llm-recommended-questions")
         data = extract_json(text)
         if not isinstance(data, dict):
             return [], {}
@@ -296,25 +306,32 @@ async def _finalize_trace(
     root_obs: Any,
     session_service: Any,
     session_id: Optional[str],
+    already_emitted: bool = False,
 ) -> AsyncGenerator[str, None]:
-    """Langfuse trace 收尾：flush + yield trace_ready + 保存 trace_id 到 Redis。
+    """Langfuse trace 收尾：flush + （可选）yield trace_ready + 保存 trace_id。
 
     在根 span context manager 之外执行，保证 span 已 end。
+    already_emitted=True 时跳过 trace_ready 下发与 trace_id 保存（已在流首处理），
+    但仍执行 flush。
     """
-    trace_id = None
     if langfuse_service and langfuse_service.enabled:
         try:
             langfuse_service.flush()
-            trace_id = root_obs.trace_id if root_obs else None
         except Exception:
             pass
 
-    trace_event = json.dumps({"type": "trace_ready", "trace_id": trace_id})
-    yield f"data: {trace_event}\n\n"
+    if not already_emitted:
+        trace_id = None
+        try:
+            trace_id = root_obs.trace_id if root_obs else None
+        except Exception:
+            pass
+        trace_event = json.dumps({"type": "trace_ready", "trace_id": trace_id})
+        yield f"data: {trace_event}\n\n"
 
-    # 保存 trace_id 到 Redis 元信息
-    if session_service and session_id and trace_id:
-        await session_service.save_latest_trace_id(session_id, trace_id)
+        # 保存 trace_id 到 Redis 元信息
+        if session_service and session_id and trace_id:
+            await session_service.save_latest_trace_id(session_id, trace_id)
 
 
 def load_model_config(config_path: str = MODEL_CONFIG_PATH) -> dict:
@@ -348,6 +365,9 @@ def create_model_from_config(model_config: dict):
             stream=True,
             parameters=OpenAIChatModel.Parameters(**parameters),
             context_size=context_size,
+            # vLLM 部署的 Qwen3 等模型默认开启 thinking，显式关闭，
+            # 通过 extra_body 透传 chat_template_kwargs 到请求体
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
     else:
         raise ValueError(f"不支持的 provider: {provider}")
@@ -412,9 +432,12 @@ async def generate_response(
 ) -> AsyncGenerator[str, None]:
     """根据消息列表生成流式回复（多智能体编排版本）。
 
-    主流程：加载历史 → 快照 → 根span → 执行编排 → 推荐问题 → 持久化 → 文件检测 → trace收尾。
+    主流程：加载历史 → 快照 → 根span → 执行编排 → 输出敏感检测 →
+    推荐问题 → 持久化 → 文件检测 → trace收尾。
     中断处理：cancel_event 被 set 时主动 raise CancelledError，进入 finally 保证
     落库（success=False）+ flush trace + yield user_abort 事件。
+    敏感拦截：final_output 命中敏感时 yield message_replace 事件并跳过推荐问题，
+    持久化与文件检测仍执行（用户输入检测在 routes/chat.py 创建工作区之前完成）。
     """
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -429,6 +452,9 @@ async def generate_response(
     final_fallback_parts: List[str] = []
     final_output = ""
     aborted = False
+    t0 = time.perf_counter()
+    ttft_ms = None
+    aborted_at_ms = None
 
     # ② 快照工作目录（用于结束后检测新文件）
     before_files: set = set()
@@ -455,8 +481,20 @@ async def generate_response(
         else _noop_ctx()
     )
     root_obs = None
+    trace_emitted = False
     try:
         with root_span_ctx as root_obs:
+            # P0-3: 流首即下发真实 trace_id（span 内即可读），前端可立即关联反馈
+            trace_id = getattr(root_obs, "trace_id", None) if root_obs else None
+            if trace_id:
+                trace_emitted = True
+                yield f"data: {json.dumps({'type': 'trace_ready', 'trace_id': trace_id})}\n\n"
+                # 流首保存 trace_id（替代原 finalize 阶段保存，供反馈关联）
+                if session_service and session_id:
+                    try:
+                        await session_service.save_latest_trace_id(session_id, trace_id)
+                    except Exception:
+                        logger.warning("[chat_service] 流首保存 trace_id 失败", exc_info=True)
             # ④ 执行编排主流程，实时透传 SSE 事件
             async for event_str in orchestrator_service.run(
                 full_messages,
@@ -472,6 +510,7 @@ async def generate_response(
                 # 取消检查点：每个事件之间检测一次（LLM chunk 之间会回到本循环）
                 if _cancelled():
                     aborted = True
+                    aborted_at_ms = int((time.perf_counter() - t0) * 1000)
                     raise asyncio.CancelledError()
                 yield event_str
 
@@ -480,6 +519,9 @@ async def generate_response(
                     if event_str.startswith("data: ") and event_str.endswith("\n\n"):
                         payload = json.loads(event_str[6:].strip())
                         event_type = payload.get("type", "")
+
+                        if ttft_ms is None and _compute_ttft_marker(event_type):
+                            ttft_ms = int((time.perf_counter() - t0) * 1000)
 
                         if event_type == "summary":
                             final_output_parts.append(payload.get("content", ""))
@@ -505,13 +547,27 @@ async def generate_response(
             # 编排流结束后的取消检查（避免后续步骤继续执行）
             if _cancelled():
                 aborted = True
+                aborted_at_ms = int((time.perf_counter() - t0) * 1000)
                 raise asyncio.CancelledError()
 
+            # 安全敏感检测：编排输出 final_output（推荐问题生成之前）
+            # 命中则发送 message_replace 事件并跳过推荐问题（停止后续流式输出）；
+            # 持久化与文件检测仍执行，保证会话数据完整；
+            # 服务未配置或异常时兜底放行，不影响主流程
+            output_blocked = False
+            if final_output:
+                sens_result = await check_sensitive(final_output, stage="output")
+                if sens_result["blocked"]:
+                    output_blocked = True
+                    replace_event = build_message_replace_event(sens_result, stage="output")
+                    yield f"data: {json.dumps(replace_event, ensure_ascii=False)}\n\n"
+
             # ⑤ 编排流结束立即生成推荐问题（前置，让前端尽快拿到）
-            async for ev in _emit_recommended_questions(
-                orchestrator_service, messages, final_output, langfuse_service,
-            ):
-                yield ev
+            if not output_blocked:
+                async for ev in _emit_recommended_questions(
+                    orchestrator_service, messages, final_output, langfuse_service,
+                ):
+                    yield ev
 
             # ⑥ 持久化对话历史（用户输入 + 智能体输出）
             await _persist_conversation_history(
@@ -533,10 +589,17 @@ async def generate_response(
                 "reply": final_output,
                 "session_id": session_id,
                 "user_id": user_id,
+                "ttftMs": ttft_ms,
+                "totalMs": int((time.perf_counter() - t0) * 1000),
+                "aborted": aborted,
+                "abortedAtMs": aborted_at_ms,
+                "sensitiveBlocked": output_blocked,
             })
     except asyncio.CancelledError:
         # 中断时吞掉 CancelledError，进入 finally 做清理（不重新 raise，让流优雅结束）
         aborted = True
+        if aborted_at_ms is None:
+            aborted_at_ms = int((time.perf_counter() - t0) * 1000)
         logger.info(f"[chat_service] 会话被用户中断 session={session_id}")
     finally:
         # 中断时也落库：success 强制 False（绕开单例 last_success 污染）
@@ -555,7 +618,10 @@ async def generate_response(
                     logger.warning("[chat_service] 标记中断消息失败状态失败", exc_info=True)
 
         # ⑧ trace 收尾（保证 span 已 end + flush）
-        async for ev in _finalize_trace(langfuse_service, root_obs, session_service, session_id):
+        async for ev in _finalize_trace(
+            langfuse_service, root_obs, session_service, session_id,
+            already_emitted=trace_emitted,
+        ):
             yield ev
 
         # 中断时给前端发送 user_abort 事件

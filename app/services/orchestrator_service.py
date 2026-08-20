@@ -522,29 +522,63 @@ class OrchestratorService:
             return langfuse_service.start_span(name, input=input_dict)
         return _noop_ctx()
 
+    @staticmethod
+    def _migrate_legacy_enum_values(state_dict: dict) -> dict:
+        """修正历史脏数据中枚举被 str() 序列化的问题。
+
+        根因：早期保存使用 model_dump() + json.dumps(default=str)，枚举实例
+        （如 PermissionMode.BYPASS）被 str() 转成 "PermissionMode.BYPASS"
+        而非 "bypass"，导致反序列化时 PermissionMode("PermissionMode.BYPASS")
+        抛 ValueError。此处检测并修正为合法的枚举值。
+        """
+        if not isinstance(state_dict, dict):
+            return state_dict
+
+        # permission_context.mode: "PermissionMode.BYPASS" → "bypass"
+        perm = state_dict.get("permission_context")
+        if isinstance(perm, dict):
+            mode = perm.get("mode")
+            if isinstance(mode, str) and mode.startswith("PermissionMode."):
+                perm["mode"] = mode.split(".", 1)[1].lower()
+        return state_dict
+
     async def _load_agent_state(
         self,
         session_service: Any,
         session_id: Optional[str],
         agent_id: str,
     ) -> Optional[AgentState]:
-        """加载单个 agent 的 AgentState：从 session_service 读取 + trim 截断 + 异常兜底。
+        """加载单个 agent 的 AgentState：从 session_service 读取 + 历史脏数据迁移
+        + trim 截断 + 异常兜底。
 
         session_service 为空或读取失败均返回 None（调用方创建新状态）。
+        反序列化失败时记录 warning（含异常栈），便于定位 schema 不兼容问题。
         """
         if not (session_service and session_id):
             return None
         try:
             state_dict = await session_service.load_agent_state(session_id, agent_id)
-            if state_dict:
-                # 截断 context 为最近 N 条，控制模型输入 token
-                state_dict = self._trim_state_context(state_dict)
-                return AgentState.model_validate(state_dict)
         except Exception:
-            logger.debug(
-                f"[OrchestratorService] 无法加载 {agent_id} 状态，将新建"
+            logger.warning(
+                f"[OrchestratorService] 读取 {agent_id} 状态失败，将新建",
+                exc_info=True,
             )
-        return None
+            return None
+        if not state_dict:
+            return None
+
+        # 历史脏数据迁移：修正 "PermissionMode.BYPASS" → "bypass" 等
+        state_dict = self._migrate_legacy_enum_values(state_dict)
+        # 截断 context 为最近 N 条，控制模型输入 token
+        state_dict = self._trim_state_context(state_dict)
+        try:
+            return AgentState.model_validate(state_dict)
+        except Exception:
+            logger.warning(
+                f"[OrchestratorService] 反序列化 {agent_id} 状态失败，将新建",
+                exc_info=True,
+            )
+            return None
 
     async def _persist_agent_state(
         self,
@@ -624,16 +658,20 @@ class OrchestratorService:
             f"agent-{agent_id}",
             {"intent": intent.id, "query": user_input},
         ) as agent_span:
+            from app.utils.agent_event_tracer import AgentEventTracer
+            from app.utils.agent_event_stream import iter_agent_events
+            tracer = AgentEventTracer(langfuse_service, agent_id)
             try:
-                async for event in agent.reply_stream(user_msg):
-                    if isinstance(event, ReplyStartEvent):
-                        apply = AssistantMsg(
-                            name=event.name, content=[], id=event.reply_id
-                        )
-                    if isinstance(event, AgentEvent):
-                        if apply:
-                            apply.append_event(event)
-                        yield f"data: {event.model_dump_json()}\n\n"
+                def _on_reply_start(ev):
+                    nonlocal apply
+                    apply = AssistantMsg(
+                        name=ev.name, content=[], id=ev.reply_id
+                    )
+
+                async for event in iter_agent_events(agent, user_msg, tracer, _on_reply_start):
+                    if apply:
+                        apply.append_event(event)
+                    yield f"data: {event.model_dump_json()}\n\n"
 
                 if apply:
                     text_parts = []
@@ -642,16 +680,26 @@ class OrchestratorService:
                             text_parts.append(getattr(block, "text", str(block)))
                     final_output_parts.append("\n".join(text_parts).strip())
 
-                # 保存 AgentState
-                final_state = agent.state.model_dump()
+                # 保存 AgentState（mode="json" 确保枚举等类型序列化为值，避免落库后无法反序列化）
+                final_state = agent.state.model_dump(mode="json")
                 await self._persist_agent_state(
                     session_service, session_id, user_id, agent_id, final_state,
                 )
 
-                # emit 工具执行期间捕获的额外数据（如 policy_qa 的完整 citations）
-                from app.orchestrator.base import _emit_pending_tool_extras
-                for ev in _emit_pending_tool_extras():
-                    yield ev
+                # emit 工具执行期间捕获的 citations（从 ToolResultEndEvent.metadata 累积）
+                citations = tracer.consume_citations()
+                if citations:
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "policy_qa_citations",
+                                "citations": citations,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
 
                 # 记录本轮参与的 agent_id + 成功标志
                 self._last_agent_ids = [agent_id]
@@ -660,6 +708,7 @@ class OrchestratorService:
                 _safe_update_span(agent_span, {
                     "output": final_output_parts[0] if final_output_parts else "",
                     "success": True,
+                    **tracer.summary(),
                 })
             except Exception as e:
                 logger.exception(
@@ -671,6 +720,8 @@ class OrchestratorService:
                     "message": f"执行出错: {str(e)}",
                 })
                 return
+            finally:
+                tracer.close()
 
         # yield summary 事件
         if final_output_parts:
@@ -748,10 +799,12 @@ class OrchestratorService:
         ) as rw_span:
             try:
                 rewritten, rw_prompts = await rewriter.rewrite(user_input, history)
-            except Exception:
+                _rw_extra = {}
+            except Exception as e:
                 logger.exception("[OrchestratorService] 查询改写失败，使用原始输入")
                 rewritten, rw_prompts = user_input, {}
-            _safe_update_span(rw_span, {"rewritten": rewritten, "prompts": rw_prompts})
+                _rw_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
+            _safe_update_span(rw_span, {"rewritten": rewritten, "prompts": rw_prompts, **_rw_extra})
 
         yield self._event({
             "type": "query_rewritten",
@@ -770,13 +823,15 @@ class OrchestratorService:
         ) as rec_span:
             try:
                 intents, rec_prompts = await recognizer.recognize_intents(rewritten, history)
-            except Exception:
+                _rec_extra = {}
+            except Exception as e:
                 logger.exception("[OrchestratorService] 意图识别失败，降级为 general_chat")
                 intents = [Intent(id="general_chat", query=rewritten, agent="general_agent")]
                 rec_prompts = {}
+                _rec_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
             _safe_update_span(rec_span, {
                 "intents": [{"id": i.id, "agent": i.agent} for i in intents],
-                "prompts": rec_prompts,
+                "prompts": rec_prompts, **_rec_extra,
             })
         yield self._event({
             "type": "intent_step", "phase": "recognition", "status": "done",
@@ -794,12 +849,14 @@ class OrchestratorService:
         ) as orch_span:
             try:
                 relation, execution_order, orch_prompts = await recognizer.plan_orchestration(rewritten, intents)
-            except Exception:
+                _orch_extra = {}
+            except Exception as e:
                 logger.exception("[OrchestratorService] 意图编排失败，降级为 independent")
                 relation, execution_order, orch_prompts = "independent", [], {}
+                _orch_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
             _safe_update_span(orch_span, {
                 "relation": relation, "execution_order": execution_order,
-                "prompts": orch_prompts,
+                "prompts": orch_prompts, **_orch_extra,
             })
         # 按 execution_order 重排 intents（校验长度一致才应用，否则按原顺序）
         if execution_order and len(execution_order) == len(intents):
