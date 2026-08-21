@@ -50,6 +50,7 @@ from app.orchestrator.pipeline import PipelineOrchestrator
 from app.orchestrator.react import ReActOrchestrator
 from app.services.chat_service import create_model_from_config
 from app.services.mng_service import fetch_external_intents, merge_external_into_memory
+from app.utils.sse_events import Stage, stage_status_event
 
 logger = logging.getLogger(__name__)
 
@@ -361,7 +362,8 @@ class OrchestratorService:
         search_enabled: bool = True,
         langfuse_service: Optional[Any] = None,
         skills: Optional[List[str]] = None,
-    ) -> tuple:
+        holder: Optional[dict] = None,
+    ) -> AsyncGenerator[str, None]:
         """会话时构建临时组件：读 Redis 缓存（步骤 1-4 的产物）+ 步骤 5-8。
 
         缓存命中 → 直接用登录时融合好的 merged_intents/agents/skills；
@@ -369,13 +371,15 @@ class OrchestratorService:
         外部意图在下次登录后恢复。会话路径永不发起 mng HTTP 调用。
 
         步骤：
-        5. 通过 DockerWorkspaceManager 获取/创建工作区
+        5. 通过工作区管理器获取/创建工作区（yield stage_status 阶段事件）
         6. 构建 AgentRegistry / AgentFactory
         7. 构建临时识别器 IntentRecognizer
         8. 构建临时改写器 QueryRewriter
 
-        Returns:
+        async generator 无法 return 值，结果元组写入 holder["result"]：
             (registry, agent_factory, rewriter, recognizer)
+        Yields:
+            SSE 事件字符串（工作区获取/创建的 stage_status 事件）
         """
         # ---- 读取登录时缓存的融合配置（步骤 1-4 产物） ----
         fused = await self._load_cached_user_config(user_id, redis_client)
@@ -396,38 +400,18 @@ class OrchestratorService:
             merged_skills = fused["merged_skills"]
             default_orchestration = fused["default_orchestration"]
 
-        # ---- 5. 通过 DockerWorkspaceManager 获取/创建工作区 ----
+        # ---- 5. 通过工作区管理器获取/创建工作区（yield stage_status 阶段事件） ----
         all_skill_dirs = [s["directory"] for s in merged_skills]
         user_id_safe = user_id or "anonymous"
         session_id_safe = session_id or f"ephemeral-{user_id_safe}"
 
-        # 环节埋点：工作区获取/创建子 span
-        ws_ctx = (
-            langfuse_service.start_span(
-                "workspace-load",
-                input={"user_id": user_id_safe, "session_id": session_id_safe},
-            )
-            if langfuse_service
-            else _noop_ctx()
-        )
-        with ws_ctx as ws_span:
-            workspace = await self._workspace_manager.get_workspace(user_id_safe, session_id_safe)
-            if workspace is None:
-                # 首次创建：create_workspace 内部会在 ws.initialize() 处单独记录 workspace-initialize 子 span
-                workspace = await self._workspace_manager.create_workspace(
-                    user_id=user_id_safe,
-                    session_id=session_id_safe,
-                    skill_dirs=all_skill_dirs,
-                    langfuse_service=langfuse_service,
-                )
-            if ws_span:
-                try:
-                    ws_span.update(output={
-                        "workspace_id": getattr(workspace, "workspace_id", None),
-                    })
-                except Exception:
-                    pass
-            
+        ws_holder: dict = {}
+        async for ev in self._iter_workspace_stage(
+            user_id_safe, session_id_safe, all_skill_dirs, langfuse_service, ws_holder,
+        ):
+            yield ev
+        workspace = ws_holder["workspace"]
+
         from tools.chart_tools import (
             render_bar_chart, render_line_chart, render_pie_chart,
             render_generic_card, render_metric_card, render_confirm_action,
@@ -511,7 +495,63 @@ class OrchestratorService:
             rewrite_prompt=self._prompts.get("rewrite", ""),
         )
 
-        return registry, agent_factory, rewriter, recognizer
+        if holder is not None:
+            holder["result"] = (registry, agent_factory, rewriter, recognizer)
+
+    async def _iter_workspace_stage(
+        self,
+        user_id_safe: str,
+        session_id_safe: str,
+        all_skill_dirs: List[str],
+        langfuse_service: Any,
+        holder: dict,
+    ) -> AsyncGenerator[str, None]:
+        """获取/创建工作区，yield stage_status 阶段事件（workspace_get / workspace_create）。
+
+        命中已有工作区 → workspace_get started/done；
+        未命中（首次/已过期/已崩溃）→ workspace_get started → workspace_create started/done。
+        工作区实例写入 holder["workspace"]（async generator 无法 return 值）。
+        同时记录 workspace-load Langfuse 子 span。
+        """
+        ws_ctx = (
+            langfuse_service.start_span(
+                "workspace-load",
+                input={"user_id": user_id_safe, "session_id": session_id_safe},
+            )
+            if langfuse_service
+            else _noop_ctx()
+        )
+        with ws_ctx as ws_span:
+            yield stage_status_event(
+                Stage.WORKSPACE_GET, "started", "正在获取工作区...",
+            )
+            workspace = await self._workspace_manager.get_workspace(user_id_safe, session_id_safe)
+            if workspace is None:
+                # 首次创建：create_workspace 内部会在 ws.initialize() 处单独记录 workspace-initialize 子 span
+                yield stage_status_event(
+                    Stage.WORKSPACE_CREATE, "started", "正在创建工作区...",
+                )
+                workspace = await self._workspace_manager.create_workspace(
+                    user_id=user_id_safe,
+                    session_id=session_id_safe,
+                    skill_dirs=all_skill_dirs,
+                    langfuse_service=langfuse_service,
+                )
+                yield stage_status_event(
+                    Stage.WORKSPACE_CREATE, "done", "工作区创建完成",
+                )
+            else:
+                yield stage_status_event(
+                    Stage.WORKSPACE_GET, "done", "工作区获取完成",
+                )
+            if ws_span:
+                try:
+                    ws_span.update(output={
+                        "workspace_id": getattr(workspace, "workspace_id", None),
+                    })
+                except Exception:
+                    pass
+        holder["workspace"] = workspace
 
     def _span(self, langfuse_service: Any, name: str, input_dict: dict) -> Any:
         """统一 span 创建：启用 langfuse 时启动子 span，否则返回空 context manager。
@@ -767,21 +807,24 @@ class OrchestratorService:
             yield self._event({"type": "error", "message": "未检测到有效用户输入"})
             return
 
-        # ① 装配请求级组件（配置加载 + workspace 获取/创建，含 workspace 埋点）
+        # ① 装配请求级组件（配置加载 + workspace 获取/创建，含 workspace 埋点
+        #    与 workspace_get / workspace_create 阶段事件透传）
         redis_client = None
         if request is not None:
             redis_client = getattr(request.app.state, "redis_client", None)
 
-        registry, agent_factory, rewriter, recognizer = (
-            await self._build_request_components(
-                user_id=user_id,
-                redis_client=redis_client,
-                session_id=session_id,
-                search_enabled=search_enabled,
-                langfuse_service=langfuse_service,
-                skills=skills or [],
-            )
-        )
+        build_holder: dict = {}
+        async for ev in self._build_request_components(
+            user_id=user_id,
+            redis_client=redis_client,
+            session_id=session_id,
+            search_enabled=search_enabled,
+            langfuse_service=langfuse_service,
+            skills=skills or [],
+            holder=build_holder,
+        ):
+            yield ev
+        registry, agent_factory, rewriter, recognizer = build_holder["result"]
 
         # ② 单 agent 短路路径（跳过改写→识别→编排，直接由指定 agent 回答）
         if agent_id:
