@@ -150,6 +150,11 @@ class AgentRegistry:
             model=model,
             toolkit=toolkit,
             state=agent_state,
+            context_config=ContextConfig(
+                trigger_ratio=0.8,
+                reserve_ratio=0.1,
+                tool_result_limit=3000,
+            ),
             offloader=self._workspace
         )
         return agent
