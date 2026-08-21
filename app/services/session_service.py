@@ -40,9 +40,13 @@ class SessionService:
 
     async def append_messages(
         self, session_id: str, user_id: str, messages: list[dict]
-    ) -> None:
-        """向会话历史追加消息（用户输入 + 智能体输出）。"""
-        await self.dao.append_messages(session_id, user_id, messages)
+    ) -> Optional[int]:
+        """向会话历史追加消息（用户输入 + 智能体输出）。
+
+        Returns:
+            本轮 user 消息的自增 id（MySQL DAO；供上传文件回填 message_id）。
+        """
+        return await self.dao.append_messages(session_id, user_id, messages)
 
     async def append_session_files(self, session_id: str, files: list[dict]) -> None:
         """持久化本轮生成的文件元信息（按 (session_id, path) UPSERT 去重）。"""

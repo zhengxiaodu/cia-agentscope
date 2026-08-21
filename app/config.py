@@ -43,6 +43,8 @@ MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "agentscope")
 
 # 文件上传配置
 UPLOAD_MAX_SIZE_MB = int(os.getenv("UPLOAD_MAX_SIZE_MB", "10"))
+# 上传文件解析统一超时（秒）：MinerU 轮询与音频转写共用
+UPLOAD_PARSE_TIMEOUT = int(os.getenv("UPLOAD_PARSE_TIMEOUT", "60"))
 UPLOAD_ALLOWED_MEDIA_TYPES = [
     "image/jpeg",
     "image/png",
@@ -57,6 +59,15 @@ UPLOAD_ALLOWED_MEDIA_TYPES = [
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # xlsx
     "application/vnd.ms-powerpoint",  # ppt
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # pptx
+    # 音频（上传时调用音频转写模型解析）
+    "audio/mpeg",  # mp3
+    "audio/mp4",  # m4a
+    "audio/x-m4a",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/webm",
+    "audio/aac",
+    "audio/ogg",
 ]
 
 # Langfuse 可观测性配置

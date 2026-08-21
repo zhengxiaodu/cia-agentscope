@@ -65,6 +65,24 @@ CREATE TABLE IF NOT EXISTS session_files (
 CREATE UNIQUE INDEX uniq_session_file ON session_files(session_id, path);
 CREATE INDEX idx_session_files_session_id ON session_files(session_id);
 
+-- 上传文件即解析：记录上传文件名、解析内容、所属会话与消息
+-- message_id 上传时对话未开始为 NULL，问答结束回填（session 行此时可能尚不存在，故不加外键）
+CREATE TABLE IF NOT EXISTS upload_files (
+    id             BIGINT AUTO_INCREMENT PRIMARY KEY,
+    session_id     VARCHAR(64) NOT NULL,
+    filename       VARCHAR(255) NOT NULL,
+    media_type     VARCHAR(255) NOT NULL DEFAULT '',
+    parse_type     VARCHAR(16) NOT NULL DEFAULT '',
+    status         VARCHAR(16) NOT NULL DEFAULT 'pending',
+    parsed_content MEDIUMTEXT NULL,
+    error_message  VARCHAR(1024) NULL,
+    message_id     BIGINT NULL,
+    created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX idx_upload_files_session_msg ON upload_files(session_id, message_id);
+
 CREATE TABLE IF NOT EXISTS action_audit (
     id         BIGINT AUTO_INCREMENT PRIMARY KEY,
     userId     VARCHAR(64) NOT NULL,

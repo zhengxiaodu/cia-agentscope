@@ -23,6 +23,17 @@ models:
       temperature: 0.3
       max_tokens: 1024
 
+  # 音频转写专用模型（OpenAI 兼容 /v1/audio/transcriptions 接口）
+  audio_transcriber:
+    provider: "openai"
+    model_name: "Qwen3-ASR-1.7B"
+    base_url:
+    api_key:
+    parameters:
+      prompt: "解析音频"
+      language: "zh"
+      timeout: 60
+
 # 兼容旧版：单智能体时代的 Agent 配置（保留作为 general_agent 的默认值来源）
 agent:
   name: "AI问答助手"

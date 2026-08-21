@@ -31,13 +31,9 @@ from app.config import JWT_EXPIRE_HOURS, JWT_REFRESH_EXPIRE_DAYS
 
 router = APIRouter()
 
-# 可选技能（前端据此渲染技能开关；目前写死两个内置技能，描述取自 skill_config.yml）
+# 可选技能（前端据此渲染技能开关；目前写死内置技能，描述取自 skill_config.yml）
+# 文档/音频解析已改为上传时后台完成（见 file_parse_service），不再作为可选技能
 _OPTIONAL_SKILLS = [
-    {
-        "name": "mineru",
-        "nickname": "文档解析",
-        "description": "MinerU 文档解析技能，将用户上传的 pdf/docx/doc/表格/图片解析为 Markdown，适用于提取、总结、问答文档内容。",
-    },
     {
         "name": "chart_renderer",
         "nickname": "可视化图表",

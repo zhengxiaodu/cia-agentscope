@@ -190,11 +190,14 @@ async def _persist_conversation_history(
     user_id: Optional[str],
     messages: List[Dict[str, Any]],
     final_output: str,
+    upload_file_dao: Any = None,
 ) -> None:
     """持久化本轮对话历史（用户输入 + 智能体输出）。
 
     从 orchestrator_service 提取本轮参与的 agent_id 列表与成功标志，
     与 user/assistant 消息一同写入 messages 表。任何异常均静默吞掉。
+    落库成功后把本轮 user 消息 id 回填到该会话未绑定的上传文件
+    （upload_files.message_id），避免下一轮重复注入解析内容。
     """
     if not (session_service and session_id and user_id):
         missing = []
@@ -207,6 +210,7 @@ async def _persist_conversation_history(
         logger.warning(f"[chat_service] 跳过持久化：{', '.join(missing)} 为空")
         return
 
+    user_message_id = None
     try:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         user_input = _extract_user_input(messages)
@@ -243,9 +247,23 @@ async def _persist_conversation_history(
                 "tokens": _estimate_tokens(final_output),
             })
         if new_messages:
-            await session_service.append_messages(session_id, user_id, new_messages)
+            user_message_id = await session_service.append_messages(
+                session_id, user_id, new_messages
+            )
     except Exception:
         logger.exception("[chat_service] 持久化对话历史失败")
+
+    # 回填上传文件的 message_id（失败仅告警，不影响主流程）
+    if user_message_id and upload_file_dao:
+        try:
+            bound = await upload_file_dao.bind_message_id(session_id, user_message_id)
+            if bound:
+                logger.info(
+                    "[chat_service] 已绑定 %s 个上传文件到消息 %s",
+                    bound, user_message_id,
+                )
+        except Exception:
+            logger.warning("[chat_service] 回填上传文件 message_id 失败", exc_info=True)
 
 
 async def _detect_and_emit_files(
@@ -569,10 +587,13 @@ async def generate_response(
                 ):
                     yield ev
 
-            # ⑥ 持久化对话历史（用户输入 + 智能体输出）
+            # ⑥ 持久化对话历史（用户输入 + 智能体输出）+ 回填上传文件 message_id
             await _persist_conversation_history(
                 orchestrator_service, session_service, session_id, user_id,
                 messages, final_output,
+                upload_file_dao=getattr(
+                    request.app.state, "upload_file_dao", None
+                ) if request is not None else None,
             )
 
             # ⑦ 检测本轮新文件

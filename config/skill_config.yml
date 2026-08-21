@@ -11,6 +11,3 @@ skills:
   - name: policy_qa
     directory: ./skills/policy_qa
     description: "调用制度问答 API，基于知识库回答制度/政策/法规类问题。"
-  - name: mineru
-    directory: ./skills/mineru
-    description: "MinerU 文档解析技能，将用户上传的 pdf/docx/doc/表格/图片解析为 Markdown，适用于提取、总结、问答文档内容。"

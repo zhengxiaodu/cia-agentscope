@@ -172,12 +172,16 @@ class SessionDAO:
         session_id: str,
         user_id: str,
         new_messages: list[dict],
-    ) -> None:
+    ) -> Optional[int]:
         """向 messages 表插入消息 + 更新 sessions 元信息。
 
         若 sessions 行不存在则自动创建。
         messages 中的 agent_ids（list[str]）写入 messages.agent_ids（JSON 列），
         并累积去重合并到 sessions.agent_ids。
+
+        Returns:
+            本轮 user 消息的自增 id（供上传文件回填 message_id）；
+            本轮没有 user 消息或事务失败时返回 None。
         """
         now = datetime.now(timezone.utc)
         now_str = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -220,7 +224,8 @@ class SessionDAO:
                             (session_id, user_id, name, now, now, agent_ids_init),
                         )
 
-                    # 2) 插入消息（含 agent_ids）
+                    # 2) 插入消息（含 agent_ids），记录本轮 user 消息的自增 id
+                    user_message_id: Optional[int] = None
                     for msg in new_messages:
                         ts_raw = msg.get("timestamp", now_str)
                         if isinstance(ts_raw, str):
@@ -248,6 +253,8 @@ class SessionDAO:
                              int(bool(msg.get("success", True))),
                              int(msg.get("tokens", 0) or 0)),
                         )
+                        if msg.get("role") == "user" and user_message_id is None:
+                            user_message_id = cur.lastrowid
 
                     # 3) 更新 sessions 元信息
                     await cur.execute(
@@ -290,6 +297,7 @@ class SessionDAO:
                         )
 
                     await conn.commit()
+                    return user_message_id
                 except Exception:
                     await conn.rollback()
                     raise

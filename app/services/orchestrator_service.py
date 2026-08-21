@@ -64,6 +64,10 @@ _SEARCH_SKILL_NAME = "bocha_search"
 # 历史上下文保留条数（3 轮 = 6 条 user/assistant 消息），用于截断 AgentState.context
 _HISTORY_KEEP_LAST = 6
 
+# 上传文件解析内容注入提示词的头部标记与单文件截断上限（防超上下文）
+_UPLOAD_CTX_HEADER = "【用户上传文件解析内容】"
+_UPLOAD_CTX_MAX_CHARS = 30000
+
 
 @contextmanager
 def _noop_ctx() -> Iterator[None]:
@@ -474,7 +478,6 @@ class OrchestratorService:
             render_indicator_table, render_selectable_list,
         )
         from agentscope.tool import FunctionTool
-        from tools.mineru_tools import mineru_parse_tool
         from tools.policy_qa_tools import create_policy_qa_tool
 
         # 工具层：根据后端选择 agentscope 原生工具 / OpenSandbox 桥接工具
@@ -493,13 +496,13 @@ class OrchestratorService:
             adapter = OpenSandboxToolAdapter(
                 workspace, workdir=f"/data/workspaces/{session_id_safe}"
             )
-            all_tools = create_opensandbox_tools(adapter) + _chart_tools + [mineru_parse_tool, policy_qa_tool]
+            all_tools = create_opensandbox_tools(adapter) + _chart_tools + [policy_qa_tool]
             # 技能列表由管理器扫描沙箱内 /workspace/skills/ 获取
             all_skills_meta = await self._workspace_manager.list_skills(
                 user_id=user_id_safe, session_id=session_id_safe
             )
         else:
-            all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep()] + _chart_tools + [mineru_parse_tool, policy_qa_tool]
+            all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep()] + _chart_tools + [policy_qa_tool]
             all_skills_meta = await workspace.list_skills()
 
         # 按请求开关显隐联网搜索技能（workspace 始终装载全部技能，此处按轮次过滤）
@@ -835,6 +838,7 @@ class OrchestratorService:
                 session_service=session_service,
                 agent_id=agent_id,
                 langfuse_service=langfuse_service,
+                request=request,
             ):
                 yield event_str
         finally:
@@ -844,6 +848,39 @@ class OrchestratorService:
                 ws_task.cancel()
             elif not ws_task.cancelled():
                 ws_task.exception()
+
+    async def _load_upload_context(self, request: Any, session_id: Optional[str]) -> str:
+        """检索该会话未绑定消息的上传文件解析内容，拼接为提示词片段。
+
+        上传文件在 /upload 时即后台解析入库（见 file_parse_service）；
+        此处只取 message_id IS NULL 且解析内容非空的记录（失败文案也算，
+        让 agent 诚实告知用户）。检索失败静默返回空串，不影响问答主流程。
+        """
+        if request is None or not session_id:
+            return ""
+        dao = getattr(request.app.state, "upload_file_dao", None)
+        if dao is None:
+            return ""
+        try:
+            rows = await dao.load_unbound_parsed(session_id)
+        except Exception:
+            logger.warning("[OrchestratorService] 检索上传文件解析内容失败", exc_info=True)
+            return ""
+        if not rows:
+            return ""
+        parts = [_UPLOAD_CTX_HEADER]
+        for row in rows:
+            content = (row.get("parsed_content") or "")[:_UPLOAD_CTX_MAX_CHARS]
+            parts.append(f"=== 文件名: {row.get('filename', '')} ===")
+            parts.append(content)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _append_upload_context(text: str, upload_ctx: str) -> str:
+        """把上传文件上下文追加到文本尾部（上下文为空时原样返回）。"""
+        if not upload_ctx:
+            return text
+        return f"{text}\n\n{upload_ctx}"
 
     async def _run_with_workspace_task(
         self,
@@ -858,6 +895,7 @@ class OrchestratorService:
         session_service: Optional[Any],
         agent_id: Optional[str],
         langfuse_service: Optional[Any],
+        request: Any = None,
     ) -> AsyncGenerator[str, None]:
         """在等待工作区 task 的同时跑完意图链路，再执行编排。
 
@@ -870,6 +908,8 @@ class OrchestratorService:
             if ws_err:
                 yield self._event({"type": "error", "message": ws_err})
                 return
+            upload_ctx = await self._load_upload_context(request, session_id)
+            user_input = self._append_upload_context(user_input, upload_ctx)
             async for ev in self._run_single_agent_path(
                 registry, agent_factory, agent_id, user_input,
                 session_id, user_id, session_service, langfuse_service,
@@ -964,6 +1004,13 @@ class OrchestratorService:
         if ws_err:
             yield self._event({"type": "error", "message": ws_err})
             return
+
+        # 上传文件解析内容注入：意图识别已通过，真正进入问答阶段。
+        # 附加到每个 intent 的 query（pipeline/react 均以 intent.query 作为 agent 任务输入）
+        upload_ctx = await self._load_upload_context(request, session_id)
+        if upload_ctx:
+            for intent in intent_result.intents:
+                intent.query = self._append_upload_context(intent.query, upload_ctx)
 
         # ⑥ 选择编排器并加载各 agent 状态
         mode = recognizer.get_orchestration_mode(intent_result)
