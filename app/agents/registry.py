@@ -10,7 +10,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 import yaml
-from agentscope.agent import Agent
+from agentscope.agent import Agent, ContextConfig
 from agentscope.model import OpenAIChatModel
 from agentscope.permission import PermissionContext, PermissionMode
 from agentscope.state import AgentState
