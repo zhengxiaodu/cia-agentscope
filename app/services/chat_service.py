@@ -27,7 +27,6 @@ from app.services.sensitive_service import (
     build_message_replace_event,
     check_sensitive,
 )
-from app.utils.sse_events import Stage, stage_status_event
 from app.intent.llm_client import chat_complete, extract_json
 
 logger = logging.getLogger(__name__)
@@ -557,18 +556,11 @@ async def generate_response(
             # 服务未配置或异常时兜底放行，不影响主流程
             output_blocked = False
             if final_output:
-                yield stage_status_event(
-                    Stage.OUTPUT_SENSITIVE_CHECK, "started", "正在进行输出内容安全检验...",
-                )
                 sens_result = await check_sensitive(final_output, stage="output")
                 if sens_result["blocked"]:
                     output_blocked = True
                     replace_event = build_message_replace_event(sens_result, stage="output")
                     yield f"data: {json.dumps(replace_event, ensure_ascii=False)}\n\n"
-                else:
-                    yield stage_status_event(
-                        Stage.OUTPUT_SENSITIVE_CHECK, "done", "输出内容安全检验通过",
-                    )
 
             # ⑤ 编排流结束立即生成推荐问题（前置，让前端尽快拿到）
             if not output_blocked:

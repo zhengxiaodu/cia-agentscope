@@ -291,13 +291,10 @@ async def test_chat_input_blocked_emits_message_replace(monkeypatch):
 
     # 不进入主流程
     assert gen_calls["n"] == 0
-    # 事件序列：session_ready → stage_status(input检验 started) → message_replace
+    # 事件序列：session_ready → message_replace
     parsed = [json.loads(e[6:].strip()) for e in events]
-    assert [p["type"] for p in parsed] == ["session_ready", "stage_status", "message_replace"]
-    stage_ev = parsed[1]
-    assert stage_ev["stage"] == "input_sensitive_check"
-    assert stage_ev["status"] == "started"
-    replace_ev = parsed[2]
+    assert [p["type"] for p in parsed] == ["session_ready", "message_replace"]
+    replace_ev = parsed[1]
     assert replace_ev["stage"] == "input"
     assert replace_ev["reason"] == "暴力伤害意图"
     assert "敏感" in replace_ev["message"]
@@ -375,15 +372,7 @@ async def test_chat_input_fallback_continues(monkeypatch):
         events.append(chunk)
 
     parsed = [json.loads(e[6:].strip()) for e in events]
-    # 序列：session_ready → stage_status(started) → stage_status(done) → summary
-    assert [p["type"] for p in parsed] == [
-        "session_ready", "stage_status", "stage_status", "summary",
-    ]
-    stage_events = [p for p in parsed if p["type"] == "stage_status"]
-    assert stage_events[0]["stage"] == "input_sensitive_check"
-    assert stage_events[0]["status"] == "started"
-    assert stage_events[1]["stage"] == "input_sensitive_check"
-    assert stage_events[1]["status"] == "done"
+    assert [p["type"] for p in parsed] == ["session_ready", "summary"]
 
 
 # ---- generate_response：final_output 检测 ----
@@ -441,13 +430,8 @@ async def test_generate_response_output_blocked(monkeypatch):
     parsed = [json.loads(e[6:].strip()) for e in events if e.startswith("data: ")]
     types = [p["type"] for p in parsed]
 
-    # 输出命中：message_replace 出现且 stage=output，且先有 output 检验 started 事件
+    # 输出命中：message_replace 出现且 stage=output
     assert "message_replace" in types
-    stage_events = [p for p in parsed if p["type"] == "stage_status"]
-    assert len(stage_events) == 1
-    assert stage_events[0]["stage"] == "output_sensitive_check"
-    assert stage_events[0]["status"] == "started"
-    assert types.index("stage_status") < types.index("message_replace")
     replace_ev = next(p for p in parsed if p["type"] == "message_replace")
     assert replace_ev["stage"] == "output"
     assert replace_ev["reason"] == "暴力伤害意图"
@@ -507,9 +491,3 @@ async def test_generate_response_output_safe(monkeypatch):
     types = [p["type"] for p in parsed]
     assert "message_replace" not in types
     assert "recommended_questions" in types
-    # 输出检验 started → done 事件
-    stage_events = [p for p in parsed if p["type"] == "stage_status"]
-    assert [(s["stage"], s["status"]) for s in stage_events] == [
-        ("output_sensitive_check", "started"),
-        ("output_sensitive_check", "done"),
-    ]
