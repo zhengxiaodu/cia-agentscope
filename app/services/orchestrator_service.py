@@ -12,6 +12,7 @@
 - 构建临时的 AgentRegistry / IntentRecognizer / QueryRewriter
 - 请求结束时局部变量出作用域，内存自动释放
 """
+import asyncio
 import json
 import logging
 from contextlib import contextmanager
@@ -354,63 +355,105 @@ class OrchestratorService:
             )
             return None
 
-    async def _build_request_components(
-        self,
-        user_id: str,
-        redis_client,
-        session_id: Optional[str] = None,
-        search_enabled: bool = True,
-        langfuse_service: Optional[Any] = None,
-        skills: Optional[List[str]] = None,
-        holder: Optional[dict] = None,
-    ) -> AsyncGenerator[str, None]:
-        """会话时构建临时组件：读 Redis 缓存（步骤 1-4 的产物）+ 步骤 5-8。
+    async def _resolve_workspace_task(self, ws_task: "asyncio.Task") -> tuple:
+        """等待工作区准备任务完成。
+
+        失败不向调用方抛：把异常转成给前端的错误文案，由调用方 yield error 事件。
+        文案与串行版本保持一致，避免前端出现新的错误形态。
+
+        Returns:
+            (registry, agent_factory, error_message)；失败时前两项为 None。
+        """
+        try:
+            registry, agent_factory = await ws_task
+            return registry, agent_factory, None
+        except Exception as e:
+            logger.exception("[OrchestratorService] 工作区准备失败")
+            self._last_success = False
+            return None, None, f"环境准备失败: {str(e)}"
+
+    async def _load_config_bundle(self, user_id: str, redis_client) -> dict:
+        """读取登录时缓存的融合配置（步骤 1-4 的产物），未命中则 base-only 兜底。
 
         缓存命中 → 直接用登录时融合好的 merged_intents/agents/skills；
         缓存未命中 → base-only 兜底融合（不请求 mng，无外部意图），
         外部意图在下次登录后恢复。会话路径永不发起 mng HTTP 调用。
-
-        步骤：
-        5. 通过工作区管理器获取/创建工作区（yield stage_status 阶段事件）
-        6. 构建 AgentRegistry / AgentFactory
-        7. 构建临时识别器 IntentRecognizer
-        8. 构建临时改写器 QueryRewriter
-
-        async generator 无法 return 值，结果元组写入 holder["result"]：
-            (registry, agent_factory, rewriter, recognizer)
-        Yields:
-            SSE 事件字符串（工作区获取/创建的 stage_status 事件）
         """
-        # ---- 读取登录时缓存的融合配置（步骤 1-4 产物） ----
         fused = await self._load_cached_user_config(user_id, redis_client)
         if fused is not None:
-            merged_intents = fused.get("merged_intents", [])
-            merged_agents = fused.get("merged_agents", [])
-            merged_skills = fused.get("merged_skills", [])
-            default_orchestration = fused.get("default_orchestration", {})
-        else:
-            # 缓存未命中兜底：base-only 融合（不请求 mng，无外部意图）
-            logger.warning(
-                f"[OrchestratorService] 用户配置缓存未命中 user={user_id}，"
-                f"走 base-only 兜底（无外部意图），下次登录后恢复"
-            )
-            fused = await self._fuse_user_config(jwt_token="", permissions={})
-            merged_intents = fused["merged_intents"]
-            merged_agents = fused["merged_agents"]
-            merged_skills = fused["merged_skills"]
-            default_orchestration = fused["default_orchestration"]
+            return {
+                "merged_intents": fused.get("merged_intents", []),
+                "merged_agents": fused.get("merged_agents", []),
+                "merged_skills": fused.get("merged_skills", []),
+                "default_orchestration": fused.get("default_orchestration", {}),
+            }
+        logger.warning(
+            f"[OrchestratorService] 用户配置缓存未命中 user={user_id}，"
+            f"走 base-only 兜底（无外部意图），下次登录后恢复"
+        )
+        return await self._fuse_user_config(jwt_token="", permissions={})
 
-        # ---- 5. 通过工作区管理器获取/创建工作区（yield stage_status 阶段事件） ----
+    def _build_intent_components(self, fused: dict) -> tuple:
+        """构建请求级改写器与识别器（纯内存，不依赖工作区）。
+
+        Returns:
+            (rewriter, recognizer)
+        """
+        intent_configs = [IntentConfig(**item) for item in fused["merged_intents"]]
+
+        recognizer = IntentRecognizer(
+            client=self._intent_client,
+            model_config=self._intent_model_cfg,
+            recognition_prompt=self._prompts.get("intent_recognition", ""),
+            orchestration_prompt=self._prompts.get("intent_orchestration", ""),
+            intent_configs=intent_configs,
+            default_orchestration=fused["default_orchestration"],
+        )
+        rewriter = QueryRewriter(
+            client=self._intent_client,
+            model_config=self._intent_model_cfg,
+            rewrite_prompt=self._prompts.get("rewrite", ""),
+        )
+        return rewriter, recognizer
+
+    async def _prepare_workspace_components(
+        self,
+        fused: dict,
+        user_id_safe: str,
+        session_id_safe: str,
+        search_enabled: bool = True,
+        skills: Optional[List[str]] = None,
+        langfuse_service: Optional[Any] = None,
+        user_id: Optional[str] = None,
+        redis_client: Any = None,
+        stage_holder: Optional[dict] = None,
+    ) -> tuple:
+        """获取/创建工作区并组装注册表与工厂（依赖沙箱，可与意图链路并行）。
+
+        含 workspace-load 环节埋点与 workspace_get / workspace_create 阶段事件：
+        阶段事件无法从后台 task 实时 yield，先收集到 stage_holder["events"]
+        （首条 workspace_get started 已由调用方在启动前发出，此处跳过），
+        由调用方在 await 完成后补发，事件类型与顺序契约不变。
+
+        本方法会被 run() 放进 asyncio.create_task，因此不得读写 self 上的
+        请求级状态（_last_agent_ids / _last_success 等）。
+
+        Returns:
+            (registry, agent_factory)
+        """
+        merged_agents = fused["merged_agents"]
+        merged_skills = fused["merged_skills"]
         all_skill_dirs = [s["directory"] for s in merged_skills]
-        user_id_safe = user_id or "anonymous"
-        session_id_safe = session_id or f"ephemeral-{user_id_safe}"
 
         ws_holder: dict = {}
+        stage_events: List[str] = []
         async for ev in self._iter_workspace_stage(
             user_id_safe, session_id_safe, all_skill_dirs, langfuse_service, ws_holder,
         ):
-            yield ev
+            stage_events.append(ev)
         workspace = ws_holder["workspace"]
+        if stage_holder is not None:
+            stage_holder["events"] = stage_events[1:]
 
         from tools.chart_tools import (
             render_bar_chart, render_line_chart, render_pie_chart,
@@ -475,28 +518,7 @@ class OrchestratorService:
             extra_skill_names=extra_skills,
         )
         agent_factory = AgentFactory(registry)
-
-        # ---- 7. 构建临时识别器 ----
-        intent_configs = [IntentConfig(**item) for item in merged_intents]
-
-        recognizer = IntentRecognizer(
-            client=self._intent_client,
-            model_config=self._intent_model_cfg,
-            recognition_prompt=self._prompts.get("intent_recognition", ""),
-            orchestration_prompt=self._prompts.get("intent_orchestration", ""),
-            intent_configs=intent_configs,
-            default_orchestration=default_orchestration,
-        )
-
-        # ---- 8. 构建临时改写器 ----
-        rewriter = QueryRewriter(
-            client=self._intent_client,
-            model_config=self._intent_model_cfg,
-            rewrite_prompt=self._prompts.get("rewrite", ""),
-        )
-
-        if holder is not None:
-            holder["result"] = (registry, agent_factory, rewriter, recognizer)
+        return registry, agent_factory
 
     async def _iter_workspace_stage(
         self,
@@ -786,6 +808,8 @@ class OrchestratorService:
 
         每次调用动态构建请求级组件（配置从 YAML + mng 加载到内存），
         调用结束后局部变量出作用域，内存自动释放。
+        工作区准备（依赖沙箱）放入后台 task，与意图链路（改写 → 识别 →
+        编排）并行执行，在编排执行前汇合。
 
         若传入 agent_id，则跳过改写/识别/编排，直接执行指定智能体。
 
@@ -807,27 +831,102 @@ class OrchestratorService:
             yield self._event({"type": "error", "message": "未检测到有效用户输入"})
             return
 
-        # ① 装配请求级组件（配置加载 + workspace 获取/创建，含 workspace 埋点
-        #    与 workspace_get / workspace_create 阶段事件透传）
+        # ① 配置读取与意图组件装配（纯内存，不碰沙箱，立即完成）
         redis_client = None
         if request is not None:
             redis_client = getattr(request.app.state, "redis_client", None)
 
-        build_holder: dict = {}
-        async for ev in self._build_request_components(
-            user_id=user_id,
-            redis_client=redis_client,
-            session_id=session_id,
-            search_enabled=search_enabled,
-            langfuse_service=langfuse_service,
-            skills=skills or [],
-            holder=build_holder,
-        ):
-            yield ev
-        registry, agent_factory, rewriter, recognizer = build_holder["result"]
+        user_id_safe = user_id or "anonymous"
+        session_id_safe = session_id or f"ephemeral-{user_id_safe}"
+        stage_holder: dict = {}
+        try:
+            fused = await self._load_config_bundle(user_id, redis_client)
+            rewriter, recognizer = self._build_intent_components(fused)
+        except Exception as e:
+            # 配置装配失败不能让 SSE 流以 ASGI 异常中断，转为 error 事件
+            logger.exception("[OrchestratorService] 请求级配置装配失败")
+            self._last_success = False
+            yield self._event({
+                "type": "error",
+                "message": f"环境准备失败: {str(e)}",
+            })
+            return
 
-        # ② 单 agent 短路路径（跳过改写→识别→编排，直接由指定 agent 回答）
+        # 工作区准备与意图链路并行：workspace 直到编排执行阶段才被消费，
+        # 这段时间足以覆盖改写 + 意图识别 + 意图编排。
+        # 阶段事件无法从后台 task 实时 yield，先收集到 stage_holder["events"]，
+        # 由 _run_with_workspace_task 在 await 完成后补发，事件契约不变。
+        ws_task: "asyncio.Task" = asyncio.create_task(
+            self._prepare_workspace_components(
+                fused=fused,
+                user_id_safe=user_id_safe,
+                session_id_safe=session_id_safe,
+                search_enabled=search_enabled,
+                skills=skills or [],
+                langfuse_service=langfuse_service,
+                user_id=user_id,
+                redis_client=redis_client,
+                stage_holder=stage_holder,
+            ),
+            name="workspace-prepare",
+        )
+        try:
+            # 首条阶段事件在后台 task 启动后发出：保证生成器任意时刻被关闭时，
+            # 下方 finally 都能清理 ws_task（未完成则取消，已完成则消费异常）
+            yield stage_status_event(
+                Stage.WORKSPACE_GET, "started", "正在获取工作区...",
+            )
+            async for event_str in self._run_with_workspace_task(
+                ws_task=ws_task,
+                rewriter=rewriter,
+                recognizer=recognizer,
+                user_input=user_input,
+                history=history,
+                session_id=session_id,
+                user_id=user_id,
+                session_service=session_service,
+                agent_id=agent_id,
+                langfuse_service=langfuse_service,
+                stage_holder=stage_holder,
+            ):
+                yield event_str
+        finally:
+            # 客户端断连会让本生成器被提前关闭：未完成则取消，已完成则消费异常，
+            # 否则事件循环会报 "Task exception was never retrieved"
+            if not ws_task.done():
+                ws_task.cancel()
+            elif not ws_task.cancelled():
+                ws_task.exception()
+
+    async def _run_with_workspace_task(
+        self,
+        ws_task: "asyncio.Task",
+        rewriter: QueryRewriter,
+        recognizer: IntentRecognizer,
+        user_input: str,
+        history: List[dict],
+        session_id: Optional[str],
+        user_id: Optional[str],
+        session_service: Optional[Any],
+        agent_id: Optional[str],
+        langfuse_service: Optional[Any],
+        stage_holder: dict,
+    ) -> AsyncGenerator[str, None]:
+        """在后台准备工作区的同时跑完意图链路，汇合后执行编排。
+
+        拆成独立方法是为了让 run() 的 finally 能无条件覆盖本方法的全部
+        提前返回路径（return / 异常 / 生成器被关闭），保证 ws_task 不悬挂。
+        """
+        # ② 单 agent 短路路径（跳过改写→识别→编排，直接由指定 agent 回答）。
+        # 无可并行的意图链路，立即等待工作区就绪，语义与串行版一致
         if agent_id:
+            registry, agent_factory, ws_err = await self._resolve_workspace_task(ws_task)
+            if ws_err:
+                yield self._event({"type": "error", "message": ws_err})
+                return
+            # 补发工作区阶段事件（workspace_get done / workspace_create started+done）
+            for ev in stage_holder.get("events", []):
+                yield ev
             async for ev in self._run_single_agent_path(
                 registry, agent_factory, agent_id, user_input,
                 session_id, user_id, session_service, langfuse_service,
@@ -916,6 +1015,17 @@ class OrchestratorService:
             ],
             "relation": intent_result.relation,
         })
+
+        # 编排前汇合：此时意图链路已跑完，工作区大概率已就绪
+        registry, agent_factory, ws_err = await self._resolve_workspace_task(ws_task)
+        if ws_err:
+            yield self._event({"type": "error", "message": ws_err})
+            return
+        # 补发工作区阶段事件（workspace_get done / workspace_create started+done）：
+        # 首条 workspace_get started 已由 run() 在启动后台 task 后发出，
+        # 事件类型与顺序契约不变
+        for ev in stage_holder.get("events", []):
+            yield ev
 
         # ⑥ 选择编排器并加载各 agent 状态
         mode = recognizer.get_orchestration_mode(intent_result)

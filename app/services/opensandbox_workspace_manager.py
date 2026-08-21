@@ -22,7 +22,10 @@ from opensandbox import Sandbox
 from opensandbox.config import ConnectionConfig
 from opensandbox.models.filesystem import WriteEntry
 
-from agentscope.skill import Skill
+from app.services.workspace_file_access import (
+    build_list_skills_command,
+    parse_skills_output,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +37,9 @@ _DEGRADE_RECOVERY_TIME = 60.0    # 降级后恢复探测间隔（秒）
 
 
 class _Entry:
-    __slots__ = ("sandbox", "last_access", "user_id", "session_ids", "workdir")
+    __slots__ = (
+        "sandbox", "last_access", "user_id", "session_ids", "workdir", "skills_meta",
+    )
 
     def __init__(self, sandbox: Sandbox, user_id: str, session_ids: set | None = None):
         self.sandbox = sandbox
@@ -42,6 +47,9 @@ class _Entry:
         self.user_id = user_id
         self.session_ids = session_ids or set()
         self.workdir = "/data/workspaces"
+        # 技能元信息缓存：技能只在沙箱创建时注入，沙箱生命周期内不变，
+        # None 表示尚未扫描。见 list_skills。
+        self.skills_meta: list[dict] | None = None
 
 
 class OpenSandboxWorkspaceManager:
@@ -266,6 +274,19 @@ class OpenSandboxWorkspaceManager:
         except Exception:
             return False
 
+    async def _touch_session_dir(self, sbx: Sandbox, session_id: str) -> bool:
+        """建会话目录并顺带探活：一条命令同时完成 mkdir 与存活判断。
+
+        exit_code == 0 → 沙箱存活且目录就绪；非 0 或抛异常 → 视为沙箱已死。
+        把两次往返压成一次，是每轮复用路径的主要开销来源。
+        """
+        session_dir = self._session_dir(session_id)
+        try:
+            result = await sbx.commands.run(f"mkdir -p {session_dir} && echo 1")
+            return result.exit_code == 0
+        except Exception:
+            return False
+
     async def _evict_locked(self, wid: str) -> None:
         entry = self._cache.pop(wid, None)
         if entry is not None:
@@ -301,8 +322,7 @@ class OpenSandboxWorkspaceManager:
             # 复用已有沙箱
             entry = self._cache.get(wid)
             if entry is not None and (time.monotonic() - entry.last_access) <= self._ttl:
-                # 高可用：探测沙箱存活
-                if not await self._is_sandbox_alive(entry.sandbox):
+                if not await self._touch_session_dir(entry.sandbox, session_id):
                     logger.warning(
                         f"[opensandbox_ws] 沙箱已崩溃，重建 wid={wid}"
                     )
@@ -310,9 +330,10 @@ class OpenSandboxWorkspaceManager:
                 else:
                     entry.last_access = time.monotonic()
                     session_dir = self._session_dir(session_id)
-                    await entry.sandbox.commands.run(f"mkdir -p {session_dir}")
                     entry.session_ids.add(session_id)
                     entry.workdir = session_dir
+                    # 在 Sandbox 对象上设置 workdir，兼容 AgentRegistry 的 system_prompt 构建
+                    entry.sandbox.workdir = session_dir
                     logger.info(f"[opensandbox_ws] 复用沙箱 wid={wid} session={session_id}")
                     return entry.sandbox
 
@@ -331,7 +352,10 @@ class OpenSandboxWorkspaceManager:
             else:
                 sbx = await self._create_sandbox_with_retry()
             session_dir = self._session_dir(session_id)
-            await sbx.commands.run(f"mkdir -p {session_dir}")
+            if not await self._touch_session_dir(sbx, session_id):
+                logger.warning(
+                    f"[opensandbox_ws] 新建沙箱后会话目录准备失败 sandbox_id={sbx.id}"
+                )
 
             # 注入技能文件（将宿主技能目录内容写入沙箱）
             if skill_dirs:
@@ -380,73 +404,63 @@ class OpenSandboxWorkspaceManager:
             if (time.monotonic() - entry.last_access) > self._ttl:
                 await self._evict_locked(wid)
                 return None
-            # 高可用：探测沙箱存活
-            if not await self._is_sandbox_alive(entry.sandbox):
+            # 合并探活与建目录：一次往返同时判断存活并准备会话目录
+            if not await self._touch_session_dir(entry.sandbox, session_id):
                 logger.warning(f"[opensandbox_ws] 沙箱已崩溃，淘汰 wid={wid}")
                 await self._evict_locked(wid)
                 return None
             session_dir = self._session_dir(session_id)
-            await entry.sandbox.commands.run(f"mkdir -p {session_dir}")
             entry.last_access = time.monotonic()
             entry.session_ids.add(session_id)
             entry.workdir = session_dir
+            # 在 Sandbox 对象上设置 workdir，兼容 AgentRegistry 的 system_prompt 构建
+            entry.sandbox.workdir = session_dir
             return entry.sandbox
 
     # ---- 兼容 agentscope workspace 接口 ----
-    async def list_skills(self, user_id: str = "", session_id: str = "") -> list[Skill]:
-        """列出沙箱内已注入的技能元数据。
+    def _entry_for(self, user_id: str) -> Optional[_Entry]:
+        """取该用户的沙箱 entry；无 user_id 或无 entry 时返回 None。
 
-        扫描沙箱内 /workspace/skills/ 目录，读取每个技能的 SKILL.md 提取名称和描述。
-        返回 agentscope Skill 对象列表，与 agentscope workspace.list_skills() 接口一致
-        （Toolkit.skills_or_loaders 仅接受 str | Skill | SkillLoaderBase，不接受 dict）。
+        不回落到其他用户的沙箱——那等于 A 用户的请求去读 B 用户的
+        沙箱，是跨用户越权。
         """
-        wid = self._workspace_id(user_id) if user_id else None
-        entry = self._cache.get(wid) if wid else None
+        if not user_id:
+            return None
+        return self._cache.get(self._workspace_id(user_id))
+
+    @staticmethod
+    def _stdout(result) -> str:
+        """把命令结果的 logs.stdout（Message 列表，每条 text 一行、不含换行符）拼回整段 stdout 文本。"""
+        return "\n".join(m.text for m in result.logs.stdout)
+
+    async def list_skills(self, user_id: str = "", session_id: str = "") -> list[dict]:
+        """列出沙箱内已注入的技能元数据（单次往返 + 按沙箱缓存）。
+
+        一条 shell 命令扫完 /workspace/skills/ 并输出 `名称<TAB>描述首行`，
+        结果缓存在 _Entry.skills_meta：技能只在沙箱创建时注入，沙箱生命周期内不变。
+
+        无该用户的沙箱时返回 []——不得回落到其他用户的沙箱（技能清单跨用户泄漏）。
+
+        返回格式兼容 agentscope workspace.list_skills() 的 dict 列表。
+
+        session_id 保留在签名中仅为调用方兼容，本方法不使用。
+        """
+        entry = self._entry_for(user_id)
         if entry is None:
-            # 尝试取第一个活跃沙箱
-            if self._cache:
-                entry = next(iter(self._cache.values()))
-            else:
-                return []
+            return []
+
+        if entry.skills_meta is not None:
+            return entry.skills_meta
 
         try:
-            result = await entry.sandbox.commands.run(
-                "ls /workspace/skills/ 2>/dev/null || echo ''"
-            )
-            # 注意：SDK 的 logs.stdout 是 Message 列表，每条 m.text 是一行
-            # （本身不含换行符），不能先 join 再 split，否则多行被拼成一个字符串。
-            # 直接遍历 Message 列表取每条的 text。
-            stdout_lines = [m.text for m in result.logs.stdout]
-            if not stdout_lines:
-                return []
-            skills: list[Skill] = []
-            for line in stdout_lines:
-                skill_name = line.strip()
-                if not skill_name:
-                    continue
-                # 尝试读取 SKILL.md 获取描述
-                desc_result = await entry.sandbox.commands.run(
-                    f"head -5 /workspace/skills/{skill_name}/SKILL.md 2>/dev/null || echo ''"
-                )
-                desc_lines = [m.text for m in desc_result.logs.stdout]
-                # 取第一行非空作为描述（SKILL.md 首行通常是标题或简介）
-                desc = next(
-                    (ln.strip() for ln in desc_lines if ln.strip()),
-                    skill_name,
-                )
-                skills.append(Skill(
-                    name=skill_name,
-                    description=desc,
-                    dir=f"/workspace/skills/{skill_name}",
-                    # markdown 暂不读取完整内容，skill_instruction_template
-                    # 只用 name/description/dir；如需完整内容可后续按需加载
-                    markdown="",
-                    updated_at=0.0,
-                ))
-            return skills
+            result = await entry.sandbox.commands.run(build_list_skills_command())
+            skills = parse_skills_output(self._stdout(result))
         except Exception:
             logger.exception("[opensandbox_ws] list_skills 失败")
             return []
+
+        entry.skills_meta = skills
+        return skills
 
     async def list_tools(self, user_id: str = "") -> list[str]:
         """返回沙箱内可用工具列表（兼容接口）。"""
