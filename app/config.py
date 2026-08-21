@@ -17,11 +17,11 @@ try:
 except ValueError as e:
     raise RuntimeError(f"CONFIG_DECRYPT_KEY 配置非法: {e}") from e
 
-SKILL_CONFIG_PATH = "../config/skill_config.yml"
-MODEL_CONFIG_PATH = "../config/model_config.yml"
+SKILL_CONFIG_PATH = "./config/skill_config.yml"
+MODEL_CONFIG_PATH = "./config/model_config.yml"
 # 多智能体与多意图编排配置
-AGENT_CONFIG_PATH = "../config/agent_config.yml"
-INTENT_CONFIG_PATH = "../config/intent_config.yml"
+AGENT_CONFIG_PATH = "./config/agent_config.yml"
+INTENT_CONFIG_PATH = "./config/intent_config.yml"
 
 JWT_ALGORITHM = "HS256"
 # 支持 ENC(...) 密文（由 CONFIG_DECRYPT_KEY 解密）或明文（向后兼容）
