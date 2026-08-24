@@ -31,7 +31,7 @@ agents:
 
       请用自然、友好的语言回答用户的问题。
 
-  - id: regulations_qa
+  - id: regulations_agent
     name: 制度问答智能体
     skills:
       - policy_qa
