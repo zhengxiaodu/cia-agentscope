@@ -132,7 +132,11 @@ MINERU_API_KEY = os.getenv("MINERU_API_KEY", "")
 MINERU_BASE_URL = os.getenv("MINERU_BASE_URL", "")
 
 # ---- 安全敏感内容检测配置 ----
-# 敏感检测服务地址（本地词典 + MiniCPM5 语义模型），留空则关闭检测
+# 安全审核总开关（false 时输入输出均不做安全审核）
+SENSITIVE_ENABLED = os.getenv("SENSITIVE_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+# 敏感检测服务基础地址（IP+端口；/sensitive/check 与 /sensitive/dict-check 由服务代码拼接），留空则关闭检测
 SENSITIVE_SERVICE_URL = os.getenv("SENSITIVE_SERVICE_URL", "")
 # 语义风险阈值（0.0-1.0），默认 0.7
 SENSITIVE_THRESHOLD = float(os.getenv("SENSITIVE_THRESHOLD", "0.7"))

@@ -882,6 +882,22 @@ class OrchestratorService:
             return text
         return f"{text}\n\n{upload_ctx}"
 
+    async def _has_unbound_uploads(self, request: Any, session_id: Optional[str]) -> bool:
+        """该会话是否存在未绑定消息的上传文件（用于跳过问题改写）。
+
+        检索失败静默返回 False（不影响问答主流程，仅照常做改写）。
+        """
+        if request is None or not session_id:
+            return False
+        dao = getattr(request.app.state, "upload_file_dao", None)
+        if dao is None:
+            return False
+        try:
+            return await dao.has_unbound_files(session_id)
+        except Exception:
+            logger.warning("[OrchestratorService] 检查未绑定上传文件失败", exc_info=True)
+            return False
+
     async def _run_with_workspace_task(
         self,
         ws_task: "asyncio.Task",
@@ -917,24 +933,32 @@ class OrchestratorService:
                 yield ev
             return
 
-        # ③ 查询改写（联系上下文，失败降级为原始输入）
+        # ③ 查询改写（联系上下文，失败降级为原始输入）。
+        # 有未消费的上传文件时跳过改写：文件解析内容将在编排前注入 query，
+        # 原始问题已足够完整，改写反而可能引入偏差
+        skip_rewrite = await self._has_unbound_uploads(request, session_id)
         with self._span(
             langfuse_service, "query-rewrite",
             {"original": user_input, "history_len": len(history)},
         ) as rw_span:
-            try:
-                rewritten, rw_prompts = await rewriter.rewrite(user_input, history)
-                _rw_extra = {}
-            except Exception as e:
-                logger.exception("[OrchestratorService] 查询改写失败，使用原始输入")
+            if skip_rewrite:
                 rewritten, rw_prompts = user_input, {}
-                _rw_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
+                _rw_extra = {"skipped": "upload-file"}
+            else:
+                try:
+                    rewritten, rw_prompts = await rewriter.rewrite(user_input, history)
+                    _rw_extra = {}
+                except Exception as e:
+                    logger.exception("[OrchestratorService] 查询改写失败，使用原始输入")
+                    rewritten, rw_prompts = user_input, {}
+                    _rw_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
             _safe_update_span(rw_span, {"rewritten": rewritten, "prompts": rw_prompts, **_rw_extra})
 
         yield self._event({
             "type": "query_rewritten",
             "original": user_input,
             "rewritten": rewritten,
+            **({"skipped_reason": "upload-file"} if skip_rewrite else {}),
         })
 
         # ④ 意图识别（第一次 LLM，失败降级为 general_chat）

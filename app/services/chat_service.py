@@ -26,6 +26,7 @@ from app.services.langfuse_service import LangfuseService
 from app.services.sensitive_service import (
     build_message_replace_event,
     check_sensitive,
+    dict_check_sensitive,
 )
 from app.intent.llm_client import chat_complete, extract_json
 
@@ -450,12 +451,13 @@ async def generate_response(
 ) -> AsyncGenerator[str, None]:
     """根据消息列表生成流式回复（多智能体编排版本）。
 
-    主流程：加载历史 → 快照 → 根span → 执行编排 → 输出敏感检测 →
+    主流程：加载历史 → 快照 → 根span → 输入敏感检测 → 执行编排 → 输出敏感检测 →
     推荐问题 → 持久化 → 文件检测 → trace收尾。
     中断处理：cancel_event 被 set 时主动 raise CancelledError，进入 finally 保证
     落库（success=False）+ flush trace + yield user_abort 事件。
-    敏感拦截：final_output 命中敏感时 yield message_replace 事件并跳过推荐问题，
-    持久化与文件检测仍执行（用户输入检测在 routes/chat.py 创建工作区之前完成）。
+    敏感拦截：输入为纯词典检测（在根 span 内执行，span 嵌套在本轮会话 trace 中），
+    命中时 yield message_replace 事件并结束本轮、不持久化；final_output 命中敏感时
+    yield message_replace 事件并跳过推荐问题，持久化与文件检测仍执行。
     """
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -513,6 +515,25 @@ async def generate_response(
                         await session_service.save_latest_trace_id(session_id, trace_id)
                     except Exception:
                         logger.warning("[chat_service] 流首保存 trace_id 失败", exc_info=True)
+            # ③.5 用户输入敏感检测（纯词典，低延迟）。
+            # 置于根 span 内执行，使 sensitive-dict-check span 嵌套在本轮会话
+            # trace 中（而非形成独立 trace）；命中则发 message_replace 并结束本轮，
+            # 不进入编排主流程，也不持久化消息
+            sens_input = await dict_check_sensitive(
+                _extract_user_input(messages), stage="input"
+            )
+            if sens_input["blocked"]:
+                replace_event = build_message_replace_event(sens_input, stage="input")
+                yield f"data: {json.dumps(replace_event, ensure_ascii=False)}\n\n"
+                _safe_update_span(root_obs, {
+                    "reply": "",
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "sensitiveBlocked": True,
+                    "blockedStage": "input",
+                })
+                return
+
             # ④ 执行编排主流程，实时透传 SSE 事件
             async for event_str in orchestrator_service.run(
                 full_messages,

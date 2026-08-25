@@ -6,6 +6,7 @@ import pytest
 from app.services import orchestrator_service as orch_mod
 from app.services.orchestrator_service import OrchestratorService
 from app.services.chat_service import _persist_conversation_history
+from app.dao.upload_file_dao import UploadFileDAO
 
 
 def _make_service() -> OrchestratorService:
@@ -163,3 +164,119 @@ async def test_persist_swallows_bind_exception():
         upload_file_dao=dao,
     )
     dao.bind_message_id.assert_awaited_once_with("s1", 101)
+
+
+# ---------------------------------------------------------------------------
+# UploadFileDAO.has_unbound_files（mock aiomysql 连接池）
+# ---------------------------------------------------------------------------
+
+class _FakeCursor:
+    def __init__(self, row, log):
+        self._row = row
+        self._log = log
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def execute(self, sql, args=None):
+        self._log.append((sql, args))
+
+    async def fetchone(self):
+        return self._row
+
+
+class _FakeConn:
+    def __init__(self, row, log):
+        self._row = row
+        self._log = log
+
+    def cursor(self, cursor_cls=None):
+        return _FakeCursor(self._row, self._log)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def commit(self):
+        pass
+
+
+class _FakePool:
+    def __init__(self, row):
+        self._row = row
+        self.log = []
+
+    def acquire(self):
+        return _FakeConn(self._row, self.log)
+
+
+@pytest.mark.asyncio
+async def test_has_unbound_files_true():
+    pool = _FakePool(row={"1": 1})
+    dao = UploadFileDAO(pool)
+    assert await dao.has_unbound_files("s1") is True
+    sql, args = pool.log[0]
+    assert "message_id IS NULL" in sql
+    assert args == ("s1",)
+
+
+@pytest.mark.asyncio
+async def test_has_unbound_files_false():
+    pool = _FakePool(row=None)
+    dao = UploadFileDAO(pool)
+    assert await dao.has_unbound_files("s1") is False
+
+
+# ---------------------------------------------------------------------------
+# _has_unbound_uploads（跳过问题改写的判定）
+# ---------------------------------------------------------------------------
+
+class _HasFilesDao:
+    def __init__(self, result, exc=None):
+        self.result = result
+        self.exc = exc
+        self.calls = []
+
+    async def has_unbound_files(self, session_id):
+        self.calls.append(session_id)
+        if self.exc:
+            raise self.exc
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_has_unbound_uploads_true():
+    dao = _HasFilesDao(result=True)
+    assert await _make_service()._has_unbound_uploads(_make_request(dao), "s1") is True
+    assert dao.calls == ["s1"]
+
+
+@pytest.mark.asyncio
+async def test_has_unbound_uploads_false():
+    dao = _HasFilesDao(result=False)
+    assert await _make_service()._has_unbound_uploads(_make_request(dao), "s1") is False
+
+
+@pytest.mark.asyncio
+async def test_has_unbound_uploads_no_session_or_request():
+    dao = _HasFilesDao(result=True)
+    assert await _make_service()._has_unbound_uploads(_make_request(dao), None) is False
+    assert await _make_service()._has_unbound_uploads(_make_request(dao), "") is False
+    assert await _make_service()._has_unbound_uploads(None, "s1") is False
+    assert dao.calls == []
+
+
+@pytest.mark.asyncio
+async def test_has_unbound_uploads_no_dao():
+    assert await _make_service()._has_unbound_uploads(_make_request(None), "s1") is False
+
+
+@pytest.mark.asyncio
+async def test_has_unbound_uploads_swallows_exception():
+    dao = _HasFilesDao(result=True, exc=RuntimeError("db down"))
+    assert await _make_service()._has_unbound_uploads(_make_request(dao), "s1") is False

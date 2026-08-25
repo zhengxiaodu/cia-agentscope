@@ -101,3 +101,20 @@ class UploadFileDAO:
                 affected = cur.rowcount
                 await conn.commit()
                 return affected
+
+    async def has_unbound_files(self, session_id: str) -> bool:
+        """该会话是否存在未绑定消息的上传文件（message_id IS NULL）。
+
+        轻量 EXISTS 查询，用于"有上传文件时跳过问题改写"的判定，
+        不区分解析状态/类型（字面语义：只要上传过且未被消费即算）。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT 1 FROM upload_files "
+                    "WHERE session_id = %s AND message_id IS NULL LIMIT 1",
+                    (session_id,),
+                )
+                row = await cur.fetchone()
+                await conn.commit()
+                return row is not None
