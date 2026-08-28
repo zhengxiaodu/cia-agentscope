@@ -38,6 +38,7 @@ from app.services.workspace_manager import DockerWorkspaceManager
 from app.services.workspace_cleanup_service import WorkspaceCleanupService
 from app.dao.mysql_session_dao import SessionDAO
 from app.dao.action_audit_dao import ActionAuditDAO
+from app.dao.upload_file_dao import UploadFileDAO
 from app.dao.init_mysql import init_mysql_tables
 from app.services.session_service import SessionService
 from app.services.action_audit_service import ActionAuditService
@@ -151,6 +152,7 @@ async def lifespan(app: FastAPI):
     action_audit_dao = ActionAuditDAO(mysql_pool)
     app.state.action_audit_dao = action_audit_dao
     app.state.action_audit_service = ActionAuditService(action_audit_dao)
+    app.state.upload_file_dao = UploadFileDAO(mysql_pool)
     logger.info(
         "Session service initialized "
         "(MySQL: %s@%s:%s/%s)",

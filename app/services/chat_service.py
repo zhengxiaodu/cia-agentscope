@@ -26,8 +26,8 @@ from app.services.langfuse_service import LangfuseService
 from app.services.sensitive_service import (
     build_message_replace_event,
     check_sensitive,
+    dict_check_sensitive,
 )
-from app.utils.sse_events import Stage, stage_status_event
 from app.intent.llm_client import chat_complete, extract_json
 
 logger = logging.getLogger(__name__)
@@ -191,11 +191,14 @@ async def _persist_conversation_history(
     user_id: Optional[str],
     messages: List[Dict[str, Any]],
     final_output: str,
+    upload_file_dao: Any = None,
 ) -> None:
     """持久化本轮对话历史（用户输入 + 智能体输出）。
 
     从 orchestrator_service 提取本轮参与的 agent_id 列表与成功标志，
     与 user/assistant 消息一同写入 messages 表。任何异常均静默吞掉。
+    落库成功后把本轮 user 消息 id 回填到该会话未绑定的上传文件
+    （upload_files.message_id），避免下一轮重复注入解析内容。
     """
     if not (session_service and session_id and user_id):
         missing = []
@@ -208,6 +211,7 @@ async def _persist_conversation_history(
         logger.warning(f"[chat_service] 跳过持久化：{', '.join(missing)} 为空")
         return
 
+    user_message_id = None
     try:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         user_input = _extract_user_input(messages)
@@ -244,9 +248,23 @@ async def _persist_conversation_history(
                 "tokens": _estimate_tokens(final_output),
             })
         if new_messages:
-            await session_service.append_messages(session_id, user_id, new_messages)
+            user_message_id = await session_service.append_messages(
+                session_id, user_id, new_messages
+            )
     except Exception:
         logger.exception("[chat_service] 持久化对话历史失败")
+
+    # 回填上传文件的 message_id（失败仅告警，不影响主流程）
+    if user_message_id and upload_file_dao:
+        try:
+            bound = await upload_file_dao.bind_message_id(session_id, user_message_id)
+            if bound:
+                logger.info(
+                    "[chat_service] 已绑定 %s 个上传文件到消息 %s",
+                    bound, user_message_id,
+                )
+        except Exception:
+            logger.warning("[chat_service] 回填上传文件 message_id 失败", exc_info=True)
 
 
 async def _detect_and_emit_files(
@@ -433,12 +451,13 @@ async def generate_response(
 ) -> AsyncGenerator[str, None]:
     """根据消息列表生成流式回复（多智能体编排版本）。
 
-    主流程：加载历史 → 快照 → 根span → 执行编排 → 输出敏感检测 →
+    主流程：加载历史 → 快照 → 根span → 输入敏感检测 → 执行编排 → 输出敏感检测 →
     推荐问题 → 持久化 → 文件检测 → trace收尾。
     中断处理：cancel_event 被 set 时主动 raise CancelledError，进入 finally 保证
     落库（success=False）+ flush trace + yield user_abort 事件。
-    敏感拦截：final_output 命中敏感时 yield message_replace 事件并跳过推荐问题，
-    持久化与文件检测仍执行（用户输入检测在 routes/chat.py 创建工作区之前完成）。
+    敏感拦截：输入为纯词典检测（在根 span 内执行，span 嵌套在本轮会话 trace 中），
+    命中时 yield message_replace 事件并结束本轮、不持久化；final_output 命中敏感时
+    yield message_replace 事件并跳过推荐问题，持久化与文件检测仍执行。
     """
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -496,6 +515,25 @@ async def generate_response(
                         await session_service.save_latest_trace_id(session_id, trace_id)
                     except Exception:
                         logger.warning("[chat_service] 流首保存 trace_id 失败", exc_info=True)
+            # ③.5 用户输入敏感检测（纯词典，低延迟）。
+            # 置于根 span 内执行，使 sensitive-dict-check span 嵌套在本轮会话
+            # trace 中（而非形成独立 trace）；命中则发 message_replace 并结束本轮，
+            # 不进入编排主流程，也不持久化消息
+            sens_input = await dict_check_sensitive(
+                _extract_user_input(messages), stage="input"
+            )
+            if sens_input["blocked"]:
+                replace_event = build_message_replace_event(sens_input, stage="input")
+                yield f"data: {json.dumps(replace_event, ensure_ascii=False)}\n\n"
+                _safe_update_span(root_obs, {
+                    "reply": "",
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "sensitiveBlocked": True,
+                    "blockedStage": "input",
+                })
+                return
+
             # ④ 执行编排主流程，实时透传 SSE 事件
             async for event_str in orchestrator_service.run(
                 full_messages,
@@ -557,18 +595,11 @@ async def generate_response(
             # 服务未配置或异常时兜底放行，不影响主流程
             output_blocked = False
             if final_output:
-                yield stage_status_event(
-                    Stage.OUTPUT_SENSITIVE_CHECK, "started", "正在进行输出内容安全检验...",
-                )
                 sens_result = await check_sensitive(final_output, stage="output")
                 if sens_result["blocked"]:
                     output_blocked = True
                     replace_event = build_message_replace_event(sens_result, stage="output")
                     yield f"data: {json.dumps(replace_event, ensure_ascii=False)}\n\n"
-                else:
-                    yield stage_status_event(
-                        Stage.OUTPUT_SENSITIVE_CHECK, "done", "输出内容安全检验通过",
-                    )
 
             # ⑤ 编排流结束立即生成推荐问题（前置，让前端尽快拿到）
             if not output_blocked:
@@ -577,10 +608,13 @@ async def generate_response(
                 ):
                     yield ev
 
-            # ⑥ 持久化对话历史（用户输入 + 智能体输出）
+            # ⑥ 持久化对话历史（用户输入 + 智能体输出）+ 回填上传文件 message_id
             await _persist_conversation_history(
                 orchestrator_service, session_service, session_id, user_id,
                 messages, final_output,
+                upload_file_dao=getattr(
+                    request.app.state, "upload_file_dao", None
+                ) if request is not None else None,
             )
 
             # ⑦ 检测本轮新文件

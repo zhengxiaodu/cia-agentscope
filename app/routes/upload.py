@@ -1,14 +1,12 @@
-import os
 import uuid
 
-from agentscope.message import DataBlock, URLSource
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Request
-from pydantic import AnyUrl
 
 from app.dependencies import current_user
 from app.services.file_service import FileService
-from app.config import UPLOAD_MAX_SIZE_MB, UPLOAD_ALLOWED_MEDIA_TYPES, WORKSPACE_BASEDIR
+from app.config import UPLOAD_MAX_SIZE_MB, UPLOAD_ALLOWED_MEDIA_TYPES
 from app.models.upload import UploadResponse, UploadErrorResponse
+from app.services.file_parse_service import start_background_parse
 
 router = APIRouter()
 
@@ -20,6 +18,12 @@ async def upload_file(
     user: dict = Depends(current_user),
     request: Request = None,
 ):
+    """上传文件：插入 upload_files 记录并启动后台解析，立即返回。
+
+    解析策略（见 file_parse_service.classify_parse_type）：
+    - 图片/文档/pdf/表格 → MinerU；音频 → 音频转写模型；纯文本直接读取
+    - 不再写入沙箱/宿主机工作区：问答时解析内容经提示词注入给 agent
+    """
     # Validate file size
     content = await file.read()
     if not FileService.validate_file_size(content, UPLOAD_MAX_SIZE_MB):
@@ -42,44 +46,30 @@ async def upload_file(
             ).model_dump(),
         )
 
-    # Save file and return DataBlock
     user_id = user.get("user_id")
     if not session_id:
         session_service = request.app.state.session_service
         session_id = await session_service.get_or_create_session(None, user_id)
 
-    workspace_backend = getattr(request.app.state, "workspace_backend", "docker")
-    workspace_manager = getattr(request.app.state, "workspace_manager", None)
-
-    if workspace_backend == "opensandbox" and workspace_manager is not None:
-        # OpenSandbox 后端：写入沙箱工作路径 adapter.workdir（/data/workspaces/{session_id}）
-        adapter = await workspace_manager._get_adapter(user_id, session_id)
-        filename = file.filename or "unknown"
-        unique_name = f"{uuid.uuid4().hex}_{filename}"
-        target_path = f"{adapter.workdir}/{unique_name}"
-        await adapter.upload(target_path, content)
-        datablock = DataBlock(
-            id=uuid.uuid4().hex,
-            name=filename,
-            source=URLSource(
-                url=AnyUrl(f"sandbox://{session_id}/{unique_name}"),
-                media_type=media_type,
-            ),
-        )
-    else:
-        # Docker 后端：原宿主机落盘逻辑
-        workdir = os.path.join(WORKSPACE_BASEDIR, session_id)
-        file_service = FileService(workdir=workdir)
-        datablock = await file_service.save_upload(
-            session_id=session_id,
-            filename=file.filename or "unknown",
-            content=content,
-            media_type=media_type,
-        )
+    # 后台异步解析：立即返回 file_id，解析结果稍后写入 upload_files 表
+    filename = file.filename or "unknown"
+    file_id = await start_background_parse(
+        request, session_id, filename, media_type, content
+    )
 
     return UploadResponse(
         code=200,
         msg="success",
         session_id=session_id,
-        data={"datablock": datablock.model_dump()},
+        data={
+            "datablock": {
+                "id": uuid.uuid4().hex,
+                "name": filename,
+                "source": {
+                    "url": f"uploaded://{filename}",
+                    "media_type": media_type,
+                },
+            },
+            "file_id": file_id,
+        },
     )

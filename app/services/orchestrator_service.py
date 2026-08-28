@@ -12,6 +12,7 @@
 - 构建临时的 AgentRegistry / IntentRecognizer / QueryRewriter
 - 请求结束时局部变量出作用域，内存自动释放
 """
+import asyncio
 import json
 import logging
 from contextlib import contextmanager
@@ -50,7 +51,6 @@ from app.orchestrator.pipeline import PipelineOrchestrator
 from app.orchestrator.react import ReActOrchestrator
 from app.services.chat_service import create_model_from_config
 from app.services.mng_service import fetch_external_intents, merge_external_into_memory
-from app.utils.sse_events import Stage, stage_status_event
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,10 @@ _SEARCH_SKILL_NAME = "bocha_search"
 
 # 历史上下文保留条数（3 轮 = 6 条 user/assistant 消息），用于截断 AgentState.context
 _HISTORY_KEEP_LAST = 6
+
+# 上传文件解析内容注入提示词的头部标记与单文件截断上限（防超上下文）
+_UPLOAD_CTX_HEADER = "【用户上传文件解析内容】"
+_UPLOAD_CTX_MAX_CHARS = 30000
 
 
 @contextmanager
@@ -354,71 +358,126 @@ class OrchestratorService:
             )
             return None
 
-    async def _build_request_components(
-        self,
-        user_id: str,
-        redis_client,
-        session_id: Optional[str] = None,
-        search_enabled: bool = True,
-        langfuse_service: Optional[Any] = None,
-        skills: Optional[List[str]] = None,
-        holder: Optional[dict] = None,
-    ) -> AsyncGenerator[str, None]:
-        """会话时构建临时组件：读 Redis 缓存（步骤 1-4 的产物）+ 步骤 5-8。
+    async def _resolve_workspace_task(self, ws_task: "asyncio.Task") -> tuple:
+        """等待工作区准备任务完成。
+
+        失败不向调用方抛：把异常转成给前端的错误文案，由调用方 yield error 事件。
+        文案与串行版本保持一致，避免前端出现新的错误形态。
+
+        Returns:
+            (registry, agent_factory, error_message)；失败时前两项为 None。
+        """
+        try:
+            registry, agent_factory = await ws_task
+            return registry, agent_factory, None
+        except Exception as e:
+            logger.exception("[OrchestratorService] 工作区准备失败")
+            self._last_success = False
+            return None, None, f"环境准备失败: {str(e)}"
+
+    async def _load_config_bundle(self, user_id: str, redis_client) -> dict:
+        """读取登录时缓存的融合配置（步骤 1-4 的产物），未命中则 base-only 兜底。
 
         缓存命中 → 直接用登录时融合好的 merged_intents/agents/skills；
         缓存未命中 → base-only 兜底融合（不请求 mng，无外部意图），
         外部意图在下次登录后恢复。会话路径永不发起 mng HTTP 调用。
-
-        步骤：
-        5. 通过工作区管理器获取/创建工作区（yield stage_status 阶段事件）
-        6. 构建 AgentRegistry / AgentFactory
-        7. 构建临时识别器 IntentRecognizer
-        8. 构建临时改写器 QueryRewriter
-
-        async generator 无法 return 值，结果元组写入 holder["result"]：
-            (registry, agent_factory, rewriter, recognizer)
-        Yields:
-            SSE 事件字符串（工作区获取/创建的 stage_status 事件）
         """
-        # ---- 读取登录时缓存的融合配置（步骤 1-4 产物） ----
         fused = await self._load_cached_user_config(user_id, redis_client)
         if fused is not None:
-            merged_intents = fused.get("merged_intents", [])
-            merged_agents = fused.get("merged_agents", [])
-            merged_skills = fused.get("merged_skills", [])
-            default_orchestration = fused.get("default_orchestration", {})
-        else:
-            # 缓存未命中兜底：base-only 融合（不请求 mng，无外部意图）
-            logger.warning(
-                f"[OrchestratorService] 用户配置缓存未命中 user={user_id}，"
-                f"走 base-only 兜底（无外部意图），下次登录后恢复"
-            )
-            fused = await self._fuse_user_config(jwt_token="", permissions={})
-            merged_intents = fused["merged_intents"]
-            merged_agents = fused["merged_agents"]
-            merged_skills = fused["merged_skills"]
-            default_orchestration = fused["default_orchestration"]
+            return {
+                "merged_intents": fused.get("merged_intents", []),
+                "merged_agents": fused.get("merged_agents", []),
+                "merged_skills": fused.get("merged_skills", []),
+                "default_orchestration": fused.get("default_orchestration", {}),
+            }
+        # 缓存未命中兜底：base-only 融合（不请求 mng，无外部意图）
+        logger.warning(
+            f"[OrchestratorService] 用户配置缓存未命中 user={user_id}，"
+            f"走 base-only 兜底（无外部意图），下次登录后恢复"
+        )
+        return await self._fuse_user_config(jwt_token="", permissions={})
 
-        # ---- 5. 通过工作区管理器获取/创建工作区（yield stage_status 阶段事件） ----
+    def _build_intent_components(self, fused: dict) -> tuple:
+        """构建请求级改写器与识别器（纯内存，不依赖工作区）。
+
+        Returns:
+            (rewriter, recognizer)
+        """
+        intent_configs = [IntentConfig(**item) for item in fused["merged_intents"]]
+
+        recognizer = IntentRecognizer(
+            client=self._intent_client,
+            model_config=self._intent_model_cfg,
+            recognition_prompt=self._prompts.get("intent_recognition", ""),
+            orchestration_prompt=self._prompts.get("intent_orchestration", ""),
+            intent_configs=intent_configs,
+            default_orchestration=fused["default_orchestration"],
+        )
+        rewriter = QueryRewriter(
+            client=self._intent_client,
+            model_config=self._intent_model_cfg,
+            rewrite_prompt=self._prompts.get("rewrite", ""),
+        )
+        return rewriter, recognizer
+
+    async def _prepare_workspace_components(
+        self,
+        fused: dict,
+        user_id: str,
+        redis_client,
+        user_id_safe: str,
+        session_id_safe: str,
+        search_enabled: bool = True,
+        skills: Optional[List[str]] = None,
+        langfuse_service: Optional[Any] = None,
+    ) -> tuple:
+        """获取/创建工作区并组装注册表与工厂（依赖沙箱，可与意图链路并行）。
+
+        含 workspace-load 环节埋点。本方法会被 run() 放进 asyncio.create_task，
+        因此不得读写 self 上的请求级状态（_last_agent_ids / _last_success 等）。
+
+        Returns:
+            (registry, agent_factory)
+        """
+        merged_agents = fused["merged_agents"]
+        merged_skills = fused["merged_skills"]
         all_skill_dirs = [s["directory"] for s in merged_skills]
-        user_id_safe = user_id or "anonymous"
-        session_id_safe = session_id or f"ephemeral-{user_id_safe}"
 
-        ws_holder: dict = {}
-        async for ev in self._iter_workspace_stage(
-            user_id_safe, session_id_safe, all_skill_dirs, langfuse_service, ws_holder,
-        ):
-            yield ev
-        workspace = ws_holder["workspace"]
+        # ---- 获取/创建工作区 ----
 
+        # 环节埋点：工作区获取/创建子 span
+        ws_ctx = (
+            langfuse_service.start_span(
+                "workspace-load",
+                input={"user_id": user_id_safe, "session_id": session_id_safe},
+            )
+            if langfuse_service
+            else _noop_ctx()
+        )
+        with ws_ctx as ws_span:
+            workspace = await self._workspace_manager.get_workspace(user_id_safe, session_id_safe)
+            if workspace is None:
+                # 首次创建：create_workspace 内部会在 ws.initialize() 处单独记录 workspace-initialize 子 span
+                workspace = await self._workspace_manager.create_workspace(
+                    user_id=user_id_safe,
+                    session_id=session_id_safe,
+                    skill_dirs=all_skill_dirs,
+                    langfuse_service=langfuse_service,
+                )
+            if ws_span:
+                try:
+                    ws_span.update(output={
+                        "workspace_id": getattr(workspace, "workspace_id", None),
+                    })
+                except Exception:
+                    pass
+            
         from tools.chart_tools import (
             render_bar_chart, render_line_chart, render_pie_chart,
             render_generic_card, render_metric_card, render_confirm_action,
             render_indicator_table, render_selectable_list,
         )
         from agentscope.tool import FunctionTool
-        from tools.mineru_tools import mineru_parse_tool
         from tools.policy_qa_tools import create_policy_qa_tool
 
         # 工具层：根据后端选择 agentscope 原生工具 / OpenSandbox 桥接工具
@@ -437,13 +496,13 @@ class OrchestratorService:
             adapter = OpenSandboxToolAdapter(
                 workspace, workdir=f"/data/workspaces/{session_id_safe}"
             )
-            all_tools = create_opensandbox_tools(adapter) + _chart_tools + [mineru_parse_tool, policy_qa_tool]
+            all_tools = create_opensandbox_tools(adapter) + _chart_tools + [policy_qa_tool]
             # 技能列表由管理器扫描沙箱内 /workspace/skills/ 获取
             all_skills_meta = await self._workspace_manager.list_skills(
                 user_id=user_id_safe, session_id=session_id_safe
             )
         else:
-            all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep()] + _chart_tools + [mineru_parse_tool, policy_qa_tool]
+            all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep()] + _chart_tools + [policy_qa_tool]
             all_skills_meta = await workspace.list_skills()
 
         # 按请求开关显隐联网搜索技能（workspace 始终装载全部技能，此处按轮次过滤）
@@ -475,83 +534,7 @@ class OrchestratorService:
             extra_skill_names=extra_skills,
         )
         agent_factory = AgentFactory(registry)
-
-        # ---- 7. 构建临时识别器 ----
-        intent_configs = [IntentConfig(**item) for item in merged_intents]
-
-        recognizer = IntentRecognizer(
-            client=self._intent_client,
-            model_config=self._intent_model_cfg,
-            recognition_prompt=self._prompts.get("intent_recognition", ""),
-            orchestration_prompt=self._prompts.get("intent_orchestration", ""),
-            intent_configs=intent_configs,
-            default_orchestration=default_orchestration,
-        )
-
-        # ---- 8. 构建临时改写器 ----
-        rewriter = QueryRewriter(
-            client=self._intent_client,
-            model_config=self._intent_model_cfg,
-            rewrite_prompt=self._prompts.get("rewrite", ""),
-        )
-
-        if holder is not None:
-            holder["result"] = (registry, agent_factory, rewriter, recognizer)
-
-    async def _iter_workspace_stage(
-        self,
-        user_id_safe: str,
-        session_id_safe: str,
-        all_skill_dirs: List[str],
-        langfuse_service: Any,
-        holder: dict,
-    ) -> AsyncGenerator[str, None]:
-        """获取/创建工作区，yield stage_status 阶段事件（workspace_get / workspace_create）。
-
-        命中已有工作区 → workspace_get started/done；
-        未命中（首次/已过期/已崩溃）→ workspace_get started → workspace_create started/done。
-        工作区实例写入 holder["workspace"]（async generator 无法 return 值）。
-        同时记录 workspace-load Langfuse 子 span。
-        """
-        ws_ctx = (
-            langfuse_service.start_span(
-                "workspace-load",
-                input={"user_id": user_id_safe, "session_id": session_id_safe},
-            )
-            if langfuse_service
-            else _noop_ctx()
-        )
-        with ws_ctx as ws_span:
-            yield stage_status_event(
-                Stage.WORKSPACE_GET, "started", "正在获取工作区...",
-            )
-            workspace = await self._workspace_manager.get_workspace(user_id_safe, session_id_safe)
-            if workspace is None:
-                # 首次创建：create_workspace 内部会在 ws.initialize() 处单独记录 workspace-initialize 子 span
-                yield stage_status_event(
-                    Stage.WORKSPACE_CREATE, "started", "正在创建工作区...",
-                )
-                workspace = await self._workspace_manager.create_workspace(
-                    user_id=user_id_safe,
-                    session_id=session_id_safe,
-                    skill_dirs=all_skill_dirs,
-                    langfuse_service=langfuse_service,
-                )
-                yield stage_status_event(
-                    Stage.WORKSPACE_CREATE, "done", "工作区创建完成",
-                )
-            else:
-                yield stage_status_event(
-                    Stage.WORKSPACE_GET, "done", "工作区获取完成",
-                )
-            if ws_span:
-                try:
-                    ws_span.update(output={
-                        "workspace_id": getattr(workspace, "workspace_id", None),
-                    })
-                except Exception:
-                    pass
-        holder["workspace"] = workspace
+        return registry, agent_factory
 
     def _span(self, langfuse_service: Any, name: str, input_dict: dict) -> Any:
         """统一 span 创建：启用 langfuse 时启动子 span，否则返回空 context manager。
@@ -807,27 +790,142 @@ class OrchestratorService:
             yield self._event({"type": "error", "message": "未检测到有效用户输入"})
             return
 
-        # ① 装配请求级组件（配置加载 + workspace 获取/创建，含 workspace 埋点
-        #    与 workspace_get / workspace_create 阶段事件透传）
+        # ① 装配请求级配置组件（纯内存；workspace 获取/创建并行化，见下方 ws_task）
         redis_client = None
         if request is not None:
             redis_client = getattr(request.app.state, "redis_client", None)
 
-        build_holder: dict = {}
-        async for ev in self._build_request_components(
-            user_id=user_id,
-            redis_client=redis_client,
-            session_id=session_id,
-            search_enabled=search_enabled,
-            langfuse_service=langfuse_service,
-            skills=skills or [],
-            holder=build_holder,
-        ):
-            yield ev
-        registry, agent_factory, rewriter, recognizer = build_holder["result"]
+        user_id_safe = user_id or "anonymous"
+        session_id_safe = session_id or f"ephemeral-{user_id_safe}"
+        try:
+            fused = await self._load_config_bundle(user_id, redis_client)
+            rewriter, recognizer = self._build_intent_components(fused)
+        except Exception as e:
+            # 配置装配失败不能让 SSE 流以 ASGI 异常中断，转为 error 事件
+            logger.exception("[OrchestratorService] 请求级配置装配失败")
+            self._last_success = False
+            yield self._event({
+                "type": "error",
+                "message": f"环境准备失败: {str(e)}",
+            })
+            return
 
+        # 工作区准备与意图链路并行：workspace 直到编排执行阶段才被消费，
+        # 这段时间足以覆盖改写 + 意图识别 + 意图编排。
+        ws_task = asyncio.create_task(
+            self._prepare_workspace_components(
+                fused=fused,
+                user_id=user_id,
+                redis_client=redis_client,
+                user_id_safe=user_id_safe,
+                session_id_safe=session_id_safe,
+                search_enabled=search_enabled,
+                skills=skills or [],
+                langfuse_service=langfuse_service,
+            ),
+            name="workspace-prepare",
+        )
+        try:
+            async for event_str in self._run_with_workspace_task(
+                ws_task=ws_task,
+                rewriter=rewriter,
+                recognizer=recognizer,
+                user_input=user_input,
+                history=history,
+                messages=messages,
+                session_id=session_id,
+                user_id=user_id,
+                session_service=session_service,
+                agent_id=agent_id,
+                langfuse_service=langfuse_service,
+                request=request,
+            ):
+                yield event_str
+        finally:
+            # 客户端断连会让本生成器被提前关闭：未完成则取消，已完成则消费异常，
+            # 否则事件循环会报 "Task exception was never retrieved"
+            if not ws_task.done():
+                ws_task.cancel()
+            elif not ws_task.cancelled():
+                ws_task.exception()
+
+    async def _load_upload_context(self, request: Any, session_id: Optional[str]) -> str:
+        """检索该会话未绑定消息的上传文件解析内容，拼接为提示词片段。
+
+        上传文件在 /upload 时即后台解析入库（见 file_parse_service）；
+        此处只取 message_id IS NULL 且解析内容非空的记录（失败文案也算，
+        让 agent 诚实告知用户）。检索失败静默返回空串，不影响问答主流程。
+        """
+        if request is None or not session_id:
+            return ""
+        dao = getattr(request.app.state, "upload_file_dao", None)
+        if dao is None:
+            return ""
+        try:
+            rows = await dao.load_unbound_parsed(session_id)
+        except Exception:
+            logger.warning("[OrchestratorService] 检索上传文件解析内容失败", exc_info=True)
+            return ""
+        if not rows:
+            return ""
+        parts = [_UPLOAD_CTX_HEADER]
+        for row in rows:
+            content = (row.get("parsed_content") or "")[:_UPLOAD_CTX_MAX_CHARS]
+            parts.append(f"=== 文件名: {row.get('filename', '')} ===")
+            parts.append(content)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _append_upload_context(text: str, upload_ctx: str) -> str:
+        """把上传文件上下文追加到文本尾部（上下文为空时原样返回）。"""
+        if not upload_ctx:
+            return text
+        return f"{text}\n\n{upload_ctx}"
+
+    async def _has_unbound_uploads(self, request: Any, session_id: Optional[str]) -> bool:
+        """该会话是否存在未绑定消息的上传文件（用于跳过问题改写）。
+
+        检索失败静默返回 False（不影响问答主流程，仅照常做改写）。
+        """
+        if request is None or not session_id:
+            return False
+        dao = getattr(request.app.state, "upload_file_dao", None)
+        if dao is None:
+            return False
+        try:
+            return await dao.has_unbound_files(session_id)
+        except Exception:
+            logger.warning("[OrchestratorService] 检查未绑定上传文件失败", exc_info=True)
+            return False
+
+    async def _run_with_workspace_task(
+        self,
+        ws_task: "asyncio.Task",
+        rewriter: QueryRewriter,
+        recognizer: IntentRecognizer,
+        user_input: str,
+        history: List[dict],
+        messages: List[Dict[str, Any]],
+        session_id: Optional[str],
+        user_id: Optional[str],
+        session_service: Optional[Any],
+        agent_id: Optional[str],
+        langfuse_service: Optional[Any],
+        request: Any = None,
+    ) -> AsyncGenerator[str, None]:
+        """在等待工作区 task 的同时跑完意图链路，再执行编排。
+
+        拆成独立方法是为了让 run() 的 finally 能无条件覆盖本方法的全部提前返回路径
+        （return / 异常 / 生成器被关闭），保证 ws_task 不会悬挂。
+        """
         # ② 单 agent 短路路径（跳过改写→识别→编排，直接由指定 agent 回答）
         if agent_id:
+            registry, agent_factory, ws_err = await self._resolve_workspace_task(ws_task)
+            if ws_err:
+                yield self._event({"type": "error", "message": ws_err})
+                return
+            upload_ctx = await self._load_upload_context(request, session_id)
+            user_input = self._append_upload_context(user_input, upload_ctx)
             async for ev in self._run_single_agent_path(
                 registry, agent_factory, agent_id, user_input,
                 session_id, user_id, session_service, langfuse_service,
@@ -835,24 +933,32 @@ class OrchestratorService:
                 yield ev
             return
 
-        # ③ 查询改写（联系上下文，失败降级为原始输入）
+        # ③ 查询改写（联系上下文，失败降级为原始输入）。
+        # 有未消费的上传文件时跳过改写：文件解析内容将在编排前注入 query，
+        # 原始问题已足够完整，改写反而可能引入偏差
+        skip_rewrite = await self._has_unbound_uploads(request, session_id)
         with self._span(
             langfuse_service, "query-rewrite",
             {"original": user_input, "history_len": len(history)},
         ) as rw_span:
-            try:
-                rewritten, rw_prompts = await rewriter.rewrite(user_input, history)
-                _rw_extra = {}
-            except Exception as e:
-                logger.exception("[OrchestratorService] 查询改写失败，使用原始输入")
+            if skip_rewrite:
                 rewritten, rw_prompts = user_input, {}
-                _rw_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
+                _rw_extra = {"skipped": "upload-file"}
+            else:
+                try:
+                    rewritten, rw_prompts = await rewriter.rewrite(user_input, history)
+                    _rw_extra = {}
+                except Exception as e:
+                    logger.exception("[OrchestratorService] 查询改写失败，使用原始输入")
+                    rewritten, rw_prompts = user_input, {}
+                    _rw_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
             _safe_update_span(rw_span, {"rewritten": rewritten, "prompts": rw_prompts, **_rw_extra})
 
         yield self._event({
             "type": "query_rewritten",
             "original": user_input,
             "rewritten": rewritten,
+            **({"skipped_reason": "upload-file"} if skip_rewrite else {}),
         })
 
         # ④ 意图识别（第一次 LLM，失败降级为 general_chat）
@@ -916,6 +1022,19 @@ class OrchestratorService:
             ],
             "relation": intent_result.relation,
         })
+
+        # 编排前汇合：此时意图链路已跑完，工作区大概率已就绪
+        registry, agent_factory, ws_err = await self._resolve_workspace_task(ws_task)
+        if ws_err:
+            yield self._event({"type": "error", "message": ws_err})
+            return
+
+        # 上传文件解析内容注入：意图识别已通过，真正进入问答阶段。
+        # 附加到每个 intent 的 query（pipeline/react 均以 intent.query 作为 agent 任务输入）
+        upload_ctx = await self._load_upload_context(request, session_id)
+        if upload_ctx:
+            for intent in intent_result.intents:
+                intent.query = self._append_upload_context(intent.query, upload_ctx)
 
         # ⑥ 选择编排器并加载各 agent 状态
         mode = recognizer.get_orchestration_mode(intent_result)

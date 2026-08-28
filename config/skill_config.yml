@@ -1,16 +1,13 @@
 skills:
   - name: bocha_search
-    directory: ../skills/bocha_search
+    directory: ./skills/bocha_search
     description: "使用博查搜索引擎获取网上的知识和最新信息。适用于查询新闻、科技资讯、天气预报、股票行情等需要实时数据的场景。"
   - name: chart_renderer
-    directory: ../skills/chart_renderer
+    directory: ./skills/chart_renderer
     description: "智能图表渲染技能，根据数据特征自动选择最合适的图表类型并通过工具渲染。"
   - name: card_interaction
-    directory: ../skills/card_interaction
+    directory: ./skills/card_interaction
     description: "个性化交互卡片技能，用于展示需要用户交互的个性化卡片组件。"
   - name: policy_qa
-    directory: ../skills/policy_qa
+    directory: ./skills/policy_qa
     description: "调用制度问答 API，基于知识库回答制度/政策/法规类问题。"
-  - name: mineru
-    directory: ../skills/mineru
-    description: "MinerU 文档解析技能，将用户上传的 pdf/docx/doc/表格/图片解析为 Markdown，适用于提取、总结、问答文档内容。"

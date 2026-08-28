@@ -10,7 +10,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 import yaml
-from agentscope.agent import Agent
+from agentscope.agent import Agent, ContextConfig
 from agentscope.model import OpenAIChatModel
 from agentscope.permission import PermissionContext, PermissionMode
 from agentscope.state import AgentState
@@ -146,10 +146,18 @@ class AgentRegistry:
 
         agent = Agent(
             name=definition.name,
-            system_prompt=definition.system_prompt + f"\n注意当前工作区目录是/data/workspace/{session_id}，用户所有附件（如果有）以及所有的技能文件已上传到该目录下，你只能在该目录下读/写/编辑文件，绝不允许操作目录以外的文件！" + f"\n当你生成文件时，给文件起一个英文名，不要用中文名生成文件",
+            system_prompt=definition.system_prompt
+            + f"\n注意当前工作区目录是/data/workspaces/{session_id}，你的技能文件已装载到该目录下，你只能在该目录下读/写/编辑文件，绝不允许操作目录以外的文件！"
+            + "\n用户上传的文件不会出现在工作区目录中：其内容已解析并直接附在用户问题里，请直接阅读使用，不要尝试在工作区中查找用户附件。"
+            + "\n当你生成文件时，给文件起一个英文名，不要用中文名生成文件",
             model=model,
             toolkit=toolkit,
             state=agent_state,
+            context_config=ContextConfig(
+                trigger_ratio=0.8,
+                reserve_ratio=0.1,
+                tool_result_limit=3000,
+            ),
             offloader=self._workspace
         )
         return agent

@@ -17,11 +17,11 @@ try:
 except ValueError as e:
     raise RuntimeError(f"CONFIG_DECRYPT_KEY 配置非法: {e}") from e
 
-SKILL_CONFIG_PATH = "../config/skill_config.yml"
-MODEL_CONFIG_PATH = "../config/model_config.yml"
+SKILL_CONFIG_PATH = "./config/skill_config.yml"
+MODEL_CONFIG_PATH = "./config/model_config.yml"
 # 多智能体与多意图编排配置
-AGENT_CONFIG_PATH = "../config/agent_config.yml"
-INTENT_CONFIG_PATH = "../config/intent_config.yml"
+AGENT_CONFIG_PATH = "./config/agent_config.yml"
+INTENT_CONFIG_PATH = "./config/intent_config.yml"
 
 JWT_ALGORITHM = "HS256"
 # 支持 ENC(...) 密文（由 CONFIG_DECRYPT_KEY 解密）或明文（向后兼容）
@@ -43,6 +43,8 @@ MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "agentscope")
 
 # 文件上传配置
 UPLOAD_MAX_SIZE_MB = int(os.getenv("UPLOAD_MAX_SIZE_MB", "10"))
+# 上传文件解析统一超时（秒）：MinerU 轮询与音频转写共用
+UPLOAD_PARSE_TIMEOUT = int(os.getenv("UPLOAD_PARSE_TIMEOUT", "60"))
 UPLOAD_ALLOWED_MEDIA_TYPES = [
     "image/jpeg",
     "image/png",
@@ -57,6 +59,15 @@ UPLOAD_ALLOWED_MEDIA_TYPES = [
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # xlsx
     "application/vnd.ms-powerpoint",  # ppt
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # pptx
+    # 音频（上传时调用音频转写模型解析）
+    "audio/mpeg",  # mp3
+    "audio/mp4",  # m4a
+    "audio/x-m4a",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/webm",
+    "audio/aac",
+    "audio/ogg",
 ]
 
 # Langfuse 可观测性配置
@@ -121,7 +132,11 @@ MINERU_API_KEY = os.getenv("MINERU_API_KEY", "")
 MINERU_BASE_URL = os.getenv("MINERU_BASE_URL", "")
 
 # ---- 安全敏感内容检测配置 ----
-# 敏感检测服务地址（本地词典 + MiniCPM5 语义模型），留空则关闭检测
+# 安全审核总开关（false 时输入输出均不做安全审核）
+SENSITIVE_ENABLED = os.getenv("SENSITIVE_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+# 敏感检测服务基础地址（IP+端口；/sensitive/check 与 /sensitive/dict-check 由服务代码拼接），留空则关闭检测
 SENSITIVE_SERVICE_URL = os.getenv("SENSITIVE_SERVICE_URL", "")
 # 语义风险阈值（0.0-1.0），默认 0.7
 SENSITIVE_THRESHOLD = float(os.getenv("SENSITIVE_THRESHOLD", "0.7"))
