@@ -39,6 +39,6 @@ orchestrator:
   # ReAct 循环最大步数，防止死循环
   react_max_steps: 8
   # 并行执行单个智能体的超时时间（秒）
-  parallel_timeout: 240
+  parallel_timeout: 900
   # 流水线任一步骤超时时间（秒）
-  pipeline_step_timeout: 240
+  pipeline_step_timeout: 900
