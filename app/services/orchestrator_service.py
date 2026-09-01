@@ -15,6 +15,7 @@
 import asyncio
 import json
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional
 
@@ -34,6 +35,7 @@ from app.config import (
     EXTERNAL_SKILLS_DIR,
     JWT_EXPIRE_HOURS,
     WORKSPACE_BACKEND,
+    WORKSPACE_BASEDIR,
 )
 from app.agents.base import AgentDefinition
 from app.agents.factory import AgentFactory
@@ -478,6 +480,7 @@ class OrchestratorService:
             render_indicator_table, render_selectable_list,
         )
         from agentscope.tool import FunctionTool
+        from tools.md_export_tools import create_md_export_tools
         from tools.policy_qa_tools import create_policy_qa_tool
 
         # 工具层：根据后端选择 agentscope 原生工具 / OpenSandbox 桥接工具
@@ -490,19 +493,63 @@ class OrchestratorService:
         # 制度问答工具（宿主侧 FunctionTool，知识库 ID 由用户权限自动映射，不依赖工作区后端）
         policy_qa_tool = create_policy_qa_tool(user_id=user_id, redis_client=redis_client)
         if WORKSPACE_BACKEND == "opensandbox":
+            import base64
+
             from app.services.opensandbox_adapter import OpenSandboxToolAdapter
             from app.services.opensandbox_tool_bridge import create_opensandbox_tools
             # workspace 此处是 OpenSandbox Sandbox 实例
             adapter = OpenSandboxToolAdapter(
                 workspace, workdir=f"/data/workspaces/{session_id_safe}"
             )
-            all_tools = create_opensandbox_tools(adapter) + _chart_tools + [policy_qa_tool]
+
+            # Markdown 导出工具的沙箱读写闭包：文本读直接走 adapter.read；
+            # 二进制写经 base64 文本通道 + bash 解码落盘
+            # （与 opensandbox_workspace_manager.read_session_file 的二进制读取模式对称）
+            async def _sandbox_read_file(rel_path: str) -> str:
+                return await adapter.read(f"{adapter.workdir}/{rel_path}")
+
+            async def _sandbox_write_file(rel_path: str, data: bytes) -> None:
+                abs_path = f"{adapter.workdir}/{rel_path}"
+                b64_path = f"{abs_path}.b64"
+                await adapter.write(b64_path, base64.b64encode(data).decode("ascii"))
+                result = await adapter.bash(f"base64 -d '{b64_path}' > '{abs_path}'")
+                # 解码成败均清理临时 b64，避免残留进入 files_generated 快照差分
+                await adapter.bash(f"rm -f '{b64_path}'")
+                if result["exit_code"] != 0:
+                    raise RuntimeError(
+                        f"base64 解码写入沙箱失败 exit={result['exit_code']} "
+                        f"stderr={result['stderr']}"
+                    )
+
+            md_tools = create_md_export_tools(_sandbox_read_file, _sandbox_write_file)
+            all_tools = (
+                create_opensandbox_tools(adapter) + _chart_tools
+                + [policy_qa_tool] + md_tools
+            )
             # 技能列表由管理器扫描沙箱内 /workspace/skills/ 获取
             all_skills_meta = await self._workspace_manager.list_skills(
                 user_id=user_id_safe, session_id=session_id_safe
             )
         else:
-            all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep()] + _chart_tools + [policy_qa_tool]
+            # docker 分支：会话工作区为宿主机 WORKSPACE_BASEDIR/{session_id} 目录
+            # （与 app/routes/files.py 的 docker 下载路径一致），走本地读写闭包
+            session_dir = os.path.join(WORKSPACE_BASEDIR, session_id_safe)
+
+            async def _local_read_file(rel_path: str) -> str:
+                with open(os.path.join(session_dir, rel_path), "r", encoding="utf-8") as f:
+                    return f.read()
+
+            async def _local_write_file(rel_path: str, data: bytes) -> None:
+                out_path = os.path.join(session_dir, rel_path)
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                with open(out_path, "wb") as f:
+                    f.write(data)
+
+            md_tools = create_md_export_tools(_local_read_file, _local_write_file)
+            all_tools = (
+                [Bash(), Read(), Write(), Edit(), Glob(), Grep()] + _chart_tools
+                + [policy_qa_tool] + md_tools
+            )
             all_skills_meta = await workspace.list_skills()
 
         # 按请求开关显隐联网搜索技能（workspace 始终装载全部技能，此处按轮次过滤）
