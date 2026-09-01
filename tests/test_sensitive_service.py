@@ -270,7 +270,6 @@ def _build_request(orch=None):
     request.app.state.session_service = session_service
     request.app.state.chat_tasks = {}
     request.app.state.langfuse_service = None
-    request.app.state.workspace_backend = "docker"
     request.app.state.workspace_manager = None
     request.app.state.upload_file_dao = None
     request.app.state.orchestrator_service = orch if orch is not None else MagicMock()

@@ -156,11 +156,8 @@ def test_build_intent_components_wires_prompts():
 
 
 @pytest.mark.asyncio
-async def test_prepare_workspace_components_creates_when_absent(monkeypatch):
+async def test_prepare_workspace_components_creates_when_absent():
     """get_workspace 返回 None → 回退 create_workspace，并透传技能目录。"""
-    monkeypatch.setattr(
-        "app.services.orchestrator_service.WORKSPACE_BACKEND", "opensandbox"
-    )
     mgr = _FakeWorkspaceManager(existing=None)
     svc = _make_service(mgr)
 
@@ -182,11 +179,8 @@ async def test_prepare_workspace_components_creates_when_absent(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_prepare_workspace_components_reuses_existing(monkeypatch):
+async def test_prepare_workspace_components_reuses_existing():
     """get_workspace 命中 → 不调 create_workspace。"""
-    monkeypatch.setattr(
-        "app.services.orchestrator_service.WORKSPACE_BACKEND", "opensandbox"
-    )
     mgr = _FakeWorkspaceManager(existing=_FakeSandbox())
     svc = _make_service(mgr)
 
@@ -200,11 +194,8 @@ async def test_prepare_workspace_components_reuses_existing(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_prepare_workspace_components_filters_search_skill(monkeypatch):
+async def test_prepare_workspace_components_filters_search_skill():
     """search_enabled=False → bocha_search 从 all_skills_meta 中剔除。"""
-    monkeypatch.setattr(
-        "app.services.orchestrator_service.WORKSPACE_BACKEND", "opensandbox"
-    )
     mgr = _FakeWorkspaceManager(existing=_FakeSandbox())
     svc = _make_service(mgr)
 
