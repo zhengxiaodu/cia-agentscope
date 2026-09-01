@@ -386,7 +386,7 @@ class OpenSandboxWorkspaceManager:
                     rel_path = os.path.relpath(host_path, d)
                     sandbox_path = f"/workspace/skills/{skill_name}/{rel_path}"
                     try:
-                        with open(host_path, "rb", encoding="utf-8") as f:
+                        with open(host_path, "r", encoding="utf-8") as f:
                             content = f.read()
                         await sbx.files.write_files([
                             WriteEntry(path=sandbox_path, data=content, mode=644)
