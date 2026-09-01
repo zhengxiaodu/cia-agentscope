@@ -1,6 +1,7 @@
 import logging
 import mimetypes
 import os
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
@@ -10,6 +11,20 @@ from app.services.opensandbox_workspace_manager import OpenSandboxWorkspaceManag
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _content_disposition(basename: str) -> str:
+    """构造 attachment 的 Content-Disposition 头（RFC 5987/6266）。
+
+    HTTP 头只支持 latin-1，中文等非 ASCII 文件名直接拼接会导致
+    'latin-1' codec 编码错误；改为 ASCII 回退名 + filename*=UTF-8'' 双写：
+    现代浏览器优先读 filename* 显示原名，老客户端回退到 ASCII 名。
+    """
+    ascii_name = basename.encode("latin-1", "ignore").decode("latin-1") or "download"
+    return (
+        f"attachment; filename=\"{ascii_name}\"; "
+        f"filename*=UTF-8''{quote(basename)}"
+    )
 
 
 def _build_file_response(
@@ -26,7 +41,7 @@ def _build_file_response(
         return Response(
             content=content,
             media_type=media_type,
-            headers={"Content-Disposition": f'attachment; filename="{basename}"'},
+            headers={"Content-Disposition": _content_disposition(basename)},
         )
     is_text = media_type.startswith("text/") or OpenSandboxWorkspaceManager._is_text_rel(rel)
     is_image = media_type.startswith("image/")
