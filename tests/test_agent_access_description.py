@@ -11,7 +11,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.routes.auth import _build_auth_success, _enrich_agent_access
+from app.routes.auth import (
+    _MERGED_REGULATIONS_AGENT,
+    _build_auth_success,
+    _enrich_agent_access,
+    _merge_regulations_agents,
+)
 from app.services.mng_service import build_agent_definition_map
 
 
@@ -157,12 +162,17 @@ class TestBuildAuthSuccess:
         agent_access = resp["data"]["agent_access"]
         by_id = {a["id"]: a for a in agent_access}
         assert by_id["999"]["description"] == "用于生成精美ppt"
-        assert "description" not in by_id["123"]
+        # "制度问答" 项被合并为统一的 regulations_qa
+        assert by_id["regulations_qa"]["description"] == (
+            _MERGED_REGULATIONS_AGENT["description"]
+        )
+        assert "123" not in by_id
 
-        # 存 Redis 的是已 enrich 的 permissions
+        # 存 Redis 的是已 enrich 且未合并的 permissions
         saved = save_mock.await_args.args[2]
         saved_by_id = {a["id"]: a for a in saved["agent_whitelist"]}
         assert saved_by_id["999"]["description"] == "用于生成精美ppt"
+        assert "123" in saved_by_id  # 原始制度问答项保留
 
     @pytest.mark.asyncio
     async def test_degrade_when_orchestrator_missing(self):
@@ -172,8 +182,14 @@ class TestBuildAuthSuccess:
             resp = await _build_auth_success(copy.deepcopy(_RESULT), request)
 
         agent_access = resp["data"]["agent_access"]
+        # 制度问答合并为 1 项 + 生成PPT 1 项
         assert len(agent_access) == 2
-        assert all("description" not in a for a in agent_access)
+        by_id = {a["id"]: a for a in agent_access}
+        # 合并项 description 为统一文案；其余项无 description
+        assert by_id["regulations_qa"]["description"] == (
+            _MERGED_REGULATIONS_AGENT["description"]
+        )
+        assert "description" not in by_id["999"]
 
     @pytest.mark.asyncio
     async def test_degrade_when_fuse_fails(self):
@@ -184,7 +200,60 @@ class TestBuildAuthSuccess:
             resp = await _build_auth_success(copy.deepcopy(_RESULT), request)
 
         agent_access = resp["data"]["agent_access"]
-        assert all("description" not in a for a in agent_access)
-        # 权限仍正常保存（未 enrich）
+        by_id = {a["id"]: a for a in agent_access}
+        assert "description" not in by_id["999"]
+        assert by_id["regulations_qa"]["description"] == (
+            _MERGED_REGULATIONS_AGENT["description"]
+        )
+        # 权限仍正常保存（未 enrich、未合并）
         saved = save_mock.await_args.args[2]
         assert all("description" not in a for a in saved["agent_whitelist"])
+        assert len(saved["agent_whitelist"]) == 2
+
+
+# ---------- _merge_regulations_agents ----------
+
+class TestMergeRegulationsAgents:
+    def test_merge_multiple_regulations_agents(self):
+        whitelist = [
+            {"id": "111", "name": "通用问答", "show": 1},
+            {"id": "123", "name": "金科制度问答", "show": 1},
+            {"id": "456", "name": "信科制度问答", "show": 1},
+            {"id": "999", "name": "生成PPT智能体", "show": 0},
+        ]
+        merged = _merge_regulations_agents(whitelist)
+
+        # 金科+信科合并为 1 项，位于首个命中原项位置；其余项原顺序保留
+        assert merged == [
+            {"id": "111", "name": "通用问答", "show": 1},
+            dict(_MERGED_REGULATIONS_AGENT),
+            {"id": "999", "name": "生成PPT智能体", "show": 0},
+        ]
+        assert merged[1]["id"] == "regulations_qa"
+        assert merged[1]["name"] == "制度问答"
+        assert merged[1]["description"] == "根据公司内部制度文件知识库回答问题"
+
+    def test_no_hit_returns_original(self):
+        whitelist = [{"id": "1", "name": "通用问答"}]
+        assert _merge_regulations_agents(whitelist) is whitelist
+
+    def test_empty_list(self):
+        assert _merge_regulations_agents([]) == []
+
+    def test_non_dict_items_robustness(self):
+        merged = _merge_regulations_agents([
+            "bad-item",
+            {"id": "123", "name": "制度问答"},
+            None,
+        ])
+        assert merged == ["bad-item", dict(_MERGED_REGULATIONS_AGENT), None]
+
+    def test_returned_item_not_polluting_constant(self):
+        merged = _merge_regulations_agents([{"id": "123", "name": "制度问答"}])
+        merged[0]["name"] = "被修改"
+        assert _MERGED_REGULATIONS_AGENT["name"] == "制度问答"
+
+    def test_input_not_modified(self):
+        whitelist = [{"id": "123", "name": "金科制度问答"}]
+        _merge_regulations_agents(whitelist)
+        assert whitelist == [{"id": "123", "name": "金科制度问答"}]
