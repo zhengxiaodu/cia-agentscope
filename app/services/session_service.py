@@ -3,7 +3,7 @@ from typing import Optional
 
 from agentscope.state import AgentState
 
-from app.models.session import SessionMeta, SessionMessage, SessionDetailResponse
+from app.models.session import SessionMeta, SessionMessage, SessionDetailResponse, SessionFile
 
 
 class SessionService:
@@ -14,7 +14,7 @@ class SessionService:
 
     async def get_or_create_session(self, session_id: Optional[str], user_id: str) -> str:
         """获取已有 session_id 或创建新会话。"""
-        if session_id and await self.dao.session_exists(session_id):
+        if session_id:
             return session_id
         return uuid.uuid4().hex
 
@@ -30,15 +30,31 @@ class SessionService:
         """将最新 trace_id 保存到会话元信息。"""
         await self.dao.save_latest_trace_id(session_id, trace_id)
 
+    async def mark_last_assistant_failed(self, session_id: str, user_id: str) -> None:
+        """把该会话最新一条 assistant 消息标记为失败（用户中断时调用）。"""
+        await self.dao.mark_last_assistant_failed(session_id, user_id)
+
     async def load_messages(self, session_id: str) -> list[dict]:
         """加载多智能体对话历史（纯消息列表形式）。"""
         return await self.dao.load_messages(session_id)
 
     async def append_messages(
         self, session_id: str, user_id: str, messages: list[dict]
-    ) -> None:
-        """向会话历史追加消息（用户输入 + 智能体输出）。"""
-        await self.dao.append_messages(session_id, user_id, messages)
+    ) -> Optional[int]:
+        """向会话历史追加消息（用户输入 + 智能体输出）。
+
+        Returns:
+            本轮 user 消息的自增 id（MySQL DAO；供上传文件回填 message_id）。
+        """
+        return await self.dao.append_messages(session_id, user_id, messages)
+
+    async def append_session_files(self, session_id: str, files: list[dict]) -> None:
+        """持久化本轮生成的文件元信息（按 (session_id, path) UPSERT 去重）。"""
+        await self.dao.append_session_files(session_id, files)
+
+    async def load_session_files(self, session_id: str) -> list[dict]:
+        """加载会话历史生成的文件元信息列表。"""
+        return await self.dao.load_session_files(session_id)
 
     async def pin_session(self, user_id: str, session_id: str) -> None:
         """置顶会话。"""
@@ -78,10 +94,15 @@ class SessionService:
         raw_messages = await self.dao.load_messages(session_id)
         messages = [SessionMessage(**m) for m in raw_messages]
 
+        # 从 session_files 表加载历史生成的文件
+        raw_files = await self.dao.load_session_files(session_id)
+        files = [SessionFile(**f) for f in raw_files]
+
         return SessionDetailResponse(
             session_id=session_id,
             created_at=meta.get("created_at", ""),
             updated_at=meta.get("updated_at", ""),
             trace_id=meta.get("latest_trace_id"),
             messages=messages,
+            files=files,
         )

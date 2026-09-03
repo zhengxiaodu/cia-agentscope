@@ -2,7 +2,8 @@
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from contextlib import contextmanager
+from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -14,6 +15,12 @@ from app.agents.factory import AgentFactory
 from app.intent.models import Intent, IntentResult
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _noop_ctx() -> Iterator[None]:
+    """空 context manager，langfuse 未启用时作为 span 占位，yield None。"""
+    yield None
 
 
 class TaskResult(BaseModel):
@@ -33,6 +40,7 @@ class TaskResult(BaseModel):
     output: str = ""
     events: List[str] = Field(default_factory=list)
     final_state: Optional[dict] = None
+    metadata: Optional[dict] = None
 
 
 class BaseOrchestrator(ABC):
@@ -53,14 +61,20 @@ class BaseOrchestrator(ABC):
         prior_context: str = "",
         session_id: Optional[str] = None,
         agent_state: Optional[AgentState] = None,
-    ) -> TaskResult:
-        """执行单个智能体，收集所有 SSE 事件。
+        langfuse_service: Optional[Any] = None,
+    ) -> AsyncGenerator[Union[str, "TaskResult"], None]:
+        """执行单个智能体，实时 yield SSE 事件，最后 yield TaskResult。
 
         Args:
             intent: 要执行的意图
             prior_context: 前置步骤的输出（流水线模式中使用）
             session_id: 会话 id
             agent_state: 已恢复的 AgentState（多轮上下文），为 None 则新建
+            langfuse_service: 可选的 Langfuse 服务，用于启动 agent 调用子 span
+
+        Yields:
+            str: SSE 事件字符串（实时透传，形如 "data: {...}\\n\\n"）
+            TaskResult: 最后一个 yield，含 output/final_state/success（events 留空）
         """
         agent_id = intent.agent or "general_agent"
         agent = self.agent_factory.create_for_agent(
@@ -69,12 +83,13 @@ class BaseOrchestrator(ABC):
             agent_state=agent_state,
         )
         if agent is None:
-            return TaskResult(
+            yield TaskResult(
                 intent_id=intent.id,
                 agent_id=agent_id,
                 success=False,
                 output=f"无法创建智能体 {agent_id}",
             )
+            return
 
         # 构建用户消息：如有前置上下文，附加在前
         user_content = intent.query
@@ -86,35 +101,80 @@ class BaseOrchestrator(ABC):
         result = TaskResult(intent_id=intent.id, agent_id=agent_id)
         apply = None
 
-        try:
-            async for event in agent.reply_stream(user_msg):
-                if isinstance(event, ReplyStartEvent):
-                    apply = AssistantMsg(name=event.name, content=[], id=event.reply_id)
+        # 环节埋点：每次智能体调用子 span
+        # 从 agent 对象读取 system_prompt（agentscope ReActAgent 通过 sys_prompt 属性暴露）
+        agent_sys_prompt = getattr(agent, "sys_prompt", None) or ""
+        span_ctx = (
+            langfuse_service.start_span(
+                f"agent-{agent_id}",
+                input={
+                    "intent": intent.id,
+                    "query": intent.query,
+                    "system_prompt": agent_sys_prompt,
+                    "user_message": user_content,
+                },
+            )
+            if langfuse_service
+            else _noop_ctx()
+        )
+        with span_ctx as agent_span:
+            from app.utils.agent_event_tracer import AgentEventTracer
+            from app.utils.agent_event_stream import iter_agent_events
+            tracer = AgentEventTracer(langfuse_service, agent_id)
+            try:
+                def _on_reply_start(ev):
+                    nonlocal apply
+                    apply = AssistantMsg(name=ev.name, content=[], id=ev.reply_id)
 
-                if isinstance(event, AgentEvent):
+                async for event in iter_agent_events(agent, user_msg, tracer, _on_reply_start):
                     if apply:
                         apply.append_event(event)
-                    # 收集事件用于回放
-                    result.events.append(f"data: {event.model_dump_json()}\n\n")
+                    # 实时透传事件给上层
+                    yield f"data: {event.model_dump_json()}\n\n"
 
-            # 提取文本输出
-            if apply:
-                text_parts = []
-                for block in apply.content:
-                    if hasattr(block, "type") and block.type == "text":
-                        text_parts.append(getattr(block, "text", str(block)))
-                result.output = "\n".join(text_parts).strip()
+                # 提取文本输出
+                if apply:
+                    text_parts = []
+                    for block in apply.content:
+                        if hasattr(block, "type") and block.type == "text":
+                            text_parts.append(getattr(block, "text", str(block)))
+                    result.output = "\n".join(text_parts).strip()
 
-            # 捕获执行后的 AgentState（用于后续持久化）
-            result.final_state = agent.state.model_dump()
+                # 捕获执行后的 AgentState（用于后续持久化）
+                # mode="json" 确保枚举等类型序列化为值，避免落库后无法反序列化
+                result.final_state = agent.state.model_dump(mode="json")
 
-            result.success = True
-        except Exception as e:
-            logger.exception(f"[Orchestrator] 智能体 {agent_id} 执行异常")
-            result.success = False
-            result.output = f"执行出错: {str(e)}"
+                result.success = True
+            except Exception as e:
+                logger.exception(f"[Orchestrator] 智能体 {agent_id} 执行异常")
+                result.success = False
+                result.output = f"执行出错: {str(e)}"
+            finally:
+                tracer.close()
 
-        return result
+            if agent_span:
+                try:
+                    agent_span.update(output={
+                        "output": result.output,
+                        "success": result.success,
+                        **tracer.summary(),
+                    })
+                except Exception:
+                    pass
+
+        # emit 工具执行期间捕获的 citations（从 ToolResultEndEvent.metadata 累积）
+        citations = tracer.consume_citations()
+        if citations:
+            yield (
+                "data: "
+                + json.dumps(
+                    {"type": "policy_qa_citations", "citations": citations},
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
+
+        yield result
 
     @abstractmethod
     async def run(
@@ -122,6 +182,7 @@ class BaseOrchestrator(ABC):
         intent_result: IntentResult,
         session_id: Optional[str] = None,
         agent_states: Optional[Dict[str, AgentState]] = None,
+        langfuse_service: Optional[Any] = None,
     ) -> AsyncGenerator[str, None]:
         """执行编排，yield SSE 事件字符串。"""
         ...

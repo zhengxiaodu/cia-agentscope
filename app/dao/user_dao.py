@@ -1,14 +1,13 @@
 """用户登录校验 DAO。
 
 支持两种模式：
-- AUTH_MOCK=true：使用内置模拟数据（含 access_token + permissions），便于本地开发
+- AUTH_MOCK=true：使用内置模拟数据（含 permissions），便于本地开发
 - AUTH_MOCK=false：调用 mng 管理中心进行登录校验，返回结构标准化后供 auth 路由使用
 
 标准返回结构：
     {
         "verification": bool,
-        "user_info": {"user_id", "user_name", "department", "role"},
-        "access_token": str,        # mng 返回的 access_token
+        "user_info": {"id", "username", "name", "department", "role"},
         "permissions": {            # mng 返回的权限
             "agent_whitelist": [{"id","name","code"}, ...],
             "skill_blacklist": [{"id","name","code"}, ...],
@@ -16,6 +15,7 @@
     }
 验证失败时仅返回 {"verification": False}。
 """
+import asyncio
 import logging
 import os
 
@@ -25,42 +25,42 @@ from app.config import MNG_AUTH_URL
 
 logger = logging.getLogger(__name__)
 
-# 模拟账号数据（含 access_token + permissions，结构与 mng 返回保持一致）
+# 模拟账号数据（含 permissions，结构与 mng 返回保持一致）
 _MOCK_USERS = {
     "zhangsan": {
-        "password": "123456",
+        "password": "207cf410532f92a47dee245ce9b11ff71f578ebd763eb3bbea44ebd043d018fb",
         "verification": True,
         "user_info": {
-            "user_id": "123",
-            "user_name": "小张",
+            "id": "123",
+            "username": "zhangsan",
+            "name": "小张",
             "department": "后勤部",
             "role": "普通用户",
         },
-        "access_token": "mock-access-token-zhangsan",
         "permissions": {
             "agent_whitelist": [
-                {"id": "123", "name": "制度问答", "code": "zhidu"},
-                {"id": "999", "name": "生成PPT智能体", "code": "agent_ppt"},
+                {"id": "123", "name": "制度问答", "show": 1},
+                {"id": "999", "name": "生成PPT智能体", "show": 0},
             ],
             "skill_blacklist": [
-                {"id": "456", "name": "博查搜索", "code": "bocha"},
+                {"id": "456", "name": "博查搜索", "code": "bocha_search"},
             ],
         },
     },
     "admin": {
-        "password": "123456",
+        "password": "207cf410532f92a47dee245ce9b11ff71f578ebd763eb3bbea44ebd043d018fb",
         "verification": True,
         "user_info": {
-            "user_id": "1",
-            "user_name": "管理员",
+            "id": "1",
+            "username": "admin",
+            "name": "管理员",
             "department": "管理部",
             "role": "管理员",
         },
-        "access_token": "mock-access-token-admin",
         "permissions": {
             "agent_whitelist": [
-                {"id": "123", "name": "制度问答", "code": "zhidu"},
-                {"id": "999", "name": "生成PPT智能体", "code": "agent_ppt"},
+                {"id": "123", "name": "制度问答", "show": "1"},
+                {"id": "999", "name": "生成PPT智能体", "show": 0},
             ],
             "skill_blacklist": [],
         },
@@ -71,14 +71,14 @@ _MOCK_USERS = {
 async def verify_login_via_mng(username: str, password: str) -> dict:
     """调用 mng 管理中心进行登录校验。
 
-    请求 POST {MNG_AUTH_URL}/api/auth/login，body: {"username", "password"}
+    请求 POST {MNG_AUTH_URL}/api/auth/user/login，body: {"username", "password"}
     成功时解析 mng 返回并标准化为内部结构。
     """
     if not MNG_AUTH_URL:
         logger.error("[user_dao] MNG_AUTH_URL 未配置，无法调用 mng 登录")
         return {"verification": False}
 
-    url = f"{MNG_AUTH_URL}/api/auth/login"
+    url = f"{MNG_AUTH_URL}/api/auth/user/login"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -99,7 +99,6 @@ async def verify_login_via_mng(username: str, password: str) -> dict:
             return {
                 "verification": True,
                 "user_info": data.get("user_info", {}),
-                "access_token": data.get("access_token", ""),
                 "permissions": data.get("permissions", {}),
             }
     except Exception as e:
@@ -118,7 +117,6 @@ async def verify_login(username: str, password: str) -> dict:
             return {
                 "verification": True,
                 "user_info": user["user_info"],
-                "access_token": user["access_token"],
                 "permissions": user["permissions"],
             }
         return {"verification": False}
@@ -126,10 +124,10 @@ async def verify_login(username: str, password: str) -> dict:
     return await verify_login_via_mng(username, password)
 
 
-async def register_via_mng(username: str, password: str) -> dict:
+async def register_via_mng(username: str, password: str, name: str = "", department: str = "") -> dict:
     """调用 mng 管理中心注册。
 
-    请求 POST {MNG_AUTH_URL}/api/auth/register, body: {"username", "password"}
+    请求 POST {MNG_AUTH_URL}/api/auth/register, body: {"username", "password", "name", "department"}
     成功时把 mng 返回标准化为与登录一致的内部结构。
     失败时返回 {"verification": False, "message": <mng message 或默认>}。
     """
@@ -142,7 +140,7 @@ async def register_via_mng(username: str, password: str) -> dict:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
                 url,
-                json={"username": username, "password": password},
+                json={"username": username, "password": password, "name": name, "department": department},
             )
             if resp.status_code != 200:
                 logger.warning(f"[user_dao] mng 注册返回非 200: {resp.status_code}")
@@ -158,8 +156,7 @@ async def register_via_mng(username: str, password: str) -> dict:
             data = body.get("data", {}) or {}
             return {
                 "verification": True,
-                "user_info": data.get("user_info", {}),
-                "access_token": data.get("access_token", ""),
+                "user_info": data.get("user", {}),
                 "permissions": data.get("permissions", {}),
             }
     except Exception as e:
@@ -167,19 +164,168 @@ async def register_via_mng(username: str, password: str) -> dict:
         return {"verification": False, "message": "注册服务异常"}
 
 
-async def register(username: str, password: str) -> dict:
+async def register(username: str, password: str, name: str = "", department: str = "") -> dict:
     """注册用户。AUTH_MOCK=true 时返回模拟新用户；否则调用 mng 注册。"""
     if os.getenv("AUTH_MOCK", "true").lower() == "true":
         # 模拟注册成功：返回新账号结构（空权限）
         return {
             "verification": True,
             "user_info": {
-                "user_id": username,
-                "user_name": username,
-                "department": "",
+                "id": username,
+                "username": username,
+                "name": name or username,
+                "department": department,
                 "role": "普通用户",
             },
-            "access_token": f"mock-access-token-{username}",
-            "permissions": {"agent_whitelist": [], "skills_blacklist": []},
+            "permissions": {"agent_whitelist": [], "skill_blacklist": []},
         }
-    return await register_via_mng(username, password)
+    return await register_via_mng(username, password, name=name, department=department)
+
+
+async def update_name_via_mng(jwt_token: str, name: str) -> dict:
+    """调用 mng 修改姓名。
+
+    请求 PUT {MNG_AUTH_URL}/api/auth/me/name，body: {"name"}，需带 Authorization（本系统 JWT）。
+    成功返回 {"success": True}，失败返回 {"success": False, "message": ...}。
+    """
+    if not MNG_AUTH_URL:
+        logger.error("[user_dao] MNG_AUTH_URL 未配置，无法调用 mng 修改姓名")
+        return {"success": False, "message": "MNG_AUTH_URL 未配置"}
+
+    url = f"{MNG_AUTH_URL}/api/auth/me/name"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.put(
+                url,
+                json={"name": name},
+                headers={"Authorization": f"Bearer {jwt_token}"},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[user_dao] mng 修改姓名返回非 200: {resp.status_code}")
+                return {"success": False, "message": "修改姓名失败"}
+
+            body = resp.json()
+            if body.get("code") != 200:
+                msg = body.get("message", "修改姓名失败")
+                logger.warning(f"[user_dao] mng 修改姓名业务失败: {msg}")
+                return {"success": False, "message": msg}
+            return {"success": True}
+    except Exception as e:
+        logger.exception(f"[user_dao] 调用 mng 修改姓名服务失败: {e}")
+        return {"success": False, "message": "修改姓名服务异常"}
+
+
+async def update_department_via_mng(jwt_token: str, department: str) -> dict:
+    """调用 mng 修改部门。
+
+    请求 PUT {MNG_AUTH_URL}/api/auth/me/department，body: {"department"}，需带 Authorization（本系统 JWT）。
+    成功返回 {"success": True}，失败返回 {"success": False, "message": ...}。
+    """
+    if not MNG_AUTH_URL:
+        logger.error("[user_dao] MNG_AUTH_URL 未配置，无法调用 mng 修改部门")
+        return {"success": False, "message": "MNG_AUTH_URL 未配置"}
+
+    url = f"{MNG_AUTH_URL}/api/auth/me/department"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.put(
+                url,
+                json={"department": department},
+                headers={"Authorization": f"Bearer {jwt_token}"},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[user_dao] mng 修改部门返回非 200: {resp.status_code}")
+                return {"success": False, "message": "修改部门失败"}
+
+            body = resp.json()
+            if body.get("code") != 200:
+                msg = body.get("message", "修改部门失败")
+                logger.warning(f"[user_dao] mng 修改部门业务失败: {msg}")
+                return {"success": False, "message": msg}
+            return {"success": True}
+    except Exception as e:
+        logger.exception(f"[user_dao] 调用 mng 修改部门服务失败: {e}")
+        return {"success": False, "message": "修改部门服务异常"}
+
+
+async def update_password_via_mng(jwt_token: str, old_password: str, new_password: str) -> dict:
+    """调用 mng 修改密码。
+
+    请求 PUT {MNG_AUTH_URL}/api/auth/me/password，body: {"old_password","new_password"}，需带 Authorization（本系统 JWT）。
+    成功返回 {"success": True}，失败返回 {"success": False, "message": ...}。
+    """
+    if not MNG_AUTH_URL:
+        logger.error("[user_dao] MNG_AUTH_URL 未配置，无法调用 mng 修改密码")
+        return {"success": False, "message": "MNG_AUTH_URL 未配置"}
+
+    url = f"{MNG_AUTH_URL}/api/auth/me/password"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.put(
+                url,
+                json={"old_password": old_password, "new_password": new_password},
+                headers={"Authorization": f"Bearer {jwt_token}"},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[user_dao] mng 修改密码返回非 200: {resp.status_code}")
+                return {"success": False, "message": "修改密码失败"}
+
+            body = resp.json()
+            if body.get("code") != 200:
+                msg = body.get("message", "修改密码失败")
+                logger.warning(f"[user_dao] mng 修改密码业务失败: {msg}")
+                return {"success": False, "message": msg}
+            return {"success": True}
+    except Exception as e:
+        logger.exception(f"[user_dao] 调用 mng 修改密码服务失败: {e}")
+        return {"success": False, "message": "修改密码服务异常"}
+
+
+async def notify_mng_active(jwt_token: str) -> None:
+    """向 mng 上报用户活跃（POST /api/auth/me/active）。
+
+    异步 fire-and-forget，所有异常仅记日志，不抛出。
+    """
+    if not MNG_AUTH_URL or not jwt_token:
+        return
+    url = f"{MNG_AUTH_URL}/api/auth/me/active"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                url,
+                json={},
+                headers={"Authorization": f"Bearer {jwt_token}"},
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    f"[mng_active] 上报失败 status={resp.status_code} "
+                    f"body={resp.text[:200]}"
+                )
+                return
+            body = resp.json()
+            if body.get("code") != 200:
+                logger.warning(
+                    f"[mng_active] mng 业务码异常 code={body.get('code')} "
+                    f"msg={body.get('message')}"
+                )
+    except Exception:
+        logger.warning("[mng_active] 上报异常", exc_info=True)
+
+
+def fire_notify_mng_active(jwt_token: str) -> None:
+    """fire-and-forget 包装：投递后台任务上报 mng active，不阻断主流程。
+
+    若当前无运行中的事件循环则静默跳过。
+    """
+    if not MNG_AUTH_URL or not jwt_token:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 无运行中的事件循环，跳过
+        return
+    task = loop.create_task(notify_mng_active(jwt_token))
+    # 兜底：消费任务中未捕获的异常，避免"Task exception was never retrieved"警告
+    task.add_done_callback(
+        lambda t: t.exception() if not t.cancelled() and t.exception() else None
+    )

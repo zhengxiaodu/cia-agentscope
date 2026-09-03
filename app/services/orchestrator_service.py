@@ -12,9 +12,11 @@
 - 构建临时的 AgentRegistry / IntentRecognizer / QueryRewriter
 - 请求结束时局部变量出作用域，内存自动释放
 """
+import asyncio
 import json
 import logging
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from contextlib import contextmanager
+from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional
 
 import yaml
 from fastapi import Request
@@ -29,14 +31,15 @@ from app.config import (
     INTENT_CONFIG_PATH,
     SKILL_CONFIG_PATH,
     EXTERNAL_SKILLS_DIR,
+    JWT_EXPIRE_HOURS,
 )
 from app.agents.base import AgentDefinition
 from app.agents.factory import AgentFactory
 from app.agents.registry import (
     AgentRegistry,
     load_agent_definitions,
-    load_skills_from_directories,
 )
+from app.services.opensandbox_workspace_manager import OpenSandboxWorkspaceManager
 from app.intent.models import Intent, IntentConfig, IntentResult
 from app.intent.rewriter import QueryRewriter
 from app.intent.recognizer import IntentRecognizer, load_intent_config
@@ -44,11 +47,44 @@ from app.intent.llm_client import create_async_client
 from app.orchestrator.parallel import ParallelOrchestrator
 from app.orchestrator.pipeline import PipelineOrchestrator
 from app.orchestrator.react import ReActOrchestrator
-from app.services.auth_service import get_user_permissions
 from app.services.chat_service import create_model_from_config
-from app.services.mng_service import fetch_external_intents, merge_external_into_memory
+from app.services.mng_service import (
+    build_agent_definition_map,
+    fetch_external_intents,
+    merge_external_into_memory,
+)
 
 logger = logging.getLogger(__name__)
+
+# Redis key：用户融合后的配置（登录时写入，会话时读取）
+_REDIS_KEY_USER_CONFIG = "user_config:{user_id}"
+_USER_CONFIG_TTL = JWT_EXPIRE_HOURS * 3600  # 与 user_permissions 同 TTL
+
+# 联网搜索技能名（与 skill_config.yml / agent_config.yml 中的 name 一致）
+_SEARCH_SKILL_NAME = "bocha_search"
+
+# 历史上下文保留条数（3 轮 = 6 条 user/assistant 消息），用于截断 AgentState.context
+_HISTORY_KEEP_LAST = 6
+
+# 上传文件解析内容注入提示词的头部标记与单文件截断上限（防超上下文）
+_UPLOAD_CTX_HEADER = "【用户上传文件解析内容】"
+_UPLOAD_CTX_MAX_CHARS = 30000
+
+
+@contextmanager
+def _noop_ctx() -> Iterator[None]:
+    """空 context manager，langfuse 未启用时作为 start_span 的占位，yield None。"""
+    yield None
+
+
+def _safe_update_span(span: Any, output_dict: dict) -> None:
+    """安全更新 span 的 output 字段，span 为 None 或更新异常均静默忽略。"""
+    if not span:
+        return
+    try:
+        span.update(output=output_dict)
+    except Exception:
+        pass
 
 
 class OrchestratorService:
@@ -65,6 +101,7 @@ class OrchestratorService:
         intent_client: AsyncOpenAI,
         intent_model_cfg: dict,
         think_prompt: str,
+        workspace_manager: OpenSandboxWorkspaceManager,
     ):
         self._model_config = model_config
         self._prompts = prompts
@@ -72,12 +109,21 @@ class OrchestratorService:
         self._intent_client = intent_client
         self._intent_model_cfg = intent_model_cfg
         self._think_prompt = think_prompt
+        self._workspace_manager = workspace_manager
 
         # 最近一次编排结果引用（供外部提取 agent states）
         self._last_orchestrator: Optional[Any] = None
+        # 最近一次编排参与的 agent_id 列表（供 chat_service 持久化到 messages）
+        self._last_agent_ids: List[str] = []
+        # 最近一次编排是否成功（单 agent 路径标志位；多 agent 路径从 _last_results 派生）
+        self._last_success: bool = True
 
     @classmethod
-    async def create(cls, model_config: dict) -> "OrchestratorService":
+    async def create(
+        cls,
+        model_config: dict,
+        workspace_manager: OpenSandboxWorkspaceManager,
+    ) -> "OrchestratorService":
         """工厂方法：从配置创建编排服务（仅持有不可变资源）。
 
         不再在启动时加载智能体/skill/意图配置；
@@ -108,6 +154,7 @@ class OrchestratorService:
             intent_client=intent_client,
             intent_model_cfg=intent_model_cfg,
             think_prompt=think_prompt,
+            workspace_manager=workspace_manager,
         )
 
     def _create_model_fn(self):
@@ -151,6 +198,26 @@ class OrchestratorService:
                 states[r.agent_id] = r.final_state
         return states
 
+    @property
+    def last_agent_ids(self) -> List[str]:
+        """获取最近一次编排中参与的 agent_id 列表（去重保序）。
+
+        覆盖单 agent 直接问答与多 agent 编排两条路径。
+        """
+        return list(self._last_agent_ids) if self._last_agent_ids else []
+
+    @property
+    def last_success(self) -> bool:
+        """获取最近一次编排是否全部成功。
+
+        多 agent 路径从 _last_orchestrator._last_results 派生
+        （任一 TaskResult.success=False 则整体 False，即使有 output 返回）；
+        单 agent 路径使用 _last_success 标志位。
+        """
+        if self._last_orchestrator and self._last_orchestrator._last_results:
+            return all(r.success for r in self._last_orchestrator._last_results)
+        return self._last_success
+
     @staticmethod
     def _event(data: dict) -> str:
         """序列化 SSE 事件。"""
@@ -189,23 +256,27 @@ class OrchestratorService:
                 history.append({"role": role, "content": content})
         return history
 
-    async def _build_request_components(
-        self,
-        user_id: str,
-        redis_client,
-    ) -> tuple:
-        """每次 /chat 请求时动态构建临时组件。
+    @staticmethod
+    def _trim_state_context(state_dict: dict, keep_last: int = _HISTORY_KEEP_LAST) -> dict:
+        """截断 AgentState.context 为最后 N 条消息，控制模型输入 token。
 
-        步骤：
-        1. 从 YAML 加载基础配置到内存
-        2. 从 Redis 获取当前用户权限 + access_token
-        3. 从 mng 获取外部意图（失败不影响主流程）
-        4. 权限过滤 + 合并配置
-        5. 加载外部技能到临时 workspace
-        6. 构建 AgentRegistry / AgentFactory / IntentRecognizer / QueryRewriter
+        AgentState.context 是完整对话历史 Msg_dict 列表；大模型上下文有限时
+        仅保留最近 keep_last 条（默认 6 = 3 轮）。仅内存截断，不落库。
+        """
+        if not state_dict:
+            return state_dict
+        ctx = state_dict.get("context")
+        if isinstance(ctx, list) and len(ctx) > keep_last:
+            state_dict = {**state_dict, "context": ctx[-keep_last:]}
+        return state_dict
 
-        Returns:
-            (registry, agent_factory, rewriter, recognizer)
+    async def _fuse_user_config(
+        self, jwt_token: str, permissions: dict
+    ) -> dict:
+        """步骤 1-4：加载 YAML + 请求 mng 外部意图 + 权限过滤 + 合并。
+
+        返回可 JSON 序列化的 dict，供登录时写入 Redis。
+        mng 请求失败仅记日志，降级为只用基础配置。
         """
         # ---- 1. 加载基础配置到内存 ----
         base_agent_defs = load_agent_definitions(AGENT_CONFIG_PATH)
@@ -215,23 +286,16 @@ class OrchestratorService:
             base_skill_config = yaml.safe_load(f)
         base_skills = base_skill_config.get("skills", [])
 
-        # ---- 2. 获取用户权限 ----
-        permissions = {}
+        # ---- 2-3. 请求 mng 获取外部意图 ----
         external_intents = []
-        if user_id and redis_client:
+        if jwt_token:
             try:
-                perms_data = await get_user_permissions(redis_client, user_id)
-                if perms_data:
-                    access_token = perms_data.get("access_token", "")
-                    permissions = perms_data.get("permissions", {}) or {}
-
-                    # ---- 3. 从 mng 获取外部意图 ----
-                    if access_token:
-                        external_intents = await fetch_external_intents(access_token)
+                external_intents = await fetch_external_intents(jwt_token)
             except Exception:
                 logger.exception(
-                    f"[OrchestratorService] 获取用户 {user_id} 权限或外部意图失败"
+                    "[OrchestratorService] 登录时获取外部意图失败，仅用基础配置"
                 )
+                external_intents = []
 
         # ---- 4. 权限过滤 + 合并配置 ----
         merged_intents, merged_agents, merged_skills = merge_external_into_memory(
@@ -239,50 +303,490 @@ class OrchestratorService:
             base_agents=[a.model_dump() for a in base_agent_defs],
             base_skills=base_skills,
             external_intents=external_intents,
-            permissions=permissions,
+            permissions=permissions or {},
             external_skills_dir=EXTERNAL_SKILLS_DIR,
         )
+        return {
+            "merged_intents": merged_intents,
+            "merged_agents": merged_agents,
+            "merged_skills": merged_skills,
+            "default_orchestration": base_intents_raw.get("default_orchestration", {}),
+            # agent_id → 意图 definition 映射，供登录接口为
+            # agent_access 注入 description（取自 /api/intents 原始返回）
+            "agent_definitions": build_agent_definition_map(external_intents),
+        }
 
-        # ---- 5. 加载所有技能（基础 + 外部）到临时 workspace ----
-        all_skill_dirs = [
-            s["directory"] for s in merged_skills
-        ]
-        workspace, all_tools, all_skills_meta = await load_skills_from_directories(
-            directories=all_skill_dirs,
-            workdir="./my-workspace",
+    async def build_and_cache_user_config(
+        self,
+        user_id: str,
+        jwt_token: str,
+        permissions: dict,
+        redis_client,
+    ) -> dict:
+        """登录时融合（YAML + mng 外部意图 + 权限过滤）并写入 Redis。
+
+        供 /chat 会话时直接读取。失败不阻断登录：mng 不可用或 Redis
+        写失败均仅记日志，会话时读取不到缓存则走 base-only 兜底。
+
+        Returns:
+            融合后的配置 dict（含 agent_definitions 映射，供登录接口
+            为 agent_access 注入 description）；_fuse_user_config 异常时
+            由调用方兜底（该异常不在此吞掉，由 auth 侧 try/except 处理）。
+        """
+        fused = await self._fuse_user_config(jwt_token, permissions)
+        if redis_client is not None and user_id:
+            try:
+                key = _REDIS_KEY_USER_CONFIG.format(user_id=user_id)
+                await redis_client.set(
+                    key,
+                    json.dumps(fused, ensure_ascii=False).encode("utf-8"),
+                    ex=_USER_CONFIG_TTL,
+                )
+                logger.info(f"[OrchestratorService] 用户配置已缓存: {key}")
+            except Exception:
+                logger.exception(
+                    f"[OrchestratorService] 缓存用户配置失败 user={user_id}"
+                )
+        return fused
+
+    async def _load_cached_user_config(
+        self, user_id: str, redis_client
+    ) -> Optional[dict]:
+        """会话时从 Redis 读取登录时缓存的融合配置。不存在或失败返回 None。"""
+        if not user_id or redis_client is None:
+            return None
+        try:
+            key = _REDIS_KEY_USER_CONFIG.format(user_id=user_id)
+            raw = await redis_client.get(key)
+            if raw is None:
+                return None
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            return json.loads(raw)
+        except Exception:
+            logger.exception(
+                f"[OrchestratorService] 读取用户配置缓存失败 user={user_id}"
+            )
+            return None
+
+    async def _resolve_workspace_task(self, ws_task: "asyncio.Task") -> tuple:
+        """等待工作区准备任务完成。
+
+        失败不向调用方抛：把异常转成给前端的错误文案，由调用方 yield error 事件。
+        文案与串行版本保持一致，避免前端出现新的错误形态。
+
+        Returns:
+            (registry, agent_factory, error_message)；失败时前两项为 None。
+        """
+        try:
+            registry, agent_factory = await ws_task
+            return registry, agent_factory, None
+        except Exception as e:
+            logger.exception("[OrchestratorService] 工作区准备失败")
+            self._last_success = False
+            return None, None, f"环境准备失败: {str(e)}"
+
+    async def _load_config_bundle(self, user_id: str, redis_client) -> dict:
+        """读取登录时缓存的融合配置（步骤 1-4 的产物），未命中则 base-only 兜底。
+
+        缓存命中 → 直接用登录时融合好的 merged_intents/agents/skills；
+        缓存未命中 → base-only 兜底融合（不请求 mng，无外部意图），
+        外部意图在下次登录后恢复。会话路径永不发起 mng HTTP 调用。
+        """
+        fused = await self._load_cached_user_config(user_id, redis_client)
+        if fused is not None:
+            return {
+                "merged_intents": fused.get("merged_intents", []),
+                "merged_agents": fused.get("merged_agents", []),
+                "merged_skills": fused.get("merged_skills", []),
+                "default_orchestration": fused.get("default_orchestration", {}),
+            }
+        # 缓存未命中兜底：base-only 融合（不请求 mng，无外部意图）
+        logger.warning(
+            f"[OrchestratorService] 用户配置缓存未命中 user={user_id}，"
+            f"走 base-only 兜底（无外部意图），下次登录后恢复"
         )
+        return await self._fuse_user_config(jwt_token="", permissions={})
+
+    def _build_intent_components(self, fused: dict) -> tuple:
+        """构建请求级改写器与识别器（纯内存，不依赖工作区）。
+
+        Returns:
+            (rewriter, recognizer)
+        """
+        intent_configs = [IntentConfig(**item) for item in fused["merged_intents"]]
+
+        recognizer = IntentRecognizer(
+            client=self._intent_client,
+            model_config=self._intent_model_cfg,
+            recognition_prompt=self._prompts.get("intent_recognition", ""),
+            orchestration_prompt=self._prompts.get("intent_orchestration", ""),
+            intent_configs=intent_configs,
+            default_orchestration=fused["default_orchestration"],
+        )
+        rewriter = QueryRewriter(
+            client=self._intent_client,
+            model_config=self._intent_model_cfg,
+            rewrite_prompt=self._prompts.get("rewrite", ""),
+        )
+        return rewriter, recognizer
+
+    async def _prepare_workspace_components(
+        self,
+        fused: dict,
+        user_id: str,
+        redis_client,
+        user_id_safe: str,
+        session_id_safe: str,
+        search_enabled: bool = True,
+        skills: Optional[List[str]] = None,
+        langfuse_service: Optional[Any] = None,
+    ) -> tuple:
+        """获取/创建工作区并组装注册表与工厂（依赖沙箱，可与意图链路并行）。
+
+        含 workspace-load 环节埋点。本方法会被 run() 放进 asyncio.create_task，
+        因此不得读写 self 上的请求级状态（_last_agent_ids / _last_success 等）。
+
+        Returns:
+            (registry, agent_factory)
+        """
+        merged_agents = fused["merged_agents"]
+        merged_skills = fused["merged_skills"]
+        all_skill_dirs = [s["directory"] for s in merged_skills]
+
+        # ---- 获取/创建工作区 ----
+
+        # 环节埋点：工作区获取/创建子 span
+        ws_ctx = (
+            langfuse_service.start_span(
+                "workspace-load",
+                input={"user_id": user_id_safe, "session_id": session_id_safe},
+            )
+            if langfuse_service
+            else _noop_ctx()
+        )
+        with ws_ctx as ws_span:
+            workspace = await self._workspace_manager.get_workspace(user_id_safe, session_id_safe)
+            if workspace is None:
+                # 首次创建：create_workspace 内部会在 ws.initialize() 处单独记录 workspace-initialize 子 span
+                workspace = await self._workspace_manager.create_workspace(
+                    user_id=user_id_safe,
+                    session_id=session_id_safe,
+                    skill_dirs=all_skill_dirs,
+                    langfuse_service=langfuse_service,
+                )
+            if ws_span:
+                try:
+                    ws_span.update(output={
+                        "workspace_id": getattr(workspace, "workspace_id", None),
+                    })
+                except Exception:
+                    pass
+            
+        from tools.chart_tools import (
+            render_bar_chart, render_line_chart, render_pie_chart,
+            render_generic_card, render_metric_card, render_confirm_action,
+            render_indicator_table, render_selectable_list,
+        )
+        from agentscope.tool import FunctionTool
+        from tools.md_export_tools import create_md_export_tools
+        from tools.policy_qa_tools import create_policy_qa_tool
+
+        # 工具层：根据后端选择 agentscope 原生工具 / OpenSandbox 桥接工具
+        _chart_tools = [
+            FunctionTool(render_pie_chart), FunctionTool(render_bar_chart),
+            FunctionTool(render_line_chart), FunctionTool(render_generic_card),
+            FunctionTool(render_metric_card), FunctionTool(render_confirm_action),
+            FunctionTool(render_indicator_table), FunctionTool(render_selectable_list),
+        ]
+        # 制度问答工具（宿主侧 FunctionTool，知识库 ID 由用户权限自动映射，不依赖工作区后端）
+        policy_qa_tool = create_policy_qa_tool(user_id=user_id, redis_client=redis_client)
+
+        import base64
+
+        from app.services.opensandbox_adapter import OpenSandboxToolAdapter
+        from app.services.opensandbox_tool_bridge import create_opensandbox_tools
+        # workspace 此处是 OpenSandbox Sandbox 实例
+        adapter = OpenSandboxToolAdapter(
+            workspace, workdir=f"/data/workspaces/{session_id_safe}"
+        )
+
+        # Markdown 导出工具的沙箱读写闭包：文本读直接走 adapter.read；
+        # 二进制写经 base64 文本通道 + bash 解码落盘
+        # （与 opensandbox_workspace_manager.read_session_file 的二进制读取模式对称）
+        async def _sandbox_read_file(rel_path: str) -> str:
+            return await adapter.read(f"{adapter.workdir}/{rel_path}")
+
+        async def _sandbox_write_file(rel_path: str, data: bytes) -> None:
+            abs_path = f"{adapter.workdir}/{rel_path}"
+            b64_path = f"{abs_path}.b64"
+            await adapter.write(b64_path, base64.b64encode(data).decode("ascii"))
+            result = await adapter.bash(f"base64 -d '{b64_path}' > '{abs_path}'")
+            # 解码成败均清理临时 b64，避免残留进入 files_generated 快照差分
+            await adapter.bash(f"rm -f '{b64_path}'")
+            if result["exit_code"] != 0:
+                raise RuntimeError(
+                    f"base64 解码写入沙箱失败 exit={result['exit_code']} "
+                    f"stderr={result['stderr']}"
+                )
+
+        md_tools = create_md_export_tools(_sandbox_read_file, _sandbox_write_file)
+        all_tools = (
+            create_opensandbox_tools(adapter) + _chart_tools
+            + [policy_qa_tool] + md_tools
+        )
+        # 技能列表由管理器扫描沙箱内 /workspace/skills/ 获取
+        all_skills_meta = await self._workspace_manager.list_skills(
+            user_id=user_id_safe, session_id=session_id_safe
+        )
+
+        # 按请求开关显隐联网搜索技能（workspace 始终装载全部技能，此处按轮次过滤）
+        if not search_enabled:
+            all_skills_meta = [
+                m for m in all_skills_meta
+                if (getattr(m, "name", None) or
+                    (m.get("name") if isinstance(m, dict) else None)
+                    ) != _SEARCH_SKILL_NAME
+            ]
 
         # ---- 6. 构建临时注册表 ----
         agent_defs = [AgentDefinition(**a) for a in merged_agents]
+
+        # 请求级附加技能：用户请求 skills ∪（search_enabled 时追加 bocha_search）
+        # bocha_search 追加到 extra 后会 union 到每个 agent；
+        # search_enabled=False 时 all_skills_meta 已移除 bocha_search，
+        # extra 中的声明匹配不到 loader 自动失效，行为不变
+        extra_skills = list(skills or [])
+        if search_enabled:
+            extra_skills.append(_SEARCH_SKILL_NAME)
+
         registry = AgentRegistry(
             definitions=agent_defs,
             workspace=workspace,
             all_tools=all_tools,
             all_skills_meta=all_skills_meta,
             create_model_fn=self._create_model_fn,
+            extra_skill_names=extra_skills,
         )
         agent_factory = AgentFactory(registry)
+        return registry, agent_factory
 
-        # ---- 7. 构建临时识别器 ----
-        intent_configs = [IntentConfig(**item) for item in merged_intents]
-        default_orchestration = base_intents_raw.get("default_orchestration", {})
+    def _span(self, langfuse_service: Any, name: str, input_dict: dict) -> Any:
+        """统一 span 创建：启用 langfuse 时启动子 span，否则返回空 context manager。
 
-        recognizer = IntentRecognizer(
-            client=self._intent_client,
-            model_config=self._intent_model_cfg,
-            recognition_prompt=self._prompts.get("intent_recognition", ""),
-            intent_configs=intent_configs,
-            default_orchestration=default_orchestration,
+        返回一个 context manager，with ... as span 使用；span 可能为 None。
+        """
+        if langfuse_service:
+            return langfuse_service.start_span(name, input=input_dict)
+        return _noop_ctx()
+
+    @staticmethod
+    def _migrate_legacy_enum_values(state_dict: dict) -> dict:
+        """修正历史脏数据中枚举被 str() 序列化的问题。
+
+        根因：早期保存使用 model_dump() + json.dumps(default=str)，枚举实例
+        （如 PermissionMode.BYPASS）被 str() 转成 "PermissionMode.BYPASS"
+        而非 "bypass"，导致反序列化时 PermissionMode("PermissionMode.BYPASS")
+        抛 ValueError。此处检测并修正为合法的枚举值。
+        """
+        if not isinstance(state_dict, dict):
+            return state_dict
+
+        # permission_context.mode: "PermissionMode.BYPASS" → "bypass"
+        perm = state_dict.get("permission_context")
+        if isinstance(perm, dict):
+            mode = perm.get("mode")
+            if isinstance(mode, str) and mode.startswith("PermissionMode."):
+                perm["mode"] = mode.split(".", 1)[1].lower()
+        return state_dict
+
+    async def _load_agent_state(
+        self,
+        session_service: Any,
+        session_id: Optional[str],
+        agent_id: str,
+    ) -> Optional[AgentState]:
+        """加载单个 agent 的 AgentState：从 session_service 读取 + 历史脏数据迁移
+        + trim 截断 + 异常兜底。
+
+        session_service 为空或读取失败均返回 None（调用方创建新状态）。
+        反序列化失败时记录 warning（含异常栈），便于定位 schema 不兼容问题。
+        """
+        if not (session_service and session_id):
+            return None
+        try:
+            state_dict = await session_service.load_agent_state(session_id, agent_id)
+        except Exception:
+            logger.warning(
+                f"[OrchestratorService] 读取 {agent_id} 状态失败，将新建",
+                exc_info=True,
+            )
+            return None
+        if not state_dict:
+            return None
+
+        # 历史脏数据迁移：修正 "PermissionMode.BYPASS" → "bypass" 等
+        state_dict = self._migrate_legacy_enum_values(state_dict)
+        # 截断 context 为最近 N 条，控制模型输入 token
+        state_dict = self._trim_state_context(state_dict)
+        try:
+            return AgentState.model_validate(state_dict)
+        except Exception:
+            logger.warning(
+                f"[OrchestratorService] 反序列化 {agent_id} 状态失败，将新建",
+                exc_info=True,
+            )
+            return None
+
+    async def _persist_agent_state(
+        self,
+        session_service: Any,
+        session_id: Optional[str],
+        user_id: Optional[str],
+        agent_id: str,
+        state_dict: dict,
+    ) -> None:
+        """保存单个 agent 的 AgentState（带非空校验与异常兜底）。"""
+        if not (session_service and session_id and user_id and state_dict):
+            return
+        try:
+            await session_service.save_agent_state(
+                session_id, user_id, agent_id, state_dict,
+            )
+        except Exception:
+            logger.exception(
+                f"[OrchestratorService] 保存 agent {agent_id} 状态失败"
+            )
+
+    async def _run_single_agent_path(
+        self,
+        registry: AgentRegistry,
+        agent_factory: AgentFactory,
+        agent_id: str,
+        user_input: str,
+        session_id: Optional[str],
+        user_id: Optional[str],
+        session_service: Any,
+        langfuse_service: Any,
+    ) -> AsyncGenerator[str, None]:
+        """单 agent 直接问答全流程：校验 → 加载状态 → 创建 → span 内流式执行 → 存状态 → 记标志 → yield summary。
+
+        跳过改写/识别/编排，直接由指定 agent 回答。
+        """
+        yield self._event({
+            "type": "orchestration_start",
+            "mode": "direct",
+            "agent_id": agent_id,
+        })
+
+        # 校验 agent_id 是否存在
+        definition = registry.get_definition(agent_id)
+        if not definition:
+            yield self._event({
+                "type": "error",
+                "message": f"agent_id '{agent_id}' 不存在",
+            })
+            return
+
+        intent = Intent(id=f"direct_{agent_id}", query=user_input, agent=agent_id)
+
+        # 加载已有 AgentState
+        agent_state = await self._load_agent_state(session_service, session_id, agent_id)
+
+        # 创建 agent 实例
+        agent = agent_factory.create_for_agent(
+            agent_id=agent_id,
+            session_id=session_id,
+            agent_state=agent_state,
         )
+        if agent is None:
+            yield self._event({
+                "type": "error",
+                "message": f"无法创建智能体 '{agent_id}'",
+            })
+            return
 
-        # ---- 8. 构建临时改写器 ----
-        rewriter = QueryRewriter(
-            client=self._intent_client,
-            model_config=self._intent_model_cfg,
-            rewrite_prompt=self._prompts.get("rewrite", ""),
-        )
+        # 执行单 agent 对话（span 内流式执行）
+        user_msg = UserMsg(name="user", content=user_input)
+        apply = None
+        final_output_parts: List[str] = []
 
-        return registry, agent_factory, rewriter, recognizer
+        with self._span(
+            langfuse_service,
+            f"agent-{agent_id}",
+            {"intent": intent.id, "query": user_input},
+        ) as agent_span:
+            from app.utils.agent_event_tracer import AgentEventTracer
+            from app.utils.agent_event_stream import iter_agent_events
+            tracer = AgentEventTracer(langfuse_service, agent_id)
+            try:
+                def _on_reply_start(ev):
+                    nonlocal apply
+                    apply = AssistantMsg(
+                        name=ev.name, content=[], id=ev.reply_id
+                    )
+
+                async for event in iter_agent_events(agent, user_msg, tracer, _on_reply_start):
+                    if apply:
+                        apply.append_event(event)
+                    yield f"data: {event.model_dump_json()}\n\n"
+
+                if apply:
+                    text_parts = []
+                    for block in apply.content:
+                        if hasattr(block, "type") and block.type == "text":
+                            text_parts.append(getattr(block, "text", str(block)))
+                    final_output_parts.append("\n".join(text_parts).strip())
+
+                # 保存 AgentState（mode="json" 确保枚举等类型序列化为值，避免落库后无法反序列化）
+                final_state = agent.state.model_dump(mode="json")
+                await self._persist_agent_state(
+                    session_service, session_id, user_id, agent_id, final_state,
+                )
+
+                # emit 工具执行期间捕获的 citations（从 ToolResultEndEvent.metadata 累积）
+                citations = tracer.consume_citations()
+                if citations:
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "policy_qa_citations",
+                                "citations": citations,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+
+                # 记录本轮参与的 agent_id + 成功标志
+                self._last_agent_ids = [agent_id]
+                self._last_success = True
+
+                _safe_update_span(agent_span, {
+                    "output": final_output_parts[0] if final_output_parts else "",
+                    "success": True,
+                    **tracer.summary(),
+                })
+            except Exception as e:
+                logger.exception(
+                    f"[OrchestratorService] 单智能体 {agent_id} 执行异常"
+                )
+                self._last_success = False
+                yield self._event({
+                    "type": "error",
+                    "message": f"执行出错: {str(e)}",
+                })
+                return
+            finally:
+                tracer.close()
+
+        # yield summary 事件
+        if final_output_parts:
+            yield self._event({
+                "type": "summary",
+                "content": final_output_parts[0],
+            })
 
     async def run(
         self,
@@ -292,6 +796,9 @@ class OrchestratorService:
         session_service: Optional[Any] = None,
         agent_id: Optional[str] = None,
         request: Optional[Request] = None,
+        search_enabled: bool = True,
+        langfuse_service: Optional[Any] = None,
+        skills: Optional[List[str]] = None,
     ) -> AsyncGenerator[str, None]:
         """编排主流程：改写 → 识别 → 选择编排器 → 执行。
 
@@ -318,142 +825,230 @@ class OrchestratorService:
             yield self._event({"type": "error", "message": "未检测到有效用户输入"})
             return
 
-        # ===== 动态构建请求级组件（配置加载到内存 + 外部意图合并） =====
+        # ① 装配请求级配置组件（纯内存；workspace 获取/创建并行化，见下方 ws_task）
         redis_client = None
         if request is not None:
             redis_client = getattr(request.app.state, "redis_client", None)
 
-        registry, agent_factory, rewriter, recognizer = (
-            await self._build_request_components(
+        user_id_safe = user_id or "anonymous"
+        session_id_safe = session_id or f"ephemeral-{user_id_safe}"
+        try:
+            fused = await self._load_config_bundle(user_id, redis_client)
+            rewriter, recognizer = self._build_intent_components(fused)
+        except Exception as e:
+            # 配置装配失败不能让 SSE 流以 ASGI 异常中断，转为 error 事件
+            logger.exception("[OrchestratorService] 请求级配置装配失败")
+            self._last_success = False
+            yield self._event({
+                "type": "error",
+                "message": f"环境准备失败: {str(e)}",
+            })
+            return
+
+        # 工作区准备与意图链路并行：workspace 直到编排执行阶段才被消费，
+        # 这段时间足以覆盖改写 + 意图识别 + 意图编排。
+        ws_task = asyncio.create_task(
+            self._prepare_workspace_components(
+                fused=fused,
                 user_id=user_id,
                 redis_client=redis_client,
-            )
+                user_id_safe=user_id_safe,
+                session_id_safe=session_id_safe,
+                search_enabled=search_enabled,
+                skills=skills or [],
+                langfuse_service=langfuse_service,
+            ),
+            name="workspace-prepare",
         )
-
-        # ========== 单智能体直接问答路径（跳过改写→识别→编排） ==========
-        if agent_id:
-            yield self._event({
-                "type": "orchestration_start",
-                "mode": "direct",
-                "agent_id": agent_id,
-            })
-
-            # 校验 agent_id 是否存在（从内存中的 registry 查找）
-            definition = registry.get_definition(agent_id)
-            if not definition:
-                yield self._event({
-                    "type": "error",
-                    "message": f"agent_id '{agent_id}' 不存在",
-                })
-                return
-
-            intent = Intent(id=f"direct_{agent_id}", query=user_input, agent=agent_id)
-
-            # 加载已有 AgentState
-            agent_state = None
-            if session_service and session_id and user_id:
-                try:
-                    state_dict = await session_service.load_agent_state(
-                        session_id, agent_id
-                    )
-                    if state_dict:
-                        agent_state = AgentState.model_validate(state_dict)
-                except Exception:
-                    logger.debug(
-                        f"[OrchestratorService] 无法加载 {agent_id} 状态，将新建"
-                    )
-
-            # 创建 agent 实例
-            agent = agent_factory.create_for_agent(
-                agent_id=agent_id,
-                session_id=session_id,
-                agent_state=agent_state,
-            )
-            if agent is None:
-                yield self._event({
-                    "type": "error",
-                    "message": f"无法创建智能体 '{agent_id}'",
-                })
-                return
-
-            # 执行单 agent 对话
-            user_msg = UserMsg(name="user", content=user_input)
-            apply = None
-            final_output_parts = []
-
-            try:
-                async for event in agent.reply_stream(user_msg):
-                    if isinstance(event, ReplyStartEvent):
-                        apply = AssistantMsg(
-                            name=event.name, content=[], id=event.reply_id
-                        )
-
-                    if isinstance(event, AgentEvent):
-                        if apply:
-                            apply.append_event(event)
-                        yield f"data: {event.model_dump_json()}\n\n"
-
-                if apply:
-                    text_parts = []
-                    for block in apply.content:
-                        if hasattr(block, "type") and block.type == "text":
-                            text_parts.append(getattr(block, "text", str(block)))
-                    final_output = "\n".join(text_parts).strip()
-                    final_output_parts.append(final_output)
-
-                # 保存 AgentState
-                final_state = agent.state.model_dump()
-                if session_service and session_id and user_id and final_state:
-                    await session_service.save_agent_state(
-                        session_id, user_id, agent_id, final_state,
-                    )
-
-            except Exception as e:
-                logger.exception(
-                    f"[OrchestratorService] 单智能体 {agent_id} 执行异常"
-                )
-                yield self._event({
-                    "type": "error",
-                    "message": f"执行出错: {str(e)}",
-                })
-                return
-
-            # yield summary 事件
-            if final_output_parts:
-                yield self._event({
-                    "type": "summary",
-                    "content": final_output_parts[0],
-                })
-
-            return  # 跳过后续改写→识别→编排流程
-
-        # ① 查询改写（联系上下文）
         try:
-            rewritten = await rewriter.rewrite(user_input, history)
+            async for event_str in self._run_with_workspace_task(
+                ws_task=ws_task,
+                rewriter=rewriter,
+                recognizer=recognizer,
+                user_input=user_input,
+                history=history,
+                messages=messages,
+                session_id=session_id,
+                user_id=user_id,
+                session_service=session_service,
+                agent_id=agent_id,
+                langfuse_service=langfuse_service,
+                request=request,
+            ):
+                yield event_str
+        finally:
+            # 客户端断连会让本生成器被提前关闭：未完成则取消，已完成则消费异常，
+            # 否则事件循环会报 "Task exception was never retrieved"
+            if not ws_task.done():
+                ws_task.cancel()
+            elif not ws_task.cancelled():
+                ws_task.exception()
+
+    async def _load_upload_context(self, request: Any, session_id: Optional[str]) -> str:
+        """检索该会话未绑定消息的上传文件解析内容，拼接为提示词片段。
+
+        上传文件在 /upload 时即后台解析入库（见 file_parse_service）；
+        此处只取 message_id IS NULL 且解析内容非空的记录（失败文案也算，
+        让 agent 诚实告知用户）。检索失败静默返回空串，不影响问答主流程。
+        """
+        if request is None or not session_id:
+            return ""
+        dao = getattr(request.app.state, "upload_file_dao", None)
+        if dao is None:
+            return ""
+        try:
+            rows = await dao.load_unbound_parsed(session_id)
         except Exception:
-            logger.exception("[OrchestratorService] 查询改写失败，使用原始输入")
-            rewritten = user_input
+            logger.warning("[OrchestratorService] 检索上传文件解析内容失败", exc_info=True)
+            return ""
+        if not rows:
+            return ""
+        parts = [_UPLOAD_CTX_HEADER]
+        for row in rows:
+            content = (row.get("parsed_content") or "")[:_UPLOAD_CTX_MAX_CHARS]
+            parts.append(f"=== 文件名: {row.get('filename', '')} ===")
+            parts.append(content)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _append_upload_context(text: str, upload_ctx: str) -> str:
+        """把上传文件上下文追加到文本尾部（上下文为空时原样返回）。"""
+        if not upload_ctx:
+            return text
+        return f"{text}\n\n{upload_ctx}"
+
+    async def _has_unbound_uploads(self, request: Any, session_id: Optional[str]) -> bool:
+        """该会话是否存在未绑定消息的上传文件（用于跳过问题改写）。
+
+        检索失败静默返回 False（不影响问答主流程，仅照常做改写）。
+        """
+        if request is None or not session_id:
+            return False
+        dao = getattr(request.app.state, "upload_file_dao", None)
+        if dao is None:
+            return False
+        try:
+            return await dao.has_unbound_files(session_id)
+        except Exception:
+            logger.warning("[OrchestratorService] 检查未绑定上传文件失败", exc_info=True)
+            return False
+
+    async def _run_with_workspace_task(
+        self,
+        ws_task: "asyncio.Task",
+        rewriter: QueryRewriter,
+        recognizer: IntentRecognizer,
+        user_input: str,
+        history: List[dict],
+        messages: List[Dict[str, Any]],
+        session_id: Optional[str],
+        user_id: Optional[str],
+        session_service: Optional[Any],
+        agent_id: Optional[str],
+        langfuse_service: Optional[Any],
+        request: Any = None,
+    ) -> AsyncGenerator[str, None]:
+        """在等待工作区 task 的同时跑完意图链路，再执行编排。
+
+        拆成独立方法是为了让 run() 的 finally 能无条件覆盖本方法的全部提前返回路径
+        （return / 异常 / 生成器被关闭），保证 ws_task 不会悬挂。
+        """
+        # ② 单 agent 短路路径（跳过改写→识别→编排，直接由指定 agent 回答）
+        if agent_id:
+            registry, agent_factory, ws_err = await self._resolve_workspace_task(ws_task)
+            if ws_err:
+                yield self._event({"type": "error", "message": ws_err})
+                return
+            upload_ctx = await self._load_upload_context(request, session_id)
+            user_input = self._append_upload_context(user_input, upload_ctx)
+            async for ev in self._run_single_agent_path(
+                registry, agent_factory, agent_id, user_input,
+                session_id, user_id, session_service, langfuse_service,
+            ):
+                yield ev
+            return
+
+        # ③ 查询改写（联系上下文，失败降级为原始输入）。
+        # 有未消费的上传文件时跳过改写：文件解析内容将在编排前注入 query，
+        # 原始问题已足够完整，改写反而可能引入偏差
+        skip_rewrite = await self._has_unbound_uploads(request, session_id)
+        with self._span(
+            langfuse_service, "query-rewrite",
+            {"original": user_input, "history_len": len(history)},
+        ) as rw_span:
+            if skip_rewrite:
+                rewritten, rw_prompts = user_input, {}
+                _rw_extra = {"skipped": "upload-file"}
+            else:
+                try:
+                    rewritten, rw_prompts = await rewriter.rewrite(user_input, history)
+                    _rw_extra = {}
+                except Exception as e:
+                    logger.exception("[OrchestratorService] 查询改写失败，使用原始输入")
+                    rewritten, rw_prompts = user_input, {}
+                    _rw_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
+            _safe_update_span(rw_span, {"rewritten": rewritten, "prompts": rw_prompts, **_rw_extra})
 
         yield self._event({
             "type": "query_rewritten",
             "original": user_input,
             "rewritten": rewritten,
+            **({"skipped_reason": "upload-file"} if skip_rewrite else {}),
         })
 
-        # ② 意图识别
-        try:
-            intent_result = await recognizer.recognize(rewritten, history)
-        except Exception:
-            logger.exception(
-                "[OrchestratorService] 意图识别失败，降级为 general_chat"
-            )
-            intent_result = IntentResult(
-                rewritten_query=rewritten,
-                intents=[
-                    Intent(id="general_chat", query=rewritten, agent="general_agent")
-                ],
-                relation="independent",
-            )
+        # ④ 意图识别（第一次 LLM，失败降级为 general_chat）
+        yield self._event({
+            "type": "intent_step", "phase": "recognition", "status": "started",
+            "message": "正在识别意图...",
+        })
+        with self._span(
+            langfuse_service, "intent-recognition",
+            {"query": rewritten, "history_len": len(history)},
+        ) as rec_span:
+            try:
+                intents, rec_prompts = await recognizer.recognize_intents(rewritten, history)
+                _rec_extra = {}
+            except Exception as e:
+                logger.exception("[OrchestratorService] 意图识别失败，降级为 general_chat")
+                intents = [Intent(id="general_chat", query=rewritten, agent="general_agent")]
+                rec_prompts = {}
+                _rec_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
+            _safe_update_span(rec_span, {
+                "intents": [{"id": i.id, "agent": i.agent} for i in intents],
+                "prompts": rec_prompts, **_rec_extra,
+            })
+        yield self._event({
+            "type": "intent_step", "phase": "recognition", "status": "done",
+            "intents": [{"id": i.id, "query": i.query, "agent": i.agent} for i in intents],
+        })
+
+        # ⑤ 意图编排（第二次 LLM，失败降级为 independent）
+        yield self._event({
+            "type": "intent_step", "phase": "orchestration", "status": "started",
+            "message": "正在决策编排策略...",
+        })
+        with self._span(
+            langfuse_service, "intent-orchestration",
+            {"intents_count": len(intents)},
+        ) as orch_span:
+            try:
+                relation, execution_order, orch_prompts = await recognizer.plan_orchestration(rewritten, intents)
+                _orch_extra = {}
+            except Exception as e:
+                logger.exception("[OrchestratorService] 意图编排失败，降级为 independent")
+                relation, execution_order, orch_prompts = "independent", [], {}
+                _orch_extra = {"degraded": True, "reason": type(e).__name__, "detail": str(e)[:500]}
+            _safe_update_span(orch_span, {
+                "relation": relation, "execution_order": execution_order,
+                "prompts": orch_prompts, **_orch_extra,
+            })
+        # 按 execution_order 重排 intents（校验长度一致才应用，否则按原顺序）
+        if execution_order and len(execution_order) == len(intents):
+            intents = [intents[i] for i in execution_order]
+        intent_result = IntentResult(
+            rewritten_query=rewritten, intents=intents,
+            relation=relation, execution_order=execution_order,
+        )
         yield self._event({
             "type": "intents_recognized",
             "intents": [
@@ -463,46 +1058,49 @@ class OrchestratorService:
             "relation": intent_result.relation,
         })
 
-        # ③ 选择编排器
+        # 编排前汇合：此时意图链路已跑完，工作区大概率已就绪
+        registry, agent_factory, ws_err = await self._resolve_workspace_task(ws_task)
+        if ws_err:
+            yield self._event({"type": "error", "message": ws_err})
+            return
+
+        # 上传文件解析内容注入：意图识别已通过，真正进入问答阶段。
+        # 附加到每个 intent 的 query（pipeline/react 均以 intent.query 作为 agent 任务输入）
+        upload_ctx = await self._load_upload_context(request, session_id)
+        if upload_ctx:
+            for intent in intent_result.intents:
+                intent.query = self._append_upload_context(intent.query, upload_ctx)
+
+        # ⑥ 选择编排器并加载各 agent 状态
         mode = recognizer.get_orchestration_mode(intent_result)
         orchestrator = self._create_orchestrator(mode, agent_factory)
 
-        # ④ 加载已有 AgentState（按 agent_id 逐个加载）
         agent_states: Dict[str, AgentState] = {}
-        if session_service and session_id and user_id:
-            for intent in intent_result.intents:
-                aid = intent.agent or "general_agent"
-                try:
-                    state_dict = await session_service.load_agent_state(
-                        session_id, aid
-                    )
-                    if state_dict:
-                        agent_states[aid] = AgentState.model_validate(state_dict)
-                except Exception:
-                    logger.debug(
-                        f"[OrchestratorService] 无法加载 {aid} 状态，将新建"
-                    )
+        for intent in intent_result.intents:
+            aid = intent.agent or "general_agent"
+            agent_states[aid] = await self._load_agent_state(
+                session_service, session_id, aid,
+            )
 
-        # ⑤ 执行编排（内部 yield SSE 事件）
+        # ⑥ 执行编排（内部实时 yield SSE 事件）
+        self._last_agent_ids = []  # 重置，避免上一轮残留
+        self._last_success = True  # 重置
         async for event_str in orchestrator.run(
             intent_result,
             session_id=session_id,
             agent_states=agent_states,
+            langfuse_service=langfuse_service,
         ):
             yield event_str
 
-        # ⑥ 保存编排结果引用（供外部提取 agent states）
+        # ⑦ 保存编排结果引用 + 持久化各 agent 状态
         self._last_orchestrator = orchestrator
-
-        # ⑦ 持久化所有 AgentState
-        if session_service and session_id and user_id:
-            for r in orchestrator._last_results:
-                if r.final_state:
-                    try:
-                        await session_service.save_agent_state(
-                            session_id, user_id, r.agent_id, r.final_state,
-                        )
-                    except Exception:
-                        logger.exception(
-                            f"[OrchestratorService] 保存 agent {r.agent_id} 状态失败"
-                        )
+        # 汇总本轮编排参与的 agent_id 列表（去重保序）
+        self._last_agent_ids = list(dict.fromkeys(
+            r.agent_id for r in orchestrator._last_results if r.agent_id
+        ))
+        for r in orchestrator._last_results:
+            if r.final_state:
+                await self._persist_agent_state(
+                    session_service, session_id, user_id, r.agent_id, r.final_state,
+                )

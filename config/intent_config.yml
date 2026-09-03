@@ -16,9 +16,9 @@ intents:
     agent: general_agent
 
   - id: regulations_qa
-      name: 制度问答
-      description: 涉及公司内部制度知识的问答，需要调用知识库
-      agent: regulations_agent
+    name: 制度问答
+    description: 涉及公司内部制度知识的问答，需要调用知识库
+    agent: regulations_agent
 
 
 # ==================== 默认编排策略映射 ====================
@@ -29,7 +29,7 @@ intents:
 #   - related_dynamic:  多意图有关联，顺序需动态决策，走 ReAct
 # 单意图统一走 parallel（直接执行，无汇总开销）
 default_orchestration:
-  single_intent: parallel
+  single_intent: pipeline
   multi_independent: parallel
   multi_related_fixed: pipeline
   multi_related_dynamic: react
@@ -39,6 +39,6 @@ orchestrator:
   # ReAct 循环最大步数，防止死循环
   react_max_steps: 8
   # 并行执行单个智能体的超时时间（秒）
-  parallel_timeout: 60
+  parallel_timeout: 900
   # 流水线任一步骤超时时间（秒）
-  pipeline_step_timeout: 60
+  pipeline_step_timeout: 900

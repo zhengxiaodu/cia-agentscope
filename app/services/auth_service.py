@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import jwt
 
-from app.config import JWT_ALGORITHM, JWT_SECRET, JWT_EXPIRE_HOURS
+from app.config import JWT_ALGORITHM, JWT_SECRET, JWT_EXPIRE_HOURS, JWT_REFRESH_EXPIRE_DAYS
 
 logger = logging.getLogger(__name__)
 
@@ -28,19 +28,35 @@ def decode_access_token(token: str) -> dict:
     return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
 
 
-async def save_user_permissions(redis_client, user_id: str, access_token: str, permissions: dict) -> None:
-    """将用户的 mng access_token 和 permissions 存入 Redis。
+def create_refresh_token(payload: dict, expire_days: int = JWT_REFRESH_EXPIRE_DAYS) -> str:
+    """生成 refresh JWT, 默认按 JWT_REFRESH_EXPIRE_DAYS 过期（天）。"""
+    now = datetime.now(timezone.utc)
+    body = payload.copy()
+    body["iat"] = int(now.timestamp())
+    body["exp"] = int((now + timedelta(days=expire_days)).timestamp())
+    body["type"] = "refresh"
+    return jwt.encode(body, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def decode_refresh_token(token: str) -> dict:
+    """解析 refresh JWT; 非 refresh 类型或过期/签名错误时抛异常。"""
+    payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    if payload.get("type") != "refresh":
+        raise jwt.InvalidTokenError("非 refresh token")
+    return payload
+
+
+async def save_user_permissions(redis_client, user_id: str, permissions: dict) -> None:
+    """将用户的 permissions 存入 Redis。
 
     Args:
         redis_client: redis.asyncio 客户端
         user_id: 用户唯一标识（来自 mng 返回的 user_info）
-        access_token: mng 系统返回的 access_token
         permissions: mng 系统返回的 permissions 对象
             {"agent_whitelist": [...], "skill_blacklist": [...]}
     """
     key = _REDIS_KEY_PERMISSIONS.format(user_id=user_id)
     value = json.dumps({
-        "access_token": access_token,
         "permissions": permissions,
     }, ensure_ascii=False)
     ttl = _PERMISSIONS_TTL
@@ -49,10 +65,10 @@ async def save_user_permissions(redis_client, user_id: str, access_token: str, p
 
 
 async def get_user_permissions(redis_client, user_id: str) -> dict | None:
-    """从 Redis 获取用户的 mng access_token 和 permissions。
+    """从 Redis 获取用户的 permissions。
 
     Returns:
-        成功返回 {"access_token": str, "permissions": dict}，
+        成功返回 {"permissions": dict}，
         不存在或解析失败返回 None。
     """
     key = _REDIS_KEY_PERMISSIONS.format(user_id=user_id)

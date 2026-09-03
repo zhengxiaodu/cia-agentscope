@@ -14,6 +14,25 @@ from agentscope.state import AgentState
 logger = logging.getLogger(__name__)
 
 
+def _parse_json_list(raw) -> list:
+    """把 MySQL JSON 列返回值统一解析为 list。
+
+    aiomysql DictCursor 对 JSON 列可能返回 str 或已解析的 list/dict，
+    本函数统一兜底为 list（非 list 时返回 []）。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            val = json.loads(raw)
+            return val if isinstance(val, list) else []
+        except Exception:
+            return []
+    return []
+
+
 class SessionDAO:
     """MySQL 会话持久化数据访问层"""
 
@@ -33,6 +52,7 @@ class SessionDAO:
                     (session_id,),
                 )
                 row = await cur.fetchone()
+                await conn.commit()
                 return row is not None
 
     # ================================================================
@@ -51,6 +71,7 @@ class SessionDAO:
                     (session_id, agent_id),
                 )
                 row = await cur.fetchone()
+                await conn.commit()
                 if row is None:
                     return None
                 # MySQL JSON 列返回的是字符串，需要解析
@@ -122,11 +143,13 @@ class SessionDAO:
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
-                    "SELECT role, content, timestamp FROM messages "
+                    "SELECT role, content, timestamp, agent_ids, user_id, "
+                    "success, tokens FROM messages "
                     "WHERE session_id = %s ORDER BY id ASC",
                     (session_id,),
                 )
                 rows = await cur.fetchall()
+                await conn.commit()
                 return [
                     {
                         "role": r["role"],
@@ -136,6 +159,10 @@ class SessionDAO:
                         )[:-3]
                         if hasattr(r["timestamp"], "strftime")
                         else str(r["timestamp"]),
+                        "agent_ids": _parse_json_list(r.get("agent_ids")),
+                        "user_id": r.get("user_id", "") or "",
+                        "success": bool(r.get("success", 1)),
+                        "tokens": int(r.get("tokens", 0) or 0),
                     }
                     for r in rows
                 ]
@@ -145,21 +172,34 @@ class SessionDAO:
         session_id: str,
         user_id: str,
         new_messages: list[dict],
-    ) -> None:
+    ) -> Optional[int]:
         """向 messages 表插入消息 + 更新 sessions 元信息。
 
         若 sessions 行不存在则自动创建。
+        messages 中的 agent_ids（list[str]）写入 messages.agent_ids（JSON 列），
+        并累积去重合并到 sessions.agent_ids。
+
+        Returns:
+            本轮 user 消息的自增 id（供上传文件回填 message_id）；
+            本轮没有 user 消息或事务失败时返回 None。
         """
         now = datetime.now(timezone.utc)
         now_str = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+        # 汇总本轮 new_messages 中所有 agent_ids（去重保序）
+        agent_ids_all: list = []
+        for msg in new_messages:
+            for aid in msg.get("agent_ids", []) or []:
+                if aid and aid not in agent_ids_all:
+                    agent_ids_all.append(aid)
 
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await conn.begin()
                 try:
-                    # 1) 确保 sessions 行存在
+                    # 1) 确保 sessions 行存在（同时读取旧 agent_ids 用于合并）
                     await cur.execute(
-                        "SELECT name FROM sessions WHERE session_id = %s",
+                        "SELECT name, agent_ids FROM sessions WHERE session_id = %s",
                         (session_id,),
                     )
                     row = await cur.fetchone()
@@ -173,14 +213,19 @@ class SessionDAO:
                                     raw_text[:50] if len(raw_text) > 50 else raw_text
                                 )
                                 break
+                        agent_ids_init = (
+                            json.dumps(agent_ids_all, ensure_ascii=False)
+                            if agent_ids_all else None
+                        )
                         await cur.execute(
                             "INSERT INTO sessions "
-                            "(session_id, user_id, name, created_at, updated_at) "
-                            "VALUES (%s, %s, %s, %s, %s)",
-                            (session_id, user_id, name, now, now),
+                            "(session_id, user_id, name, created_at, updated_at, agent_ids) "
+                            "VALUES (%s, %s, %s, %s, %s, %s)",
+                            (session_id, user_id, name, now, now, agent_ids_init),
                         )
 
-                    # 2) 插入消息
+                    # 2) 插入消息（含 agent_ids），记录本轮 user 消息的自增 id
+                    user_message_id: Optional[int] = None
                     for msg in new_messages:
                         ts_raw = msg.get("timestamp", now_str)
                         if isinstance(ts_raw, str):
@@ -192,13 +237,24 @@ class SessionDAO:
                                 ts = now
                         else:
                             ts = now
+                        msg_agent_ids = msg.get("agent_ids", []) or []
+                        agent_ids_json = (
+                            json.dumps(msg_agent_ids, ensure_ascii=False)
+                            if msg_agent_ids else None
+                        )
                         await cur.execute(
                             "INSERT INTO messages "
-                            "(session_id, role, content, timestamp) "
-                            "VALUES (%s, %s, %s, %s)",
+                            "(session_id, role, content, timestamp, agent_ids, "
+                            "user_id, success, tokens) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                             (session_id, msg.get("role", "user"),
-                             msg.get("content", ""), ts),
+                             msg.get("content", ""), ts, agent_ids_json,
+                             msg.get("user_id", ""),
+                             int(bool(msg.get("success", True))),
+                             int(msg.get("tokens", 0) or 0)),
                         )
+                        if msg.get("role") == "user" and user_message_id is None:
+                            user_message_id = cur.lastrowid
 
                     # 3) 更新 sessions 元信息
                     await cur.execute(
@@ -210,6 +266,7 @@ class SessionDAO:
                     count = count_row["cnt"] if count_row else 0
 
                     if not row:
+                        # 新建会话：agent_ids 已在 INSERT 时写入，这里只补 name/count
                         name = ""
                         for msg in new_messages:
                             if msg.get("role") == "user":
@@ -225,14 +282,22 @@ class SessionDAO:
                             (name, count, now, session_id),
                         )
                     else:
+                        # 已存在会话：合并旧 agent_ids 与本轮 agent_ids（去重保序）
+                        old_agent_ids = _parse_json_list(row.get("agent_ids"))
+                        merged = list(dict.fromkeys(old_agent_ids + agent_ids_all))
+                        agent_ids_json = (
+                            json.dumps(merged, ensure_ascii=False)
+                            if merged else None
+                        )
                         await cur.execute(
                             "UPDATE sessions "
-                            "SET message_count = %s, updated_at = %s "
+                            "SET message_count = %s, updated_at = %s, agent_ids = %s "
                             "WHERE session_id = %s",
-                            (count, now, session_id),
+                            (count, now, agent_ids_json, session_id),
                         )
 
                     await conn.commit()
+                    return user_message_id
                 except Exception:
                     await conn.rollback()
                     raise
@@ -252,6 +317,30 @@ class SessionDAO:
                     "updated_at = NOW() WHERE session_id = %s",
                     (trace_id, session_id),
                 )
+                await conn.commit()
+
+    async def mark_last_assistant_failed(
+        self, session_id: str, user_id: str
+    ) -> None:
+        """把该会话最新一条 assistant 消息的 success 强制置 0（用户中断时调用）。
+
+        _persist_conversation_history 内部读 orchestrator_service.last_success
+        （单例属性，并发会话会互相污染，中断时不可信），故落库后补此 UPDATE 保证正确。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "UPDATE messages SET success = 0 "
+                    "WHERE session_id = %s AND user_id = %s AND role = 'assistant' "
+                    "AND timestamp = ("
+                    "  SELECT max_ts FROM ("
+                    "    SELECT MAX(timestamp) AS max_ts FROM messages "
+                    "    WHERE session_id = %s AND user_id = %s AND role = 'assistant'"
+                    "  ) AS t"
+                    ")",
+                    (session_id, user_id, session_id, user_id),
+                )
+                await conn.commit()
 
     # ================================================================
     # Session 元信息
@@ -263,11 +352,12 @@ class SessionDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT session_id, user_id, name, created_at, "
-                    "updated_at, message_count, latest_trace_id, is_pinned "
-                    "FROM sessions WHERE session_id = %s",
+                    "updated_at, message_count, latest_trace_id, is_pinned, "
+                    "agent_ids FROM sessions WHERE session_id = %s",
                     (session_id,),
                 )
                 row = await cur.fetchone()
+                await conn.commit()
                 if row is None:
                     return None
                 return {
@@ -283,6 +373,7 @@ class SessionDAO:
                     "message_count": row["message_count"],
                     "latest_trace_id": row["latest_trace_id"] or "",
                     "is_pinned": bool(row["is_pinned"]),
+                    "agent_ids": _parse_json_list(row.get("agent_ids")),
                 }
 
     # ================================================================
@@ -305,8 +396,8 @@ class SessionDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT session_id, user_id, name, created_at, "
-                    "updated_at, message_count, latest_trace_id, is_pinned "
-                    "FROM sessions "
+                    "updated_at, message_count, latest_trace_id, is_pinned, "
+                    "agent_ids FROM sessions "
                     "WHERE user_id = %s AND is_pinned = 1 "
                     "ORDER BY pinned_at DESC "
                     "LIMIT %s",
@@ -331,14 +422,15 @@ class SessionDAO:
                         "message_count": row["message_count"],
                         "latest_trace_id": row["latest_trace_id"] or "",
                         "is_pinned": bool(row["is_pinned"]),
+                        "agent_ids": _parse_json_list(row.get("agent_ids")),
                     })
 
                 # 非置顶会话
                 fetch_limit = limit + len(top_sessions)
                 await cur.execute(
                     "SELECT session_id, user_id, name, created_at, "
-                    "updated_at, message_count, latest_trace_id, is_pinned "
-                    "FROM sessions "
+                    "updated_at, message_count, latest_trace_id, is_pinned, "
+                    "agent_ids FROM sessions "
                     "WHERE user_id = %s AND is_pinned = 0 "
                     "ORDER BY updated_at DESC "
                     "LIMIT %s",
@@ -365,8 +457,10 @@ class SessionDAO:
                         "message_count": row["message_count"],
                         "latest_trace_id": row["latest_trace_id"] or "",
                         "is_pinned": bool(row["is_pinned"]),
+                        "agent_ids": _parse_json_list(row.get("agent_ids")),
                     })
 
+                await conn.commit()
                 return top_sessions, sessions
 
     # ================================================================
@@ -383,6 +477,7 @@ class SessionDAO:
                     "updated_at = %s WHERE session_id = %s AND user_id = %s",
                     (now, now, session_id, user_id),
                 )
+                await conn.commit()
 
     async def unpin_session(self, user_id: str, session_id: str) -> None:
         """取消会话置顶。"""
@@ -393,6 +488,7 @@ class SessionDAO:
                     "updated_at = NOW() WHERE session_id = %s AND user_id = %s",
                     (session_id, user_id),
                 )
+                await conn.commit()
 
     # ================================================================
     # 删除会话
@@ -407,6 +503,75 @@ class SessionDAO:
                     "WHERE session_id = %s AND user_id = %s",
                     (session_id, user_id),
                 )
+                await conn.commit()
+
+    # ================================================================
+    # Session 文件元信息
+    # ================================================================
+
+    async def append_session_files(
+        self, session_id: str, files: list[dict]
+    ) -> None:
+        """向 session_files 表 UPSERT 文件元信息（按 (session_id, path) 去重）。
+
+        files: [{"name", "path", "url", "size", "media_type"}, ...]
+        空列表直接返回。
+        """
+        if not files:
+            return
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await conn.begin()
+                try:
+                    for f in files:
+                        await cur.execute(
+                            "INSERT INTO session_files "
+                            "(session_id, name, path, url, size, media_type) "
+                            "VALUES (%s, %s, %s, %s, %s, %s) "
+                            "ON DUPLICATE KEY UPDATE "
+                            "name = VALUES(name), url = VALUES(url), "
+                            "size = VALUES(size), media_type = VALUES(media_type), "
+                            "updated_at = NOW()",
+                            (
+                                session_id,
+                                f.get("name", ""),
+                                f.get("path", ""),
+                                f.get("url", ""),
+                                int(f.get("size", 0) or 0),
+                                f.get("media_type", "application/octet-stream"),
+                            ),
+                        )
+                    await conn.commit()
+                except Exception:
+                    await conn.rollback()
+                    raise
+
+    async def load_session_files(self, session_id: str) -> list[dict]:
+        """加载 session 的生成文件元信息列表（按首次生成顺序 id ASC）。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT name, path, url, size, media_type, created_at "
+                    "FROM session_files WHERE session_id = %s ORDER BY id ASC",
+                    (session_id,),
+                )
+                rows = await cur.fetchall()
+                await conn.commit()
+                return [
+                    {
+                        "name": r["name"],
+                        "path": r["path"],
+                        "url": r["url"],
+                        "size": r["size"],
+                        "media_type": r["media_type"],
+                        "created_at": r["created_at"].strftime(
+                            "%Y-%m-%d %H:%M:%S.%f"
+                        )[:-3]
+                        if hasattr(r["created_at"], "strftime")
+                        else str(r["created_at"]),
+                    }
+                    for r in rows
+                ]
 
     # ================================================================
     # AgentScope 原生接口
@@ -427,7 +592,7 @@ class SessionDAO:
                 await cur.execute(
                     "SELECT s.session_id, s.user_id, s.name, s.created_at, "
                     "s.updated_at, s.message_count, s.latest_trace_id, "
-                    "s.is_pinned, a.state, a.agent_id "
+                    "s.is_pinned, s.agent_ids, a.state, a.agent_id "
                     "FROM sessions s "
                     "LEFT JOIN agent_states a "
                     "ON a.session_id = s.session_id AND a.agent_id = %s "
@@ -435,6 +600,7 @@ class SessionDAO:
                     (agent_id, session_id, user_id),
                 )
                 row = await cur.fetchone()
+                await conn.commit()
                 if row is None:
                     return None
                 result = dict(row)
@@ -442,6 +608,8 @@ class SessionDAO:
                     state_val = result["state"]
                     if isinstance(state_val, str):
                         result["state"] = json.loads(state_val)
+                # s.agent_ids（JSON 列表）统一解析为 list
+                result["agent_ids"] = _parse_json_list(result.get("agent_ids"))
                 return result
 
     async def update_session_state(
@@ -457,7 +625,7 @@ class SessionDAO:
         """
         now = datetime.now(timezone.utc)
         state_json = json.dumps(
-            state.model_dump(),
+            state.model_dump(mode="json"),
             ensure_ascii=False,
             default=str,
         )

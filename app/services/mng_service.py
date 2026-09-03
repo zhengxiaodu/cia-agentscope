@@ -15,14 +15,14 @@ logger = logging.getLogger(__name__)
 _MNG_INTENTS_PATH = "/api/intents"
 
 
-async def fetch_external_intents(access_token: str) -> List[dict]:
+async def fetch_external_intents(jwt_token: str) -> List[dict]:
     """从 mng 系统获取外部意图配置列表。
 
-    请求 GET {MNG_INTENT_URL}/api/intents，Header 中携带 access_token。
+    请求 GET {MNG_INTENT_URL}/api/intents，Header 中携带本系统签发的 JWT。
     失败不影响主流程，返回空列表。
 
     Args:
-        access_token: 用户登录时 mng 返回的 access_token
+        jwt_token: 本系统登录签发的 JWT，作为 Authorization 转发给 mng
 
     Returns:
         外部意图配置列表，mng 返回格式：
@@ -45,16 +45,16 @@ async def fetch_external_intents(access_token: str) -> List[dict]:
     if not MNG_INTENT_URL:
         logger.warning("[mng_service] MNG_INTENT_URL 未配置，跳过获取外部意图")
         return []
-    if not access_token:
-        logger.warning("[mng_service] access_token 为空，跳过获取外部意图")
+    if not jwt_token:
+        logger.warning("[mng_service] jwt_token 为空，跳过获取外部意图")
         return []
 
     url = f"{MNG_INTENT_URL}{_MNG_INTENTS_PATH}"
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             resp = await client.get(
                 url,
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={"Authorization": f"Bearer {jwt_token}"},
             )
             if resp.status_code != 200:
                 logger.warning(
@@ -79,6 +79,35 @@ async def fetch_external_intents(access_token: str) -> List[dict]:
         return []
 
 
+def build_agent_definition_map(external_intents: list) -> dict:
+    """从 /api/intents 原始返回构建 agent_id → definition 映射。
+
+    供登录时为 agent_access 注入 description（值 = 对应意图的 definition）。
+    同一 agent 被多个意图关联时取首个非空 definition；
+    跳过非 dict、缺 agent/definition 的意图。
+
+    Args:
+        external_intents: fetch_external_intents 返回的原始意图列表
+
+    Returns:
+        {agent_id: definition, ...}
+    """
+    mapping: dict = {}
+    for ext in (external_intents or []):
+        if not isinstance(ext, dict):
+            continue
+        agent_data = ext.get("agent")
+        if not isinstance(agent_data, dict):
+            continue
+        agent_id = agent_data.get("id")
+        definition = ext.get("definition") or ""
+        if not agent_id or not definition:
+            continue
+        if agent_id not in mapping:
+            mapping[agent_id] = definition
+    return mapping
+
+
 def _build_whitelist_codes(agent_whitelist: list) -> set:
     """从 agent_whitelist 列表中提取所有 code，转为集合用于快速查找。
 
@@ -90,7 +119,7 @@ def _build_whitelist_codes(agent_whitelist: list) -> set:
         return codes
     for item in agent_whitelist:
         if isinstance(item, dict):
-            code = item.get("code")
+            code = item.get("id")
             if code:
                 codes.add(code)
     return codes
@@ -163,6 +192,7 @@ def merge_external_into_memory(
             continue
 
         intent_name = ext.get("name", "")
+        intent_description = ext.get("definition", "")
         intent_code = ext.get("intentCode", "")
         if not intent_code:
             logger.warning(
@@ -171,29 +201,21 @@ def merge_external_into_memory(
             continue
 
         # 解析该意图关联的 agent
-        agents_data = ext.get("agents", [])
-        if not isinstance(agents_data, list) or not agents_data:
+        agent_data = ext.get("agent", {})
+        if not isinstance(agent_data, dict) or not agent_data:
             logger.warning(
                 f"[mng_service] 外部意图 {intent_code} 无关联 agent，跳过"
             )
             continue
 
-        # 找到第一个在权限白名单中的 agent
-        selected_agent = None
-        for agent_item in agents_data:
-            if not isinstance(agent_item, dict):
-                continue
-            agent_code = agent_item.get("code", "")
-            if not agent_code:
-                continue
-            # 白名单检查
-            if agent_code not in agent_whitelist:
-                logger.info(
-                    f"[mng_service] 外部 agent '{agent_code}' 不在白名单中，跳过"
-                )
-                continue
-            selected_agent = agent_item
-            break
+        agent_id = agent_data.get("id", "")
+        # 白名单检查
+        if agent_id not in agent_whitelist:
+            logger.info(
+                f"[mng_service] 外部 agent '{agent_id}' 不在白名单中，跳过"
+            )
+            continue
+        selected_agent = agent_data
 
         if selected_agent is None:
             logger.info(
@@ -202,9 +224,9 @@ def merge_external_into_memory(
             )
             continue
 
-        agent_code = selected_agent.get("code", "")
+        agent_code = selected_agent.get("id", "")
         agent_name = selected_agent.get("name", "")
-        agent_prompt = selected_agent.get("prompt", "") or ""
+        agent_prompt = selected_agent.get("system_prompt", "") or ""
 
         # 解析该意图关联的 skills
         skills_data = ext.get("skills", [])
@@ -246,8 +268,10 @@ def merge_external_into_memory(
         merged_intents.append({
             "id": intent_code,          # intent.id = intentCode
             "name": intent_name,
-            "description": intent_name, # 外部意图没有独立 description，用 name
+            "description": intent_description, # 外部意图没有独立 description，用 name
             "agent": agent_code,        # intent.agent = agent.code
+            "level": ext.get("level"),
+            "parent_code": ext.get("parentCode"),
         })
 
         # 构建 agent_config 格式（参考 agent_config.yml 中的 agent 条目）

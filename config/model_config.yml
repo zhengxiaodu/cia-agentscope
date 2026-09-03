@@ -20,8 +20,19 @@ models:
     base_url:
     api_key: 
     parameters:
-      temperature: 0.1
+      temperature: 0.3
       max_tokens: 1024
+
+  # 音频转写专用模型（OpenAI 兼容 /v1/audio/transcriptions 接口）
+  audio_transcriber:
+    provider: "openai"
+    model_name: "Qwen3-ASR-1.7B"
+    base_url:
+    api_key:
+    parameters:
+      prompt: "解析音频"
+      language: "zh"
+      timeout: 60
 
 # 兼容旧版：单智能体时代的 Agent 配置（保留作为 general_agent 的默认值来源）
 agent:
@@ -39,40 +50,66 @@ agent:
 # 意图识别与查询改写使用的 prompt，支持 {{变量}} 占位符
 prompts:
   # 查询改写 prompt：把口语化输入结合上下文改写为语义完整的规范查询
+  # 占位符：{{current_date}} 服务器当前时间（Asia/Shanghai）
   rewrite: |
     你是查询改写助手。请根据【历史对话上下文】把用户的口语化、省略、指代输入，改写为语义完整、可独立理解的标准查询。
+
+    【服务器当前时间】
+    {{current_date}}
 
     要求：
     1. 补全省略的主语、宾语、时间、对象（结合上下文中的实体）
     2. 消解代词指代（"它/这个/那个" → 具体指代对象）
-    3. 保持原意，不要扩展或新增用户未表达的需求
-    4. 仅输出改写后的查询文本，不要任何解释
+    3. 时间代词改写：当用户输入包含"今天/今日/昨天/明天/本周/本月/今年/去年/最近/近期/近几个月"等时间代词时，必须根据【服务器当前时间】将其替换为具体的日期或日期范围（如"今天"→"2026-07-13"、"本周"→"2026-07-07至2026-07-13"、"近几个月"→"2026-04至2026-07"）
+    4. 保持原意，不要扩展或新增用户未表达的需求
+    5. 仅输出改写后的查询文本，不要任何解释
 
-  # 意图识别 prompt：输出严格 JSON
-  # 占位符：{{intents}} 可识别意图列表，{{history}} 历史上下文摘要
+  # 意图识别 prompt：按意图树分层识别，输出严格 JSON
+  # 占位符：{{intents}} 树形意图清单（一级+二级），{{history}} 历史上下文摘要
   intent_recognition: |
-    你是多意图识别引擎。请分析【用户输入】，联系【历史上下文】，识别其中包含的意图。
+    你是多意图识别引擎。请分析【用户输入】，联系【历史上下文】，按【意图树】分层识别最终命中的意图。
 
-    【可识别的意图清单】
+    【意图树】
     {{intents}}
 
     【识别规则】
-    1. 一条用户输入可能包含多个独立意图（如"查一下新闻，再画个图"），需全部识别
-    2. 每个意图必须从清单中选择一个 id，不可臆造
-    3. 若用户输入含义模糊无法匹配任何意图，归为 general_chat
-    4. 判断意图间的关系：
-       - independent: 各意图互不依赖，可独立并行执行
-       - related_fixed: 意图间有固定先后依赖（如必须先查数据才能画图），顺序确定
-       - related_dynamic: 意图间依赖需根据中间结果动态决策下一步
-    5. 每个意图提取对应的子查询 query（针对该意图的具体执行输入）
+    1. 先判断用户输入涉及哪些一级意图
+    2. 对每个命中的一级意图，进一步判断：
+       - 若该一级意图下有二级意图，判断具体命中哪些二级意图，输出二级意图 id
+       - 若该一级意图下没有二级意图，直接输出该一级意图 id
+    3. 一条用户输入可能涉及多个一级意图，需全部识别并逐层判断
+    4. 每个意图 id 必须从【意图树】中选择，不可臆造
+    5. 若用户输入含义模糊无法匹配任何一级意图，归为 general_chat
+    6. 每个意图提取对应的子查询 query（针对该意图的具体执行输入）
 
     【输出格式】严格输出如下 JSON，不要包含 markdown 代码块标记、不要任何解释文字：
     {
       "intents": [
         {"id": "意图id", "query": "该意图对应的子查询"}
-      ],
-      "relation": "independent | related_fixed | related_dynamic"
+      ]
     }
+
+  # 意图编排 prompt：基于已识别的 intents 列表，决策关系与执行顺序
+  # 占位符：{{intents_list}} 已识别的意图列表（含索引）
+  intent_orchestration: |
+    你是意图编排决策引擎。请基于【用户输入】和已识别的【意图列表】，决策意图间的关系与执行顺序。
+
+    【意图列表】
+    {{intents_list}}
+
+    【关系类型】
+    - independent: 各意图互不依赖，可独立并行执行
+    - related_fixed: 意图间有固定先后依赖（如必须先查数据才能画图），需给出执行顺序
+    - related_dynamic: 意图间依赖需根据中间结果动态决策
+
+    【决策规则】
+    1. 单意图直接 independent，execution_order 为空数组
+    2. 多意图判断是否有依赖关系；无依赖则 independent，execution_order 为空数组
+    3. 若 related_fixed，需给出执行顺序 execution_order（意图列表的 0-based 索引排列，先执行的索引排前面）
+    4. 若 related_dynamic，execution_order 为空数组（由 ReAct 动态决策）
+
+    【输出格式】严格 JSON，不要 markdown 标记：
+    {"relation": "independent | related_fixed | related_dynamic", "execution_order": [0,1,2]}
 
   # ReAct 推理 prompt：思维链每一步的决策
   # 占位符：{{task}} 任务描述，{{scratch}} 已有的推理链，{{available_actions}} 可用动作

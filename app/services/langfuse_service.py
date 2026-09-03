@@ -1,5 +1,6 @@
 import logging
-from typing import Any, Optional
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional
 
 from app.config import LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST
 
@@ -37,15 +38,18 @@ class LangfuseService:
         name: str = "chat-response",
         as_type: str = "span",
         input: Any = None,
+        model: Optional[str] = None,
+        metadata: Optional[dict] = None,
     ) -> Optional[Any]:
         if not self._enabled or not self._client:
             return None
         try:
-            return self._client.start_observation(
-                name=name,
-                as_type=as_type,
-                input=input,
-            )
+            kwargs: dict = {"name": name, "as_type": as_type, "input": input}
+            if model:
+                kwargs["model"] = model
+            if metadata:
+                kwargs["metadata"] = metadata
+            return self._client.start_observation(**kwargs)
         except Exception as e:
             logger.warning("Langfuse start_observation failed: %s", e)
             return None
@@ -54,11 +58,21 @@ class LangfuseService:
         self,
         observation,
         output: Any = None,
+        usage_details: Optional[dict] = None,
+        level: Optional[str] = None,
+        status_message: Optional[str] = None,
     ) -> None:
         if not self._enabled or not observation:
             return
         try:
-            observation.update(output=output)
+            kwargs: dict = {"output": output}
+            if usage_details:
+                kwargs["usage_details"] = usage_details
+            if level:
+                kwargs["level"] = level
+            if status_message:
+                kwargs["status_message"] = status_message
+            observation.update(**kwargs)
             observation.end()
         except Exception as e:
             logger.warning("Langfuse end_observation failed: %s", e)
@@ -70,6 +84,34 @@ class LangfuseService:
             self._client.flush()
         except Exception as e:
             logger.warning("Langfuse flush failed: %s", e)
+
+    @contextmanager
+    def start_span(self, name: str, input: Any = None) -> Iterator[Optional[Any]]:
+        """启动一个 span（context manager，自动嵌套到当前活跃 observation 下）。
+
+        用 v3 SDK 的 start_as_current_observation，借助 OTel context
+        propagation 使子 span 自动成为当前活跃 span 的 child。
+        根 span 与子 span 均用此方法；根 span 需保持活跃（with 包裹主体），
+        其内启动的子 span 才能正确嵌套。
+
+        用法：
+            with langfuse_service.start_span("query-rewrite", input={...}) as span:
+                ...
+                if span:
+                    span.update(output={...})
+        未启用 langfuse 时 yield None，不报错，调用方需做 None 判断。
+        """
+        if not self._enabled or not self._client:
+            yield None
+            return
+        try:
+            with self._client.start_as_current_observation(
+                as_type="span", name=name, input=input,
+            ) as obs:
+                yield obs
+        except Exception as e:
+            logger.warning("Langfuse start_span failed: %s", e)
+            yield None
 
     def create_score(
         self,
@@ -92,3 +134,19 @@ class LangfuseService:
         except Exception as e:
             logger.warning("Langfuse create_score failed: %s", e)
             return False
+
+
+# ---- 模块级单例访问器 ----
+
+_current_instance: Optional["LangfuseService"] = None
+
+
+def set_current_langfuse(svc: "LangfuseService") -> None:
+    """在 main.py lifespan 中注册，供 chat_complete 等不便无法逐层传参的场景使用。"""
+    global _current_instance
+    _current_instance = svc
+
+
+def get_current_langfuse() -> Optional["LangfuseService"]:
+    """取当前已注册的 LangfuseService 实例，未注册返回 None。"""
+    return _current_instance

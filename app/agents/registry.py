@@ -1,26 +1,24 @@
 """智能体注册表：加载配置，按智能体绑定的 skill 子集组装独立 Toolkit 并缓存。
 
 设计要点：
-- 系统启动时一次性加载所有可用 skill（复用 LocalWorkspace 机制）
+- 系统启动时一次性加载所有可用 skill（按工作区机制装载）
 - 每个智能体按其 skills 配置，从全量 skill 中筛选出子集，组装独立 Toolkit
 - 这样不同智能体只能看到自己绑定的工具，实现职责隔离
 """
 import logging
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
-from agentscope.agent import Agent
+from agentscope.agent import Agent, ContextConfig, ReActConfig
 from agentscope.model import OpenAIChatModel
 from agentscope.permission import PermissionContext, PermissionMode
 from agentscope.state import AgentState
 from agentscope.tool import Toolkit
-from agentscope.workspace import LocalWorkspace
 
 from app.agents.base import AgentDefinition
 
 logger = logging.getLogger(__name__)
-
 
 def load_agent_definitions(config_path: str) -> List[AgentDefinition]:
     """从 agent_config.yml 加载所有智能体定义。"""
@@ -28,57 +26,6 @@ def load_agent_definitions(config_path: str) -> List[AgentDefinition]:
         config = yaml.safe_load(f)
     raw_agents = config.get("agents", [])
     return [AgentDefinition(**a) for a in raw_agents]
-
-
-async def load_all_skills(skill_config_path: str, workdir: str = "./my-workspace"):
-    """加载所有可用 skill，返回 (workspace, all_tools, all_skills_meta)。
-
-    复用 chat_service 中的 LocalWorkspace 加载机制，一次性把所有 skill 装入工作区，
-    后续按智能体配置筛选子集。
-    """
-    with open(skill_config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    skill_loaders = [s["directory"] for s in config.get("skills", [])]
-
-    workspace = LocalWorkspace(
-        workdir=workdir,
-        default_mcps=[],
-        skill_paths=skill_loaders,
-    )
-    await workspace.initialize()
-
-    all_tools = await workspace.list_tools()
-    all_skills_meta = await workspace.list_skills()
-    return workspace, all_tools, all_skills_meta
-
-
-async def load_skills_from_directories(
-    directories: list,
-    workdir: str = "./my-workspace",
-) -> tuple:
-    """从目录路径列表加载技能（用于运行时动态追加外部技能）。
-
-    与 load_all_skills 的区别：不依赖 skill_config.yml，
-    直接接收 Skill 目录路径列表。
-
-    Args:
-        directories: Skill 目录路径列表，如 ["./external_skills/skill_ppt"]
-        workdir: LocalWorkspace 工作目录
-
-    Returns:
-        (workspace, all_tools, all_skills_meta) 三元组
-    """
-    workspace = LocalWorkspace(
-        workdir=workdir,
-        default_mcps=[],
-        skill_paths=directories,
-    )
-    await workspace.initialize()
-
-    all_tools = await workspace.list_tools()
-    all_skills_meta = await workspace.list_skills()
-    return workspace, all_tools, all_skills_meta
 
 
 class AgentRegistry:
@@ -90,25 +37,30 @@ class AgentRegistry:
     def __init__(
         self,
         definitions: List[AgentDefinition],
-        workspace: LocalWorkspace,
+        workspace: Any,
         all_tools: list,
         all_skills_meta: list,
         create_model_fn,
+        extra_skill_names: Optional[List[str]] = None,
     ):
         """
         Args:
             definitions: 全部智能体定义
-            workspace: 已初始化的 LocalWorkspace
+            workspace: 已初始化的工作区实例
             all_tools: 工作区内全部工具
             all_skills_meta: 工作区内全部 skill 元信息
             create_model_fn: 工厂函数，签名 create_model_fn() -> OpenAIChatModel，
                              每次调用返回新的模型实例（流式模型不可复用）
+            extra_skill_names: 请求级附加技能名，union 到每个 agent 的绑定技能
+                               （无论该 agent 是否绑定该技能，都会组装进其 Toolkit）
         """
         self._defs: Dict[str, AgentDefinition] = {d.id: d for d in definitions}
         self._workspace = workspace
         self._all_tools = all_tools
         self._all_skills_meta = all_skills_meta
         self._create_model_fn = create_model_fn
+        # 请求级附加技能：组装 Toolkit 时与 agent 自身绑定技能取并集
+        self._extra_skill_names = set(extra_skill_names or [])
         # 缓存每个智能体对应的 Toolkit（按 skill 子集组装），避免重复筛选
         self._toolkits: Dict[str, Toolkit] = {}
 
@@ -122,16 +74,17 @@ class AgentRegistry:
     def _build_toolkit_for(self, definition: AgentDefinition) -> Toolkit:
         """根据智能体绑定的 skill 列表，筛选工具子集组装 Toolkit。
 
-        无 skill 的智能体（如 general_agent）返回空 Toolkit，即纯对话无工具。
+        有效绑定技能 = agent 自身绑定技能 ∪ 请求级附加技能（extra_skill_names）。
+        无任何绑定技能时返回空 Toolkit，即纯对话无工具。
         """
-        if not definition.skills:
+        # 有效绑定技能 = agent 自身绑定 ∪ 请求级附加技能
+        bound_skill_names = set(definition.skills) | self._extra_skill_names
+        if not bound_skill_names:
             return Toolkit(tools=[], skills_or_loaders=[])
-
-        # 按 skill name 匹配元信息，筛选对应工具
-        bound_skill_names = set(definition.skills)
 
         # 从 skill 元信息中筛选出绑定的 skill loader
         bound_loaders = []
+        matched_names = set()
         for meta in self._all_skills_meta:
             # skill 元信息通常含 name 字段
             meta_name = getattr(meta, "name", None) or (
@@ -139,6 +92,14 @@ class AgentRegistry:
             )
             if meta_name in bound_skill_names:
                 bound_loaders.append(meta)
+                matched_names.add(meta_name)
+
+        # 请求了但 workspace 未装载的技能 → 记 warning 跳过
+        missing = bound_skill_names - matched_names
+        if missing:
+            logger.warning(
+                f"[AgentRegistry] 技能未在 workspace 装载，已跳过: {sorted(missing)}"
+            )
 
         return Toolkit(tools=self._all_tools, skills_or_loaders=bound_loaders)
 
@@ -182,12 +143,22 @@ class AgentRegistry:
                 session_id=session_id,
                 permission_context=PermissionContext(mode=PermissionMode.BYPASS),
             )
-
+        react_config = ReActConfig()
+        react_config.max_iters = 100
         agent = Agent(
             name=definition.name,
-            system_prompt=definition.system_prompt,
+            system_prompt=definition.system_prompt
+            + f"\n注意当前工作区目录是/data/workspaces/{session_id}，你的技能文件已装载到该目录下，你只能在该目录下读/写/编辑文件，绝不允许操作目录以外的文件！"
+            + "\n用户上传的文件不会出现在工作区目录中：其内容已解析并直接附在用户问题里，请直接阅读使用，不要尝试在工作区中查找用户附件。"
+            + "\n当你生成文件时，给文件起一个英文名，不要用中文名生成文件",
             model=model,
             toolkit=toolkit,
             state=agent_state,
+            context_config=ContextConfig(
+                trigger_ratio=0.8,
+                reserve_ratio=0.1,
+                tool_result_limit=3000,
+            ),
+            react_config=react_config
         )
         return agent
