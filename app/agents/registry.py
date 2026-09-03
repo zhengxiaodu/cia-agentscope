@@ -10,7 +10,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 import yaml
-from agentscope.agent import Agent, ContextConfig
+from agentscope.agent import Agent, ContextConfig, ReActConfig
 from agentscope.model import OpenAIChatModel
 from agentscope.permission import PermissionContext, PermissionMode
 from agentscope.state import AgentState
@@ -143,7 +143,8 @@ class AgentRegistry:
                 session_id=session_id,
                 permission_context=PermissionContext(mode=PermissionMode.BYPASS),
             )
-
+        react_config = ReActConfig()
+        react_config.max_iters = 100
         agent = Agent(
             name=definition.name,
             system_prompt=definition.system_prompt
@@ -157,6 +158,7 @@ class AgentRegistry:
                 trigger_ratio=0.8,
                 reserve_ratio=0.1,
                 tool_result_limit=3000,
-            )
+            ),
+            react_config=react_config
         )
         return agent
