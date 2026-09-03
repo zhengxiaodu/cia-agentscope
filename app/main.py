@@ -34,7 +34,10 @@ from app.dao.init_mysql import init_mysql_tables
 from app.services.session_service import SessionService
 from app.services.action_audit_service import ActionAuditService
 from app.services.langfuse_service import LangfuseService
-from app.routes import auth, chat, feedback, files, health, mng_proxy, sessions, upload, action_audit
+from app.routes import (
+    auth, chat, feedback, files, health, mng_proxy, sessions, upload, action_audit,
+    policy_qa, dashboard,
+)
 
 import logging
 from app.utils.logging_setup import setup_logging
@@ -122,6 +125,26 @@ async def lifespan(app: FastAPI):
         MYSQL_USER, MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE,
     )
 
+    # ---- 制度问答（regulations）服务初始化（共用 mysql_pool 与 model_config）----
+    from app.regulations.config import resolve_regulations_model
+    from app.regulations.runtime import set_policy_qa_service
+    from app.regulations.services.kb_client import KBClient
+    from app.regulations.services.knowledge_gap_service import KnowledgeGapService
+    from app.regulations.services.policy_qa_service import PolicyQAService
+    from app.regulations.dao.knowledge_gap_dao import KnowledgeGapDAO
+
+    regulations_model_cfg = resolve_regulations_model(model_config)
+    kb_client = KBClient()
+    gap_dao = KnowledgeGapDAO(mysql_pool)
+    gap_service = KnowledgeGapService(gap_dao, regulations_model_cfg)
+    policy_qa_service = PolicyQAService(regulations_model_cfg, kb_client, gap_service)
+    app.state.regulations_kb_client = kb_client
+    app.state.regulations_gap_dao = gap_dao
+    app.state.regulations_gap_service = gap_service
+    app.state.policy_qa_service = policy_qa_service
+    set_policy_qa_service(policy_qa_service)
+    logger.info("Regulations policy-qa service initialized")
+
     # 初始化 Langfuse 追踪服务（非强依赖）
     app.state.langfuse_service = LangfuseService()
     from app.services.langfuse_service import set_current_langfuse
@@ -135,6 +158,13 @@ async def lifespan(app: FastAPI):
     app.state.chat_tasks: dict[str, asyncio.Event] = {}
 
     yield
+
+    # 关闭制度问答 KB 客户端（httpx 连接池）
+    try:
+        await kb_client.close()
+        logger.info("Regulations KB client closed")
+    except Exception:
+        logger.warning("Regulations KB client close failed", exc_info=True)
 
     # 关闭工作区管理器（停清扫 + 销毁全部容器）
     await workspace_manager.stop_sweeper()
@@ -172,6 +202,8 @@ app.include_router(sessions.router, tags=["sessions"])
 app.include_router(upload.router, tags=["upload"])
 app.include_router(mng_proxy.router, tags=["mng"])
 app.include_router(action_audit.router, tags=["action-audit"])
+app.include_router(policy_qa.router, tags=["policy-qa"])
+app.include_router(dashboard.router, tags=["dashboard"])
 
 if __name__ == "__main__":
     uvicorn.run("app.main:app", host="0.0.0.0", port=7010, reload=True)

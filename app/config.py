@@ -107,10 +107,9 @@ EXTERNAL_SKILLS_DIR = os.getenv("EXTERNAL_SKILLS_DIR", "")
 RAGFLOW_API_KEY = os.getenv("RAGFLOW_API_KEY", "")
 RAGFLOW_BASE_URL = os.getenv("RAGFLOW_BASE_URL", "")
 
-# 制度问答（policy_qa）配置
-POLICY_QA_BASE_URL = os.getenv("POLICY_QA_BASE_URL", "http://25.59.38.160:6181")
-# 权限名 → 知识库 ID 映射（JSON 格式），留空则用代码内默认映射
+# 制度问答（policy_qa）配置：权限名 → 知识库 ID 映射（JSON 格式），留空则用代码内默认映射
 # 示例: POLICY_QA_KB_MAP={"金科制度问答":"123","信科制度问答":"456"}
+# 服务本体已移植为进程内模块（app.regulations），相关配置见 app/regulations/config.py
 POLICY_QA_KB_MAP = os.getenv("POLICY_QA_KB_MAP", "")
 
 # MinerU 文档解析配置（鉴权头为 x-api-key，非 Authorization）

@@ -94,6 +94,29 @@ CREATE TABLE IF NOT EXISTS action_audit (
 
 CREATE INDEX idx_action_audit_userId ON action_audit(userId);
 
+-- 制度问答知识缺口表：记录空应答问题（kb_id+question_hash 去重，open/resolved 生命周期）
+CREATE TABLE IF NOT EXISTS knowledge_gaps (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    gap_id        VARCHAR(64) NOT NULL,
+    kb_id         VARCHAR(128) NOT NULL,
+    question      TEXT NOT NULL,
+    question_hash VARCHAR(64) NOT NULL,
+    question_type VARCHAR(64) NULL,
+    status        ENUM('open','resolved') NOT NULL DEFAULT 'open',
+    empty_count   INTEGER NOT NULL DEFAULT 1,
+    first_seen_at DATETIME NULL,
+    last_seen_at  DATETIME NULL,
+    resolved_at   DATETIME NULL,
+    resolved_by   VARCHAR(128) NULL,
+    created_at    DATETIME NULL,
+    updated_at    DATETIME NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE UNIQUE INDEX uq_gaps_gap_id ON knowledge_gaps(gap_id);
+CREATE INDEX idx_gaps_kb_id ON knowledge_gaps(kb_id);
+CREATE INDEX idx_gaps_question_hash ON knowledge_gaps(question_hash);
+CREATE INDEX idx_gaps_status ON knowledge_gaps(status);
+
 -- 兼容已存在表：追加 agent_ids 列（MySQL 8 支持 IF NOT EXISTS）
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS (agent_ids JSON NULL DEFAULT NULL);
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS (agent_ids JSON NULL DEFAULT NULL);

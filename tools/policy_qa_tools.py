@@ -1,7 +1,8 @@
 """
 制度问答（Policy QA）工具
 
-调用制度问答通用接口，将用户问题与知识库 ID 列表传入后端，阻塞返回回答正文与段落级引用文档。
+进程内调用本地制度问答服务（app.regulations.services.PolicyQAService），将用户问题
+与知识库 ID 列表传入，阻塞返回回答正文与段落级引用文档（不再远程调用独立后端）。
 
 安全性设计：
 - 权限名 → 知识库 ID 的映射逻辑在宿主进程内存中（本文件），不注入沙箱，模型不可见。
@@ -13,17 +14,13 @@ import json
 import logging
 from typing import Optional
 
-import httpx
 from agentscope.message import TextBlock
 from agentscope.tool import FunctionTool, ToolChunk
 
-from app.config import POLICY_QA_BASE_URL, POLICY_QA_KB_MAP
+from app.config import POLICY_QA_KB_MAP
 from app.services.auth_service import get_user_permissions
 
 logger = logging.getLogger(__name__)
-
-# 默认请求超时（秒）：检索 + 模型生成需数秒，留足余量
-_DEFAULT_TIMEOUT = 120.0
 
 # 默认权限名 → 知识库 ID 映射
 # 可被环境变量 POLICY_QA_KB_MAP（JSON 格式）覆盖
@@ -172,29 +169,21 @@ def create_policy_qa_tool(user_id: str, redis_client) -> FunctionTool:
         if not kb_ids:
             return _build_result("您没有制度问答权限，请联系管理员开通。")
 
-        # 3. 调用制度问答后端接口
-        base = POLICY_QA_BASE_URL.rstrip("/")
-        url = f"{base}/api/v1/policy/qa"
-        payload = {
-            "question": question,
-            "knowledge_base_ids": kb_ids,
-        }
+        # 3. 进程内调用本地制度问答服务
+        from app.regulations.runtime import get_policy_qa_service
 
         try:
-            async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
-                resp = await client.post(
-                    url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                )
-            if resp.status_code != 200:
-                return _build_result(
-                    f"制度问答接口返回错误: HTTP {resp.status_code} - {resp.text}"
-                )
+            svc = get_policy_qa_service()
+        except RuntimeError:
+            logger.warning("[policy_qa] 制度问答服务未初始化")
+            return _build_result("制度问答服务暂不可用，请稍后重试。")
 
-            data = resp.json()
-            answer = data.get("answer", "")
-            citations = data.get("citations") or []
+        try:
+            result = await svc.run_general_qa(
+                question=question, kb_ids=kb_ids, user_id=user_id, user_department="",
+            )
+            answer = result.answer
+            citations = [c.model_dump() for c in result.citations]
 
             if not answer:
                 return _build_result("未检索到相关内容，无法回答。")
@@ -208,12 +197,6 @@ def create_policy_qa_tool(user_id: str, redis_client) -> FunctionTool:
             # citations 写入 ToolChunk.metadata，由框架透传到事件层
             return _build_result(content, citations=citations)
 
-        except httpx.TimeoutException:
-            logger.exception(f"[policy_qa] 请求超时 url={url}")
-            return _build_result("制度问答请求超时，请稍后重试。")
-        except httpx.HTTPError as e:
-            logger.exception(f"[policy_qa] 网络异常 url={url}")
-            return _build_result(f"制度问答网络异常: {e}")
         except Exception as e:
             logger.exception(f"[policy_qa] 调用异常 user={user_id}")
             return _build_result(f"制度问答调用异常: {e}")
