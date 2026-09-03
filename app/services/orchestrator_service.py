@@ -25,7 +25,6 @@ from openai import AsyncOpenAI
 from agentscope.state import AgentState
 from agentscope.event import AgentEvent, ReplyStartEvent
 from agentscope.message import AssistantMsg, UserMsg
-from agentscope.tool import Bash, Read, Write, Edit, Glob, Grep
 
 from app.config import (
     AGENT_CONFIG_PATH,
@@ -33,7 +32,6 @@ from app.config import (
     SKILL_CONFIG_PATH,
     EXTERNAL_SKILLS_DIR,
     JWT_EXPIRE_HOURS,
-    WORKSPACE_BACKEND,
 )
 from app.agents.base import AgentDefinition
 from app.agents.factory import AgentFactory
@@ -41,7 +39,7 @@ from app.agents.registry import (
     AgentRegistry,
     load_agent_definitions,
 )
-from app.services.workspace_manager import DockerWorkspaceManager
+from app.services.opensandbox_workspace_manager import OpenSandboxWorkspaceManager
 from app.intent.models import Intent, IntentConfig, IntentResult
 from app.intent.rewriter import QueryRewriter
 from app.intent.recognizer import IntentRecognizer, load_intent_config
@@ -50,7 +48,11 @@ from app.orchestrator.parallel import ParallelOrchestrator
 from app.orchestrator.pipeline import PipelineOrchestrator
 from app.orchestrator.react import ReActOrchestrator
 from app.services.chat_service import create_model_from_config
-from app.services.mng_service import fetch_external_intents, merge_external_into_memory
+from app.services.mng_service import (
+    build_agent_definition_map,
+    fetch_external_intents,
+    merge_external_into_memory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +101,7 @@ class OrchestratorService:
         intent_client: AsyncOpenAI,
         intent_model_cfg: dict,
         think_prompt: str,
-        workspace_manager: DockerWorkspaceManager,
+        workspace_manager: OpenSandboxWorkspaceManager,
     ):
         self._model_config = model_config
         self._prompts = prompts
@@ -120,7 +122,7 @@ class OrchestratorService:
     async def create(
         cls,
         model_config: dict,
-        workspace_manager: DockerWorkspaceManager,
+        workspace_manager: OpenSandboxWorkspaceManager,
     ) -> "OrchestratorService":
         """工厂方法：从配置创建编排服务（仅持有不可变资源）。
 
@@ -309,6 +311,9 @@ class OrchestratorService:
             "merged_agents": merged_agents,
             "merged_skills": merged_skills,
             "default_orchestration": base_intents_raw.get("default_orchestration", {}),
+            # agent_id → 意图 definition 映射，供登录接口为
+            # agent_access 注入 description（取自 /api/intents 原始返回）
+            "agent_definitions": build_agent_definition_map(external_intents),
         }
 
     async def build_and_cache_user_config(
@@ -317,11 +322,16 @@ class OrchestratorService:
         jwt_token: str,
         permissions: dict,
         redis_client,
-    ) -> None:
+    ) -> dict:
         """登录时融合（YAML + mng 外部意图 + 权限过滤）并写入 Redis。
 
         供 /chat 会话时直接读取。失败不阻断登录：mng 不可用或 Redis
         写失败均仅记日志，会话时读取不到缓存则走 base-only 兜底。
+
+        Returns:
+            融合后的配置 dict（含 agent_definitions 映射，供登录接口
+            为 agent_access 注入 description）；_fuse_user_config 异常时
+            由调用方兜底（该异常不在此吞掉，由 auth 侧 try/except 处理）。
         """
         fused = await self._fuse_user_config(jwt_token, permissions)
         if redis_client is not None and user_id:
@@ -337,6 +347,7 @@ class OrchestratorService:
                 logger.exception(
                     f"[OrchestratorService] 缓存用户配置失败 user={user_id}"
                 )
+        return fused
 
     async def _load_cached_user_config(
         self, user_id: str, redis_client
@@ -478,6 +489,7 @@ class OrchestratorService:
             render_indicator_table, render_selectable_list,
         )
         from agentscope.tool import FunctionTool
+        from tools.md_export_tools import create_md_export_tools
         from tools.policy_qa_tools import create_policy_qa_tool
 
         # 工具层：根据后端选择 agentscope 原生工具 / OpenSandbox 桥接工具
@@ -489,21 +501,44 @@ class OrchestratorService:
         ]
         # 制度问答工具（宿主侧 FunctionTool，知识库 ID 由用户权限自动映射，不依赖工作区后端）
         policy_qa_tool = create_policy_qa_tool(user_id=user_id, redis_client=redis_client)
-        if WORKSPACE_BACKEND == "opensandbox":
-            from app.services.opensandbox_adapter import OpenSandboxToolAdapter
-            from app.services.opensandbox_tool_bridge import create_opensandbox_tools
-            # workspace 此处是 OpenSandbox Sandbox 实例
-            adapter = OpenSandboxToolAdapter(
-                workspace, workdir=f"/data/workspaces/{session_id_safe}"
-            )
-            all_tools = create_opensandbox_tools(adapter) + _chart_tools + [policy_qa_tool]
-            # 技能列表由管理器扫描沙箱内 /workspace/skills/ 获取
-            all_skills_meta = await self._workspace_manager.list_skills(
-                user_id=user_id_safe, session_id=session_id_safe
-            )
-        else:
-            all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep()] + _chart_tools + [policy_qa_tool]
-            all_skills_meta = await workspace.list_skills()
+
+        import base64
+
+        from app.services.opensandbox_adapter import OpenSandboxToolAdapter
+        from app.services.opensandbox_tool_bridge import create_opensandbox_tools
+        # workspace 此处是 OpenSandbox Sandbox 实例
+        adapter = OpenSandboxToolAdapter(
+            workspace, workdir=f"/data/workspaces/{session_id_safe}"
+        )
+
+        # Markdown 导出工具的沙箱读写闭包：文本读直接走 adapter.read；
+        # 二进制写经 base64 文本通道 + bash 解码落盘
+        # （与 opensandbox_workspace_manager.read_session_file 的二进制读取模式对称）
+        async def _sandbox_read_file(rel_path: str) -> str:
+            return await adapter.read(f"{adapter.workdir}/{rel_path}")
+
+        async def _sandbox_write_file(rel_path: str, data: bytes) -> None:
+            abs_path = f"{adapter.workdir}/{rel_path}"
+            b64_path = f"{abs_path}.b64"
+            await adapter.write(b64_path, base64.b64encode(data).decode("ascii"))
+            result = await adapter.bash(f"base64 -d '{b64_path}' > '{abs_path}'")
+            # 解码成败均清理临时 b64，避免残留进入 files_generated 快照差分
+            await adapter.bash(f"rm -f '{b64_path}'")
+            if result["exit_code"] != 0:
+                raise RuntimeError(
+                    f"base64 解码写入沙箱失败 exit={result['exit_code']} "
+                    f"stderr={result['stderr']}"
+                )
+
+        md_tools = create_md_export_tools(_sandbox_read_file, _sandbox_write_file)
+        all_tools = (
+            create_opensandbox_tools(adapter) + _chart_tools
+            + [policy_qa_tool] + md_tools
+        )
+        # 技能列表由管理器扫描沙箱内 /workspace/skills/ 获取
+        all_skills_meta = await self._workspace_manager.list_skills(
+            user_id=user_id_safe, session_id=session_id_safe
+        )
 
         # 按请求开关显隐联网搜索技能（workspace 始终装载全部技能，此处按轮次过滤）
         if not search_enabled:

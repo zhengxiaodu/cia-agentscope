@@ -1,6 +1,5 @@
 # AgentScope AI 问答系统依赖
 agentscope>=2.0.0
-aiodocker>=0.23.0
 fastapi>=0.100.0
 uvicorn>=0.31.1
 pydantic>=2.11.7
@@ -20,9 +19,12 @@ langfuse>=4.14,<5
 
 httpx>=0.27.0
 
-# OpenSandbox SDK（K8s 沙箱集群，WORKSPACE_BACKEND=opensandbox 时需要）
+# OpenSandbox SDK（K8s 沙箱集群，工作区后端）
 opensandbox>=0.1.13
 opensandbox-code-interpreter>=0.1.0
+
+# Markdown 导出工具（md_to_docx / md_to_pdf / md_to_xlsx / md_to_png）
+md-exporter>=4.0.0
 
 # 测试
 pytest>=8.0

@@ -12,6 +12,17 @@ from opensandbox.models.filesystem import WriteEntry, SearchEntry
 logger = logging.getLogger(__name__)
 
 
+def _join_log_messages(messages) -> str:
+    """拼接 SDK 日志消息列表为完整文本。
+
+    logs.stdout/stderr 是 OutputMessage 列表，沙箱按行回传且每条 m.text
+    不含换行符；直接 "".join 会把多行输出拼成一行（如 find 输出
+    './a.md./b.md./c.docx'），导致 list_session_files/stat 等解析失败。
+    故按行拼接。
+    """
+    return "\n".join(m.text for m in messages)
+
+
 class OpenSandboxToolAdapter:
     """agentscope 工具 -> OpenSandbox 操作的适配层。
 
@@ -38,8 +49,8 @@ class OpenSandboxToolAdapter:
     async def bash(self, command: str, timeout: int = 120) -> dict:
         """执行 shell 命令，返回 {stdout, stderr, exit_code}。"""
         result = await self._sandbox.commands.run(command)
-        stdout = "".join(m.text for m in result.logs.stdout)
-        stderr = "".join(m.text for m in result.logs.stderr)
+        stdout = _join_log_messages(result.logs.stdout)
+        stderr = _join_log_messages(result.logs.stderr)
         return {
             "stdout": stdout,
             "stderr": stderr,
@@ -83,7 +94,7 @@ class OpenSandboxToolAdapter:
         result = await self._sandbox.commands.run(
             f"grep -rn '{pattern}' {search_path} 2>/dev/null || true"
         )
-        return "".join(m.text for m in result.logs.stdout)
+        return _join_log_messages(result.logs.stdout)
 
     # ---- 工作区管理 ----
     async def ensure_dir(self, path: str) -> None:
@@ -94,4 +105,4 @@ class OpenSandboxToolAdapter:
         """列出目录内容。"""
         target = path or self._workdir
         result = await self._sandbox.commands.run(f"ls -la {target}")
-        return "".join(m.text for m in result.logs.stdout)
+        return _join_log_messages(result.logs.stdout)

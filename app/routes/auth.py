@@ -50,6 +50,67 @@ def error_response(code: int, msg: str) -> Dict[str, Any]:
     return {"code": code, "msg": msg, "data": {}}
 
 
+def _enrich_agent_access(permissions: dict, agent_definitions: dict) -> None:
+    """为 permissions["agent_whitelist"] 每项注入 description。
+
+    description 取自 /api/intents 中对应意图的 definition，
+    匹配键为 agent 的 id（与 merge_external_into_memory 白名单匹配一致）。
+    未匹配到 definition 的项保持原样（无该字段）。
+    对每项做 dict 拷贝后原地写回，避免污染调用方共享对象。
+    """
+    if not isinstance(agent_definitions, dict) or not agent_definitions:
+        return
+    whitelist = permissions.get("agent_whitelist")
+    if not isinstance(whitelist, list):
+        return
+    permissions["agent_whitelist"] = [
+        {**dict(item), "description": agent_definitions[item["id"]]}
+        if isinstance(item, dict) and item.get("id") in agent_definitions
+        else item
+        for item in whitelist
+    ]
+
+
+# 制度问答类智能体合并：名称含该关键字的多个智能体（金科/信科制度问答等）
+# 在返回前端时统一为一个入口，id 固定为 regulations_qa。
+_REGULATIONS_KEYWORD = "制度问答"
+_MERGED_REGULATIONS_AGENT = {
+    "id": "regulations_qa",
+    "name": "制度问答",
+    "description": "根据公司内部制度文件知识库回答问题",
+}
+
+
+def _merge_regulations_agents(agent_whitelist: list) -> list:
+    """将名称包含"制度问答"的智能体合并为单个 regulations_qa 项。
+
+    仅用于返回前端的 agent_access；Redis permissions 保持原始不变
+    （policy_qa 按原始名称映射知识库 ID）。
+    无命中时原样返回；合并项插入到首个命中原项的位置。
+    """
+    if not isinstance(agent_whitelist, list) or not agent_whitelist:
+        return agent_whitelist
+
+    first_hit_index = None
+    kept: list = []
+    for item in agent_whitelist:
+        if (
+            isinstance(item, dict)
+            and _REGULATIONS_KEYWORD in (item.get("name") or "")
+        ):
+            if first_hit_index is None:
+                first_hit_index = len(kept)
+        else:
+            kept.append(item)
+
+    if first_hit_index is None:
+        return agent_whitelist
+
+    # dict 浅拷贝，防止调用方修改返回项污染模块常量
+    kept.insert(first_hit_index, dict(_MERGED_REGULATIONS_AGENT))
+    return kept
+
+
 async def _build_auth_success(result: dict, request: Request) -> dict:
     """登录/注册成功后的统一处理：存 Redis 权限 → 生成 JWT → 构造前端响应。
 
@@ -79,6 +140,29 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
     if user_id:
         redis_client = getattr(request.app.state, "redis_client", None)
         if redis_client is not None:
+            # 登录时融合意图/智能体/技能并缓存到 Redis，供 /chat 直接读取。
+            # 先于 permissions 入库执行：成功时从融合结果中取出
+            # agent_id → 意图 definition 映射，为 agent_whitelist 注入
+            # description 后再存 Redis，使 /refresh、/api/auth/me/* 的
+            # agent_access 响应与登录保持一致。失败不阻断登录。
+            orchestrator = getattr(request.app.state, "orchestrator_service", None)
+            if orchestrator is not None:
+                try:
+                    fused = await orchestrator.build_and_cache_user_config(
+                        user_id=user_id,
+                        jwt_token=token,
+                        permissions=permissions,
+                        redis_client=redis_client,
+                    )
+                    _enrich_agent_access(
+                        permissions, fused.get("agent_definitions", {})
+                    )
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        f"[auth] 登录时融合并缓存用户 {user_id} 配置失败"
+                    )
+
             try:
                 await save_user_permissions(redis_client, user_id, permissions)
             except Exception:
@@ -88,22 +172,6 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
                     f"[auth] 保存用户 {user_id} 权限到 Redis 失败"
                 )
 
-            # 登录时融合意图/智能体/技能并缓存到 Redis，供 /chat 直接读取
-            orchestrator = getattr(request.app.state, "orchestrator_service", None)
-            if orchestrator is not None:
-                try:
-                    await orchestrator.build_and_cache_user_config(
-                        user_id=user_id,
-                        jwt_token=token,
-                        permissions=permissions,
-                        redis_client=redis_client,
-                    )
-                except Exception:
-                    import logging
-                    logging.getLogger(__name__).exception(
-                        f"[auth] 登录时融合并缓存用户 {user_id} 配置失败"
-                    )
-
     return success_response({
         "verification": True,
         "token": token,
@@ -112,7 +180,7 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
         "refresh_token": refresh_token,
         "refresh_expires_in": JWT_REFRESH_EXPIRE_DAYS * 86400,
         "user_info": user_info,
-        "agent_access": permissions["agent_whitelist"],
+        "agent_access": _merge_regulations_agents(permissions["agent_whitelist"]),
         "skill_blacklist": permissions["skill_blacklist"],
         "optional_skills": _OPTIONAL_SKILLS,
     })
@@ -187,7 +255,9 @@ async def _build_update_response(request: Request, user: dict, updates: dict) ->
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
-        "agent_access": permissions.get("agent_whitelist", []),
+        "agent_access": _merge_regulations_agents(
+            permissions.get("agent_whitelist", [])
+        ),
         "skill_blacklist": permissions.get("skill_blacklist", []),
         "optional_skills": _OPTIONAL_SKILLS,
     })
@@ -260,7 +330,9 @@ async def refresh_token(request: Request, body: RefreshRequest):
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
-        "agent_access": permissions.get("agent_whitelist", []),
+        "agent_access": _merge_regulations_agents(
+            permissions.get("agent_whitelist", [])
+        ),
         "skill_blacklist": permissions.get("skill_blacklist", []),
         "optional_skills": _OPTIONAL_SKILLS,
     })

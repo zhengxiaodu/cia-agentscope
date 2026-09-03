@@ -1,6 +1,6 @@
-"""OpenSandbox 工作区管理器：替代 DockerWorkspaceManager。
+"""OpenSandbox 工作区管理器（唯一工作区后端）。
 
-基于 OpenSandbox SDK 实现与 DockerWorkspaceManager 相同的接口：
+基于 OpenSandbox SDK 实现：
 - 按 user_id 分配可复用沙箱
 - 按 session_id 隔离工作目录
 - TTL 淘汰 + 后台 sweeper 周期清扫
@@ -55,9 +55,7 @@ class _Entry:
 
 
 class OpenSandboxWorkspaceManager:
-    """OpenSandbox 工作区管理器。
-
-    与 DockerWorkspaceManager 接口兼容，底层使用 OpenSandbox SDK。
+    """OpenSandbox 工作区管理器，底层使用 OpenSandbox SDK。
     隔离策略：同一 user_id 复用同一沙箱，不同 user_id 各自独立沙箱；
     工作路径按 session_id 隔离（沙箱内 /data/workspaces/{session_id}）。
 
@@ -386,7 +384,7 @@ class OpenSandboxWorkspaceManager:
                     rel_path = os.path.relpath(host_path, d)
                     sandbox_path = f"/workspace/skills/{skill_name}/{rel_path}"
                     try:
-                        with open(host_path, "r", encoding="utf-8") as f:
+                        with open(host_path, "rb") as f:
                             content = f.read()
                         await sbx.files.write_files([
                             WriteEntry(path=sandbox_path, data=content, mode=644)

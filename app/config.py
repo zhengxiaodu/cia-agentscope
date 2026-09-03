@@ -86,22 +86,6 @@ MNG_AUTH_URL = os.getenv("MNG_AUTH_URL", "")
 # 管理中心 - 意图与卡片地址
 MNG_INTENT_URL = os.getenv("MNG_INTENT_URL", "")
 
-# ---- 工作区后端选择 ----
-# "docker": 使用 agentscope DockerWorkspace（单机 Docker）
-# "opensandbox": 使用 OpenSandbox SDK（K8s 沙箱集群）
-WORKSPACE_BACKEND = os.getenv("WORKSPACE_BACKEND", "docker")
-
-# Docker 工作区管理器配置
-WORKSPACE_BASE_IMAGE = os.getenv("WORKSPACE_BASE_IMAGE", "python:3.13-slim")
-WORKSPACE_BASEDIR = os.getenv("WORKSPACE_BASEDIR", "/data/docker-workspaces")
-WORKSPACE_TTL = float(os.getenv("WORKSPACE_TTL", "3600"))
-WORKSPACE_RETENTION_DAYS = int(os.getenv("WORKSPACE_RETENTION_DAYS", "7"))
-WORKSPACE_CLEANUP_INTERVAL_HOURS = int(os.getenv("WORKSPACE_CLEANUP_INTERVAL_HOURS", "24"))
-
-# Python 包安装源（为空则不设置容器 env）
-PIP_INDEX_URL = os.getenv("PIP_INDEX_URL", "")
-PIP_TRUSTED_HOST = os.getenv("PIP_TRUSTED_HOST", "")
-
 # ---- OpenSandbox 沙箱配置 ----
 OPENSANDBOX_DOMAIN = os.getenv("OPENSANDBOX_DOMAIN", "localhost:9080")
 OPENSANDBOX_API_KEY = os.getenv("OPENSANDBOX_API_KEY", "")
@@ -110,6 +94,8 @@ OPENSANDBOX_USE_SERVER_PROXY = os.getenv("OPENSANDBOX_USE_SERVER_PROXY", "true")
 OPENSANDBOX_IMAGE = os.getenv("OPENSANDBOX_IMAGE", "python:3.13-slim")
 OPENSANDBOX_RESOURCE_CPU = os.getenv("OPENSANDBOX_RESOURCE_CPU", "100m")
 OPENSANDBOX_RESOURCE_MEMORY = os.getenv("OPENSANDBOX_RESOURCE_MEMORY", "128Mi")
+# 工作区空闲 TTL（秒），供 OpenSandboxWorkspaceManager 淘汰空闲沙箱
+WORKSPACE_TTL = float(os.getenv("WORKSPACE_TTL", "3600"))
 # ---- OpenSandbox 预热池配置 ----
 # 提前创建 N 个空闲沙箱，请求时直接分配（0=不启用，按需创建）
 OPENSANDBOX_POOL_SIZE = int(os.getenv("OPENSANDBOX_POOL_SIZE", "0"))
