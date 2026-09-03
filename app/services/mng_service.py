@@ -79,6 +79,35 @@ async def fetch_external_intents(jwt_token: str) -> List[dict]:
         return []
 
 
+def build_agent_definition_map(external_intents: list) -> dict:
+    """从 /api/intents 原始返回构建 agent_id → definition 映射。
+
+    供登录时为 agent_access 注入 description（值 = 对应意图的 definition）。
+    同一 agent 被多个意图关联时取首个非空 definition；
+    跳过非 dict、缺 agent/definition 的意图。
+
+    Args:
+        external_intents: fetch_external_intents 返回的原始意图列表
+
+    Returns:
+        {agent_id: definition, ...}
+    """
+    mapping: dict = {}
+    for ext in (external_intents or []):
+        if not isinstance(ext, dict):
+            continue
+        agent_data = ext.get("agent")
+        if not isinstance(agent_data, dict):
+            continue
+        agent_id = agent_data.get("id")
+        definition = ext.get("definition") or ""
+        if not agent_id or not definition:
+            continue
+        if agent_id not in mapping:
+            mapping[agent_id] = definition
+    return mapping
+
+
 def _build_whitelist_codes(agent_whitelist: list) -> set:
     """从 agent_whitelist 列表中提取所有 code，转为集合用于快速查找。
 

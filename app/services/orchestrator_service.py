@@ -48,7 +48,11 @@ from app.orchestrator.parallel import ParallelOrchestrator
 from app.orchestrator.pipeline import PipelineOrchestrator
 from app.orchestrator.react import ReActOrchestrator
 from app.services.chat_service import create_model_from_config
-from app.services.mng_service import fetch_external_intents, merge_external_into_memory
+from app.services.mng_service import (
+    build_agent_definition_map,
+    fetch_external_intents,
+    merge_external_into_memory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -307,6 +311,9 @@ class OrchestratorService:
             "merged_agents": merged_agents,
             "merged_skills": merged_skills,
             "default_orchestration": base_intents_raw.get("default_orchestration", {}),
+            # agent_id → 意图 definition 映射，供登录接口为
+            # agent_access 注入 description（取自 /api/intents 原始返回）
+            "agent_definitions": build_agent_definition_map(external_intents),
         }
 
     async def build_and_cache_user_config(
@@ -315,11 +322,16 @@ class OrchestratorService:
         jwt_token: str,
         permissions: dict,
         redis_client,
-    ) -> None:
+    ) -> dict:
         """登录时融合（YAML + mng 外部意图 + 权限过滤）并写入 Redis。
 
         供 /chat 会话时直接读取。失败不阻断登录：mng 不可用或 Redis
         写失败均仅记日志，会话时读取不到缓存则走 base-only 兜底。
+
+        Returns:
+            融合后的配置 dict（含 agent_definitions 映射，供登录接口
+            为 agent_access 注入 description）；_fuse_user_config 异常时
+            由调用方兜底（该异常不在此吞掉，由 auth 侧 try/except 处理）。
         """
         fused = await self._fuse_user_config(jwt_token, permissions)
         if redis_client is not None and user_id:
@@ -335,6 +347,7 @@ class OrchestratorService:
                 logger.exception(
                     f"[OrchestratorService] 缓存用户配置失败 user={user_id}"
                 )
+        return fused
 
     async def _load_cached_user_config(
         self, user_id: str, redis_client

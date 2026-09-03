@@ -50,6 +50,27 @@ def error_response(code: int, msg: str) -> Dict[str, Any]:
     return {"code": code, "msg": msg, "data": {}}
 
 
+def _enrich_agent_access(permissions: dict, agent_definitions: dict) -> None:
+    """为 permissions["agent_whitelist"] 每项注入 description。
+
+    description 取自 /api/intents 中对应意图的 definition，
+    匹配键为 agent 的 id（与 merge_external_into_memory 白名单匹配一致）。
+    未匹配到 definition 的项保持原样（无该字段）。
+    对每项做 dict 拷贝后原地写回，避免污染调用方共享对象。
+    """
+    if not isinstance(agent_definitions, dict) or not agent_definitions:
+        return
+    whitelist = permissions.get("agent_whitelist")
+    if not isinstance(whitelist, list):
+        return
+    permissions["agent_whitelist"] = [
+        {**dict(item), "description": agent_definitions[item["id"]]}
+        if isinstance(item, dict) and item.get("id") in agent_definitions
+        else item
+        for item in whitelist
+    ]
+
+
 async def _build_auth_success(result: dict, request: Request) -> dict:
     """登录/注册成功后的统一处理：存 Redis 权限 → 生成 JWT → 构造前端响应。
 
@@ -79,6 +100,29 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
     if user_id:
         redis_client = getattr(request.app.state, "redis_client", None)
         if redis_client is not None:
+            # 登录时融合意图/智能体/技能并缓存到 Redis，供 /chat 直接读取。
+            # 先于 permissions 入库执行：成功时从融合结果中取出
+            # agent_id → 意图 definition 映射，为 agent_whitelist 注入
+            # description 后再存 Redis，使 /refresh、/api/auth/me/* 的
+            # agent_access 响应与登录保持一致。失败不阻断登录。
+            orchestrator = getattr(request.app.state, "orchestrator_service", None)
+            if orchestrator is not None:
+                try:
+                    fused = await orchestrator.build_and_cache_user_config(
+                        user_id=user_id,
+                        jwt_token=token,
+                        permissions=permissions,
+                        redis_client=redis_client,
+                    )
+                    _enrich_agent_access(
+                        permissions, fused.get("agent_definitions", {})
+                    )
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        f"[auth] 登录时融合并缓存用户 {user_id} 配置失败"
+                    )
+
             try:
                 await save_user_permissions(redis_client, user_id, permissions)
             except Exception:
@@ -87,22 +131,6 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
                 logging.getLogger(__name__).exception(
                     f"[auth] 保存用户 {user_id} 权限到 Redis 失败"
                 )
-
-            # 登录时融合意图/智能体/技能并缓存到 Redis，供 /chat 直接读取
-            orchestrator = getattr(request.app.state, "orchestrator_service", None)
-            if orchestrator is not None:
-                try:
-                    await orchestrator.build_and_cache_user_config(
-                        user_id=user_id,
-                        jwt_token=token,
-                        permissions=permissions,
-                        redis_client=redis_client,
-                    )
-                except Exception:
-                    import logging
-                    logging.getLogger(__name__).exception(
-                        f"[auth] 登录时融合并缓存用户 {user_id} 配置失败"
-                    )
 
     return success_response({
         "verification": True,

@@ -127,6 +127,7 @@ async def test_load_config_bundle_falls_back_to_base_only_on_miss(monkeypatch):
 
     assert set(bundle) == {
         "merged_intents", "merged_agents", "merged_skills", "default_orchestration",
+        "agent_definitions",
     }
     # base-only 兜底读的是仓库内 YAML，技能配置非空
     assert bundle["merged_skills"]
