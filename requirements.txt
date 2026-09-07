@@ -18,9 +18,10 @@ gmssl>=3.2.2
 langfuse>=4.14,<5
 
 # 制度问答（regulations）：LangGraph 编排 + LangChain LLM
-langgraph>=0.2
-langchain-core>=0.3
-langchain-openai>=0.3
+# 版本下界对齐制度问答源项目（regulation）的已验证基线；代码仅直接依赖 langchain-core，不引入 langchain 元包
+langgraph>=1.2
+langchain-core>=1.3
+langchain-openai>=1.3
 
 httpx>=0.27.0
 
