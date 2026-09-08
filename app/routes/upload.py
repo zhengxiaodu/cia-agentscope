@@ -54,7 +54,7 @@ async def upload_file(
     # 后台异步解析：立即返回 file_id，解析结果稍后写入 upload_files 表
     filename = file.filename or "unknown"
     file_id = await start_background_parse(
-        request, session_id, filename, media_type, content
+        request, session_id, user_id, filename, media_type, content
     )
 
     return UploadResponse(
@@ -73,3 +73,22 @@ async def upload_file(
             "file_id": file_id,
         },
     )
+
+
+@router.get("/uploads")
+async def list_user_uploads(
+    request: Request,
+    user_id: str,
+    user: dict = Depends(current_user),
+):
+    """按 user_id 查询该用户上传过的全部文件（最新在前）。
+
+    每条记录返回 session_id / message_id / filename / media_type / file_size；
+    message_id 为 null 表示该文件尚未被对话消费。
+    """
+    dao = getattr(request.app.state, "upload_file_dao", None)
+    if dao is None:
+        raise HTTPException(status_code=500, detail="upload_file_dao 未初始化")
+
+    files = await dao.list_files_by_user(user_id)
+    return {"code": 200, "msg": "success", "data": {"files": files}}

@@ -20,7 +20,13 @@ class UploadFileDAO:
         self.pool = pool
 
     async def insert(
-        self, session_id: str, filename: str, media_type: str, parse_type: str
+        self,
+        session_id: str,
+        user_id: str,
+        filename: str,
+        media_type: str,
+        parse_type: str,
+        file_size: int,
     ) -> int:
         """插入一条 pending 记录，返回自增 id。"""
         async with self.pool.acquire() as conn:
@@ -29,9 +35,10 @@ class UploadFileDAO:
                 try:
                     await cur.execute(
                         "INSERT INTO upload_files "
-                        "(session_id, filename, media_type, parse_type, status) "
-                        "VALUES (%s, %s, %s, %s, 'pending')",
-                        (session_id, filename, media_type, parse_type),
+                        "(session_id, user_id, filename, media_type, parse_type, "
+                        "file_size, status) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, 'pending')",
+                        (session_id, user_id, filename, media_type, parse_type, file_size),
                     )
                     file_id = cur.lastrowid
                     await conn.commit()
@@ -118,3 +125,20 @@ class UploadFileDAO:
                 row = await cur.fetchone()
                 await conn.commit()
                 return row is not None
+
+    async def list_files_by_user(self, user_id: str) -> List[dict]:
+        """查询某用户上传过的全部文件（最新在前）。
+
+        返回每条记录的 session_id / message_id / filename / media_type /
+        file_size；message_id 未绑定（对话尚未消费）时为 None。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT session_id, message_id, filename, media_type, file_size "
+                    "FROM upload_files WHERE user_id = %s ORDER BY id DESC",
+                    (user_id,),
+                )
+                rows = await cur.fetchall()
+                await conn.commit()
+                return [dict(r) for r in rows]

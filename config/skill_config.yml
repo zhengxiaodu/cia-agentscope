@@ -10,4 +10,4 @@ skills:
     description: "个性化交互卡片技能，用于展示需要用户交互的个性化卡片组件。"
   - name: policy_qa
     directory: ./skills/policy_qa
-    description: "根据公司内部制度文件知识库回答问题""
+    description: "根据公司内部制度文件知识库回答问题"

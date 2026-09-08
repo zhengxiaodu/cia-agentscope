@@ -70,9 +70,11 @@ CREATE INDEX idx_session_files_session_id ON session_files(session_id);
 CREATE TABLE IF NOT EXISTS upload_files (
     id             BIGINT AUTO_INCREMENT PRIMARY KEY,
     session_id     VARCHAR(64) NOT NULL,
+    user_id        VARCHAR(64) NOT NULL DEFAULT '',
     filename       VARCHAR(255) NOT NULL,
     media_type     VARCHAR(255) NOT NULL DEFAULT '',
     parse_type     VARCHAR(16) NOT NULL DEFAULT '',
+    file_size      BIGINT NOT NULL DEFAULT 0,
     status         VARCHAR(16) NOT NULL DEFAULT 'pending',
     parsed_content MEDIUMTEXT NULL,
     error_message  VARCHAR(1024) NULL,
@@ -82,6 +84,7 @@ CREATE TABLE IF NOT EXISTS upload_files (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE INDEX idx_upload_files_session_msg ON upload_files(session_id, message_id);
+CREATE INDEX idx_upload_files_user_id ON upload_files(user_id);
 
 CREATE TABLE IF NOT EXISTS action_audit (
     id         BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -123,6 +126,14 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS (agent_ids JSON NULL DEFAULT NULL)
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS (user_id VARCHAR(64) NOT NULL DEFAULT '');
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS (success TINYINT(1) NOT NULL DEFAULT 1);
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS (tokens INT NOT NULL DEFAULT 0);
+ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (user_id VARCHAR(64) NOT NULL DEFAULT '');
+ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (file_size BIGINT NOT NULL DEFAULT 0);
+
+-- 存量回填：按所属会话反查上传者（幂等；会话已删除的孤儿记录保持空串，不误归属）
+UPDATE upload_files uf
+JOIN sessions s ON uf.session_id = s.session_id
+SET uf.user_id = s.user_id
+WHERE uf.user_id = '';
 """
 
 
