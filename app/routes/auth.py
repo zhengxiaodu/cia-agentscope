@@ -39,6 +39,11 @@ _OPTIONAL_SKILLS = [
         "nickname": "可视化图表",
         "description": "智能图表渲染技能，根据数据特征自动选择最合适的图表类型并通过工具渲染。",
     },
+    {
+        "name": "policy_qa",
+        "nickname": "制度问答",
+        "description": "根据公司内部制度文件知识库回答问题"。",
+    }
 ]
 
 
@@ -72,10 +77,10 @@ def _enrich_agent_access(permissions: dict, agent_definitions: dict) -> None:
 
 
 # 制度问答类智能体合并：名称含该关键字的多个智能体（金科/信科制度问答等）
-# 在返回前端时统一为一个入口，id 固定为 regulations_qa。
+# 在返回前端时统一为一个入口，id 固定为 regulations_agent。
 _REGULATIONS_KEYWORD = "制度问答"
 _MERGED_REGULATIONS_AGENT = {
-    "id": "regulations_qa",
+    "id": "regulations_agent",
     "name": "制度问答",
     "description": "根据公司内部制度文件知识库回答问题",
 }
