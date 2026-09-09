@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS messages (
     user_id      VARCHAR(64) NOT NULL DEFAULT '',
     success      TINYINT(1) NOT NULL DEFAULT 1,
     tokens       INT NOT NULL DEFAULT 0,
+    message_pair_id VARCHAR(64) NULL DEFAULT NULL,
+    citations       JSON NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -57,6 +59,8 @@ CREATE TABLE IF NOT EXISTS session_files (
     url          VARCHAR(512) NOT NULL,
     size         BIGINT NOT NULL DEFAULT 0,
     media_type   VARCHAR(255) NOT NULL DEFAULT 'application/octet-stream',
+    message_id     BIGINT       NULL,
+    message_pair_id VARCHAR(64) NULL,
     created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
@@ -79,6 +83,7 @@ CREATE TABLE IF NOT EXISTS upload_files (
     parsed_content MEDIUMTEXT NULL,
     error_message  VARCHAR(1024) NULL,
     message_id     BIGINT NULL,
+    message_pair_id VARCHAR(64) NULL,
     created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -128,6 +133,11 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS (success TINYINT(1) NOT NULL DEFAU
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS (tokens INT NOT NULL DEFAULT 0);
 ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (user_id VARCHAR(64) NOT NULL DEFAULT '');
 ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (file_size BIGINT NOT NULL DEFAULT 0);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS (citations JSON NULL);
+ALTER TABLE session_files ADD COLUMN IF NOT EXISTS (message_id BIGINT NULL);
+ALTER TABLE session_files ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL);
+ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL);
 
 -- 存量回填：按所属会话反查上传者（幂等；会话已删除的孤儿记录保持空串，不误归属）
 UPDATE upload_files uf

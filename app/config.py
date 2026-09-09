@@ -69,6 +69,9 @@ UPLOAD_ALLOWED_MEDIA_TYPES = [
     "audio/aac",
     "audio/ogg",
 ]
+# 生成文件持久化目录（相对项目根；沙箱会话文件在每轮结束后搬运到此目录，
+# 供会话结束后继续下载；留空则禁用持久化，下载地址回退沙箱）
+SESSION_FILES_PERSIST_DIR = os.getenv("SESSION_FILES_PERSIST_DIR", "data/session_files")
 
 # Langfuse 可观测性配置
 LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")

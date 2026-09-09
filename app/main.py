@@ -114,11 +114,12 @@ async def lifespan(app: FastAPI):
     app.state.mysql_pool = mysql_pool
     session_dao = SessionDAO(mysql_pool)
     app.state.session_dao = session_dao
-    app.state.session_service = SessionService(session_dao)
+    upload_file_dao = UploadFileDAO(mysql_pool)
+    app.state.upload_file_dao = upload_file_dao
+    app.state.session_service = SessionService(session_dao, upload_file_dao=upload_file_dao)
     action_audit_dao = ActionAuditDAO(mysql_pool)
     app.state.action_audit_dao = action_audit_dao
     app.state.action_audit_service = ActionAuditService(action_audit_dao)
-    app.state.upload_file_dao = UploadFileDAO(mysql_pool)
     logger.info(
         "Session service initialized "
         "(MySQL: %s@%s:%s/%s)",

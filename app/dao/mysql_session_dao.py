@@ -144,7 +144,7 @@ class SessionDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT role, content, timestamp, agent_ids, user_id, "
-                    "success, tokens FROM messages "
+                    "success, tokens, message_pair_id, citations FROM messages "
                     "WHERE session_id = %s ORDER BY id ASC",
                     (session_id,),
                 )
@@ -163,6 +163,8 @@ class SessionDAO:
                         "user_id": r.get("user_id", "") or "",
                         "success": bool(r.get("success", 1)),
                         "tokens": int(r.get("tokens", 0) or 0),
+                        "message_pair_id": r.get("message_pair_id"),
+                        "citations": _parse_json_list(r.get("citations")),
                     }
                     for r in rows
                 ]
@@ -172,16 +174,19 @@ class SessionDAO:
         session_id: str,
         user_id: str,
         new_messages: list[dict],
-    ) -> Optional[int]:
+    ) -> Optional[dict]:
         """向 messages 表插入消息 + 更新 sessions 元信息。
 
         若 sessions 行不存在则自动创建。
         messages 中的 agent_ids（list[str]）写入 messages.agent_ids（JSON 列），
         并累积去重合并到 sessions.agent_ids。
+        消息 dict 可携带 message_pair_id（本轮 user/assistant 共享）与
+        citations（仅 assistant，list，非空时序列化写库，否则写 NULL）。
 
         Returns:
-            本轮 user 消息的自增 id（供上传文件回填 message_id）；
-            本轮没有 user 消息或事务失败时返回 None。
+            {"user_message_id": 本轮 user 消息自增 id（供上传文件回填），
+             "assistant_message_id": 本轮 assistant 消息自增 id}；
+            本轮没有对应角色的消息时相应 id 为 None。
         """
         now = datetime.now(timezone.utc)
         now_str = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -224,8 +229,10 @@ class SessionDAO:
                             (session_id, user_id, name, now, now, agent_ids_init),
                         )
 
-                    # 2) 插入消息（含 agent_ids），记录本轮 user 消息的自增 id
+                    # 2) 插入消息（含 agent_ids），记录本轮 user/assistant
+                    #    消息的自增 id
                     user_message_id: Optional[int] = None
+                    assistant_message_id: Optional[int] = None
                     for msg in new_messages:
                         ts_raw = msg.get("timestamp", now_str)
                         if isinstance(ts_raw, str):
@@ -242,19 +249,32 @@ class SessionDAO:
                             json.dumps(msg_agent_ids, ensure_ascii=False)
                             if msg_agent_ids else None
                         )
+                        msg_pair_id = msg.get("message_pair_id")
+                        citations = msg.get("citations")
+                        citations_json = (
+                            json.dumps(citations, ensure_ascii=False)
+                            if isinstance(citations, list) and citations
+                            else None
+                        )
                         await cur.execute(
                             "INSERT INTO messages "
                             "(session_id, role, content, timestamp, agent_ids, "
-                            "user_id, success, tokens) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                            "user_id, success, tokens, message_pair_id, citations) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                             (session_id, msg.get("role", "user"),
                              msg.get("content", ""), ts, agent_ids_json,
                              msg.get("user_id", ""),
                              int(bool(msg.get("success", True))),
-                             int(msg.get("tokens", 0) or 0)),
+                             int(msg.get("tokens", 0) or 0),
+                             msg_pair_id, citations_json),
                         )
                         if msg.get("role") == "user" and user_message_id is None:
                             user_message_id = cur.lastrowid
+                        if (
+                            msg.get("role") == "assistant"
+                            and assistant_message_id is None
+                        ):
+                            assistant_message_id = cur.lastrowid
 
                     # 3) 更新 sessions 元信息
                     await cur.execute(
@@ -297,7 +317,10 @@ class SessionDAO:
                         )
 
                     await conn.commit()
-                    return user_message_id
+                    return {
+                        "user_message_id": user_message_id,
+                        "assistant_message_id": assistant_message_id,
+                    }
                 except Exception:
                     await conn.rollback()
                     raise
@@ -514,7 +537,8 @@ class SessionDAO:
     ) -> None:
         """向 session_files 表 UPSERT 文件元信息（按 (session_id, path) 去重）。
 
-        files: [{"name", "path", "url", "size", "media_type"}, ...]
+        files: [{"name", "path", "url", "size", "media_type",
+                 "message_id"（int|None）, "message_pair_id"（str|None）}, ...]
         空列表直接返回。
         """
         if not files:
@@ -526,11 +550,14 @@ class SessionDAO:
                     for f in files:
                         await cur.execute(
                             "INSERT INTO session_files "
-                            "(session_id, name, path, url, size, media_type) "
-                            "VALUES (%s, %s, %s, %s, %s, %s) "
+                            "(session_id, name, path, url, size, media_type, "
+                            "message_id, message_pair_id) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
                             "ON DUPLICATE KEY UPDATE "
                             "name = VALUES(name), url = VALUES(url), "
                             "size = VALUES(size), media_type = VALUES(media_type), "
+                            "message_id = VALUES(message_id), "
+                            "message_pair_id = VALUES(message_pair_id), "
                             "updated_at = NOW()",
                             (
                                 session_id,
@@ -539,6 +566,8 @@ class SessionDAO:
                                 f.get("url", ""),
                                 int(f.get("size", 0) or 0),
                                 f.get("media_type", "application/octet-stream"),
+                                f.get("message_id"),
+                                f.get("message_pair_id"),
                             ),
                         )
                     await conn.commit()
@@ -551,7 +580,8 @@ class SessionDAO:
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
-                    "SELECT name, path, url, size, media_type, created_at "
+                    "SELECT name, path, url, size, media_type, created_at, "
+                    "message_id, message_pair_id "
                     "FROM session_files WHERE session_id = %s ORDER BY id ASC",
                     (session_id,),
                 )
@@ -569,6 +599,8 @@ class SessionDAO:
                         )[:-3]
                         if hasattr(r["created_at"], "strftime")
                         else str(r["created_at"]),
+                        "message_id": r.get("message_id"),
+                        "message_pair_id": r.get("message_pair_id"),
                     }
                     for r in rows
                 ]

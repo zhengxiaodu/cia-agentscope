@@ -265,7 +265,10 @@ def _build_request(orch=None):
     session_service = MagicMock()
     session_service.get_or_create_session = AsyncMock(return_value="sess-1")
     session_service.load_messages = AsyncMock(return_value=[])
-    session_service.append_messages = AsyncMock()
+    # append_messages 现返回 {"user_message_id", "assistant_message_id"} dict
+    session_service.append_messages = AsyncMock(return_value={
+        "user_message_id": None, "assistant_message_id": None,
+    })
     session_service.save_latest_trace_id = AsyncMock()
     request.app.state.session_service = session_service
     request.app.state.chat_tasks = {}
@@ -468,7 +471,10 @@ async def test_generate_response_output_blocked(monkeypatch):
 
     session_service = MagicMock()
     session_service.load_messages = AsyncMock(return_value=[])
-    session_service.append_messages = AsyncMock()
+    # append_messages 现返回 {"user_message_id", "assistant_message_id"} dict
+    session_service.append_messages = AsyncMock(return_value={
+        "user_message_id": None, "assistant_message_id": None,
+    })
     session_service.save_latest_trace_id = AsyncMock()
 
     events = []
@@ -537,7 +543,10 @@ async def test_generate_response_output_safe(monkeypatch):
 
     session_service = MagicMock()
     session_service.load_messages = AsyncMock(return_value=[])
-    session_service.append_messages = AsyncMock()
+    # append_messages 现返回 {"user_message_id", "assistant_message_id"} dict
+    session_service.append_messages = AsyncMock(return_value={
+        "user_message_id": None, "assistant_message_id": None,
+    })
     session_service.save_latest_trace_id = AsyncMock()
 
     events = []

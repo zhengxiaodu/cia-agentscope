@@ -95,15 +95,24 @@ class UploadFileDAO:
                 await conn.commit()
                 return [dict(r) for r in rows]
 
-    async def bind_message_id(self, session_id: str, message_id: int) -> int:
-        """把该会话全部未绑定的上传文件绑定到本轮 user 消息，返回影响行数。"""
+    async def bind_message_id(
+        self,
+        session_id: str,
+        message_id: int,
+        message_pair_id: str = None,
+    ) -> int:
+        """把该会话全部未绑定的上传文件绑定到本轮 user 消息，返回影响行数。
+
+        message_pair_id 与 message_id 一并回填（本轮问答的配对标识）。
+        """
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "UPDATE upload_files "
-                    "SET message_id = %s, updated_at = NOW() "
+                    "SET message_id = %s, message_pair_id = %s, "
+                    "updated_at = NOW() "
                     "WHERE session_id = %s AND message_id IS NULL",
-                    (message_id, session_id),
+                    (message_id, message_pair_id, session_id),
                 )
                 affected = cur.rowcount
                 await conn.commit()
@@ -142,3 +151,36 @@ class UploadFileDAO:
                 rows = await cur.fetchall()
                 await conn.commit()
                 return [dict(r) for r in rows]
+
+    async def list_files_by_session(self, session_id: str) -> List[dict]:
+        """查询某会话的全部上传文件（按上传顺序，含未被对话消费的记录）。
+
+        返回键：name / size / media_type / created_at / message_id /
+        message_pair_id；message_id、message_pair_id 未绑定（对话尚未消费）
+        时为 None。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT filename, media_type, file_size, created_at, "
+                    "message_id, message_pair_id FROM upload_files "
+                    "WHERE session_id = %s ORDER BY id ASC",
+                    (session_id,),
+                )
+                rows = await cur.fetchall()
+                await conn.commit()
+                return [
+                    {
+                        "name": r["filename"],
+                        "size": r["file_size"],
+                        "media_type": r["media_type"],
+                        "created_at": r["created_at"].strftime(
+                            "%Y-%m-%d %H:%M:%S.%f"
+                        )[:-3]
+                        if hasattr(r["created_at"], "strftime")
+                        else str(r["created_at"]),
+                        "message_id": r.get("message_id"),
+                        "message_pair_id": r.get("message_pair_id"),
+                    }
+                    for r in rows
+                ]

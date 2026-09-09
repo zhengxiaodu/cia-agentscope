@@ -6,6 +6,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 
+from app.config import SESSION_FILES_PERSIST_DIR
 from app.dependencies import current_user
 from app.services.opensandbox_workspace_manager import OpenSandboxWorkspaceManager
 
@@ -98,4 +99,46 @@ async def download_session_file(
         raise
     except Exception as e:
         logger.warning("下载文件失败: %s", e)
+        raise HTTPException(status_code=500, detail="服务器内部错误")
+
+
+@router.get("/persist-files/{session_id}/{path:path}")
+async def download_persisted_file(
+    request: Request,
+    session_id: str,
+    path: str,
+    mode: str = "download",
+    user: dict = Depends(current_user),
+):
+    """从持久化目录下载会话生成文件（沙箱过期后仍可下载）。
+
+    鉴权：依赖 current_user。文件位于 {SESSION_FILES_PERSIST_DIR}/{session_id}/{path}。
+    越权校验：session_id 拒绝 . / .. / 含斜杠；path 规范化后禁止 .. 与绝对路径。
+    mode=download 附件下载；mode=inline 内联预览（复用 /files 的行为）。
+    """
+    try:
+        # 越权校验：session_id 拒绝 . / .. / 含斜杠
+        if session_id in (".", "..") or "/" in session_id or "\\" in session_id:
+            raise HTTPException(status_code=403, detail="无权访问该路径")
+
+        # 越权校验：规范化相对路径，禁止 .. 和绝对路径（与 /files 一致）
+        rel = path.replace("\\", "/").lstrip("/")
+        if os.path.isabs(path) or rel.startswith("..") or "/.." in rel or rel == "..":
+            raise HTTPException(status_code=403, detail="无权访问该路径")
+
+        if not SESSION_FILES_PERSIST_DIR:
+            raise HTTPException(status_code=503, detail="持久化目录未配置")
+
+        full_path = os.path.join(SESSION_FILES_PERSIST_DIR, session_id, rel)
+        if not os.path.isfile(full_path):
+            raise HTTPException(status_code=404, detail="文件不存在")
+
+        media_type = mimetypes.guess_type(rel)[0] or "application/octet-stream"
+        with open(full_path, "rb") as f:
+            content = f.read()
+        return _build_file_response(content, rel, media_type, mode)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("下载持久化文件失败: %s", e)
         raise HTTPException(status_code=500, detail="服务器内部错误")
