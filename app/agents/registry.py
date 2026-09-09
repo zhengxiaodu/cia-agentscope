@@ -144,7 +144,7 @@ class AgentRegistry:
                 permission_context=PermissionContext(mode=PermissionMode.BYPASS),
             )
         react_config = ReActConfig()
-        react_config.max_iters = 100
+        react_config.max_iters = 200
         agent = Agent(
             name=definition.name,
             system_prompt=definition.system_prompt
