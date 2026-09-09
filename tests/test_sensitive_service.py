@@ -245,8 +245,8 @@ def test_build_message_replace_event_with_reason():
     assert event["type"] == "message_replace"
     assert event["stage"] == "input"
     assert event["reason"] == "触犯暴力危害关键词和语义"
-    assert "触犯暴力危害关键词和语义" in event["message"]
-    assert "请修改提问" in event["message"]
+    # 固定提示文案，不向用户透出具体命中原因
+    assert event["message"] == "您的输入中涉及安全或敏感问题，不予显示"
 
 
 def test_build_message_replace_event_without_reason():
@@ -254,7 +254,7 @@ def test_build_message_replace_event_without_reason():
     assert event["type"] == "message_replace"
     assert event["stage"] == "output"
     assert event["reason"] == ""
-    assert event["message"] == "您的内容涉及敏感词，请修改提问"
+    assert event["message"] == "您的输入中涉及安全或敏感问题，不予显示"
 
 
 # ---- /chat 入口：用户输入检测（在 generate_response 根 span 内执行） ----
