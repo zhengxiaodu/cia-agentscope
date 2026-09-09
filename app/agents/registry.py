@@ -157,7 +157,7 @@ class AgentRegistry:
             state=agent_state,
             context_config=ContextConfig(
                 trigger_ratio=0.8,
-                reserve_ratio=0.1,
+                reserve_ratio=0.4,
                 tool_result_limit=3000,
             ),
             react_config=react_config
