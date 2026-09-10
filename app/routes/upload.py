@@ -78,7 +78,6 @@ async def upload_file(
 @router.get("/uploads")
 async def list_user_uploads(
     request: Request,
-    user_id: str,
     user: dict = Depends(current_user),
 ):
     """按 user_id 查询该用户上传过的全部文件（最新在前）。
@@ -87,6 +86,7 @@ async def list_user_uploads(
     message_id 为 null 表示该文件尚未被对话消费。
     """
     dao = getattr(request.app.state, "upload_file_dao", None)
+    user_id = user.get("user_id")
     if dao is None:
         raise HTTPException(status_code=500, detail="upload_file_dao 未初始化")
 
