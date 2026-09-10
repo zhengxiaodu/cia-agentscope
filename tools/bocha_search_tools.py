@@ -26,7 +26,7 @@ _BOCHA_TIMEOUT = 15
 
 # 每条来源进入 bocha_sum 的字段（博查 WebPageValue 子集）
 _BOCHA_SUM_FIELDS = (
-    "name", "url", "snippet", "summary", "siteName", "datePublished",
+    "name", "url", "snippet", "summary", "siteName", "dateLastCrawled",
 )
 
 
