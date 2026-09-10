@@ -17,7 +17,7 @@ intents:
 
   - id: regulations_qa
     name: 制度问答
-    description: 涉及公司内部制度知识的问答，需要调用知识库
+    description: 查询金科、信科、产品中心、风控及采购部门的内部制度知识。仅限公司内部规章，不含通用法律法规或外部政策
     agent: regulations_agent
 
 
