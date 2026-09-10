@@ -11,6 +11,8 @@ class SessionMessage(BaseModel):
     user_id: str = ""
     success: bool = True
     tokens: int = 0
+    message_pair_id: Optional[str] = None
+    citations: List[Any] = []
 
 
 class SessionFile(BaseModel):
@@ -20,6 +22,17 @@ class SessionFile(BaseModel):
     size: int
     media_type: str
     created_at: Optional[str] = None
+    message_id: Optional[int] = None
+    message_pair_id: Optional[str] = None
+
+
+class SessionUploadFile(BaseModel):
+    name: str
+    size: int
+    media_type: str
+    created_at: Optional[str] = None
+    message_id: Optional[int] = None
+    message_pair_id: Optional[str] = None
 
 
 class SessionMeta(BaseModel):
@@ -43,3 +56,4 @@ class SessionDetailResponse(BaseModel):
     trace_id: Optional[str] = None
     messages: List[SessionMessage]
     files: List[SessionFile] = []
+    upload_files: List[SessionUploadFile] = []

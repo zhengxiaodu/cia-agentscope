@@ -24,6 +24,8 @@ def _make_service() -> OrchestratorService:
         orchestrator_params={},
         intent_client=MagicMock(),
         intent_model_cfg={},
+        summary_client=MagicMock(),
+        summary_model_cfg={},
         think_prompt="",
         workspace_manager=MagicMock(),
     )

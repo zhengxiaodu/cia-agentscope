@@ -1,16 +1,32 @@
+import logging
 import uuid
 from typing import Optional
 
 from agentscope.state import AgentState
 
-from app.models.session import SessionMeta, SessionMessage, SessionDetailResponse, SessionFile
+from app.models.session import (
+    SessionMeta,
+    SessionMessage,
+    SessionDetailResponse,
+    SessionFile,
+    SessionUploadFile,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class SessionService:
     """会话生命周期管理"""
 
-    def __init__(self, dao):
+    def __init__(self, dao, upload_file_dao=None):
+        """初始化会话服务。
+
+        Args:
+            dao: 会话 DAO（SessionDAO）。
+            upload_file_dao: 可选注入的上传文件 DAO（供会话详情返回上传文件列表）。
+        """
         self.dao = dao
+        self.upload_file_dao = upload_file_dao
 
     async def get_or_create_session(self, session_id: Optional[str], user_id: str) -> str:
         """获取已有 session_id 或创建新会话。"""
@@ -40,11 +56,12 @@ class SessionService:
 
     async def append_messages(
         self, session_id: str, user_id: str, messages: list[dict]
-    ) -> Optional[int]:
+    ) -> Optional[dict]:
         """向会话历史追加消息（用户输入 + 智能体输出）。
 
         Returns:
-            本轮 user 消息的自增 id（MySQL DAO；供上传文件回填 message_id）。
+            {"user_message_id": int|None, "assistant_message_id": int|None}
+            （MySQL DAO 返回；供上传文件回填 message_id 与生成文件关联 assistant 消息）。
         """
         return await self.dao.append_messages(session_id, user_id, messages)
 
@@ -98,6 +115,15 @@ class SessionService:
         raw_files = await self.dao.load_session_files(session_id)
         files = [SessionFile(**f) for f in raw_files]
 
+        # 加载该会话用户上传过的文件（含未被对话消费的记录）
+        upload_files = []
+        if self.upload_file_dao is not None:
+            try:
+                raw_uploads = await self.upload_file_dao.list_files_by_session(session_id)
+                upload_files = [SessionUploadFile(**u) for u in raw_uploads]
+            except Exception:
+                logger.warning("[session_service] 加载会话上传文件失败", exc_info=True)
+
         return SessionDetailResponse(
             session_id=session_id,
             created_at=meta.get("created_at", ""),
@@ -105,4 +131,5 @@ class SessionService:
             trace_id=meta.get("latest_trace_id"),
             messages=messages,
             files=files,
+            upload_files=upload_files,
         )

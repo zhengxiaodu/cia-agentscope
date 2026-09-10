@@ -31,8 +31,8 @@ class _FakeUploadDao:
             raise self.exc
         return self.rows
 
-    async def bind_message_id(self, session_id, message_id):
-        self.bind_calls.append((session_id, message_id))
+    async def bind_message_id(self, session_id, message_id, message_pair_id=None):
+        self.bind_calls.append((session_id, message_id, message_pair_id))
         return len(self.bind_calls)
 
 
@@ -112,9 +112,13 @@ def test_append_upload_context_empty_ctx_untouched():
 # _persist_conversation_history：问答结束回填 message_id
 # ---------------------------------------------------------------------------
 
-def _make_session_service(user_message_id=101):
+def _make_session_service(user_message_id=101, assistant_message_id=102):
+    """append_messages 现返回 {"user_message_id", "assistant_message_id"} dict。"""
     svc = MagicMock()
-    svc.append_messages = AsyncMock(return_value=user_message_id)
+    svc.append_messages = AsyncMock(return_value={
+        "user_message_id": user_message_id,
+        "assistant_message_id": assistant_message_id,
+    })
     return svc
 
 
@@ -128,8 +132,10 @@ async def test_persist_binds_user_message_id():
     await _persist_conversation_history(
         None, session_service, "s1", "u1", _MESSAGES, "回答内容",
         upload_file_dao=dao,
+        message_pair_id="pair-1",
     )
-    assert dao.bind_calls == [("s1", 101)]
+    # bind_message_id 三参调用：session_id + user_message_id + message_pair_id
+    assert dao.bind_calls == [("s1", 101, "pair-1")]
 
 
 @pytest.mark.asyncio
@@ -163,7 +169,8 @@ async def test_persist_swallows_bind_exception():
         None, session_service, "s1", "u1", _MESSAGES, "回答内容",
         upload_file_dao=dao,
     )
-    dao.bind_message_id.assert_awaited_once_with("s1", 101)
+    # 未传 message_pair_id 时第三参为 None
+    dao.bind_message_id.assert_awaited_once_with("s1", 101, None)
 
 
 # ---------------------------------------------------------------------------

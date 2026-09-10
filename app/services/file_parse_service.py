@@ -244,19 +244,22 @@ async def _parse_and_store(dao, file_id: int, content: bytes, filename: str, par
 
 
 async def start_background_parse(
-    request, session_id: str, filename: str, media_type: str, content: bytes
+    request, session_id: str, user_id: str, filename: str, media_type: str, content: bytes
 ) -> int:
     """插入 pending 记录并启动后台解析任务，立即返回 file_id。
 
     Args:
         request: FastAPI Request（取 app.state.upload_file_dao）
+        user_id: 上传者（写入 upload_files.user_id，供按用户查询）
     """
     dao = getattr(request.app.state, "upload_file_dao", None)
     if dao is None:
         raise RuntimeError("upload_file_dao 未初始化（app.state.upload_file_dao 缺失）")
 
     parse_type = classify_parse_type(media_type, filename)
-    file_id = await dao.insert(session_id, filename, media_type, parse_type)
+    file_id = await dao.insert(
+        session_id, user_id, filename, media_type, parse_type, len(content)
+    )
 
     # plain_text / none 无需异步网络调用，但仍走统一后台任务保证响应延迟一致
     asyncio.create_task(

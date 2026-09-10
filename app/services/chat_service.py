@@ -12,6 +12,7 @@ import logging
 import os
 import asyncio
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional, Tuple
@@ -20,7 +21,7 @@ import yaml
 from agentscope.credential import OpenAICredential
 from agentscope.model import OpenAIChatModel
 
-from app.config import MODEL_CONFIG_PATH
+from app.config import MODEL_CONFIG_PATH, SESSION_FILES_PERSIST_DIR
 from app.services.file_change_detector import diff
 from app.services.langfuse_service import LangfuseService
 from app.services.sensitive_service import (
@@ -192,13 +193,20 @@ async def _persist_conversation_history(
     messages: List[Dict[str, Any]],
     final_output: str,
     upload_file_dao: Any = None,
-) -> None:
+    message_pair_id: Optional[str] = None,
+    citations: Optional[List[dict]] = None,
+) -> Optional[dict]:
     """持久化本轮对话历史（用户输入 + 智能体输出）。
 
     从 orchestrator_service 提取本轮参与的 agent_id 列表与成功标志，
     与 user/assistant 消息一同写入 messages 表。任何异常均静默吞掉。
+    message_pair_id 为本轮对话配对 id（user/assistant 共享）；
+    citations 为制度问答引用（随 assistant 消息落库，空则不写）。
     落库成功后把本轮 user 消息 id 回填到该会话未绑定的上传文件
     （upload_files.message_id），避免下一轮重复注入解析内容。
+
+    Returns:
+        {"user_message_id": int|None, "assistant_message_id": int|None}，失败为 None。
     """
     if not (session_service and session_id and user_id):
         missing = []
@@ -209,9 +217,9 @@ async def _persist_conversation_history(
         if not user_id:
             missing.append("user_id")
         logger.warning(f"[chat_service] 跳过持久化：{', '.join(missing)} 为空")
-        return
+        return None
 
-    user_message_id = None
+    persist_result: Optional[dict] = None
     try:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         user_input = _extract_user_input(messages)
@@ -224,6 +232,7 @@ async def _persist_conversation_history(
                 "user_id": user_id,
                 "success": True,
                 "tokens": _estimate_tokens(user_input),
+                "message_pair_id": message_pair_id,
             })
         if final_output:
             # 取本轮参与的 agent_id 列表（单 agent 路径=[agent_id]，多 agent 路径=编排汇总）
@@ -246,18 +255,26 @@ async def _persist_conversation_history(
                 "user_id": user_id,
                 "success": last_success,
                 "tokens": _estimate_tokens(final_output),
+                "message_pair_id": message_pair_id,
+                "citations": citations if citations else None,
             })
         if new_messages:
-            user_message_id = await session_service.append_messages(
+            persist_result = await session_service.append_messages(
                 session_id, user_id, new_messages
             )
     except Exception:
         logger.exception("[chat_service] 持久化对话历史失败")
 
     # 回填上传文件的 message_id（失败仅告警，不影响主流程）
+    # isinstance 兜底：session_service 为 duck-typed 注入，非 dict 返回值不打断主流程
+    user_message_id = (
+        persist_result.get("user_message_id")
+        if isinstance(persist_result, dict)
+        else None
+    )
     if user_message_id and upload_file_dao:
         try:
-            bound = await upload_file_dao.bind_message_id(session_id, user_message_id)
+            bound = await upload_file_dao.bind_message_id(session_id, user_message_id, message_pair_id)
             if bound:
                 logger.info(
                     "[chat_service] 已绑定 %s 个上传文件到消息 %s",
@@ -266,6 +283,27 @@ async def _persist_conversation_history(
         except Exception:
             logger.warning("[chat_service] 回填上传文件 message_id 失败", exc_info=True)
 
+    return persist_result
+
+
+def _persist_file_bytes(persist_dir: str, session_id: str, rel_path: str, content: bytes) -> bool:
+    """把沙箱文件字节流写入持久化目录 {persist_dir}/{session_id}/{rel_path}。
+
+    保留 rel_path 的子目录结构；任何异常记 warning 并返回 False（调用方回退沙箱 url）。
+    """
+    try:
+        full_path = os.path.join(persist_dir, session_id, rel_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "wb") as f:
+            f.write(content)
+        return True
+    except Exception:
+        logger.warning(
+            "[chat_service] 写入持久化目录失败 session=%s rel=%s",
+            session_id, rel_path, exc_info=True,
+        )
+        return False
+
 
 async def _detect_and_emit_files(
     session_id: Optional[str],
@@ -273,11 +311,16 @@ async def _detect_and_emit_files(
     session_service: Any,
     workspace_manager: Any = None,
     user_id: str = "",
+    message_pair_id: Optional[str] = None,
+    assistant_message_id: Optional[int] = None,
 ) -> AsyncGenerator[str, None]:
     """检测本轮新文件并 yield files_generated 事件，随后持久化文件元信息。
 
     通过 workspace_manager.list_session_files/stat_session_file 读取沙箱内
-    会话目录的文件列表与大小。
+    会话目录的文件列表与大小。检测出的新文件会把字节流搬运到
+    SESSION_FILES_PERSIST_DIR/{session_id}/（配置了且成功时 url 用
+    /persist-files/...，否则回退 /files/...）；files_payload 每项携带
+    message_id（本轮 assistant 消息）与 message_pair_id。
     """
     import mimetypes
 
@@ -291,12 +334,25 @@ async def _detect_and_emit_files(
                 if size is None:
                     continue
                 media_type = mimetypes.guess_type(rel_path)[0] or "application/octet-stream"
+                # 字节流持久化：配置了持久化目录时读取沙箱文件并落盘，
+                # url 指向持久化下载接口；未配置/失败回退沙箱下载地址
+                url = f"/files/{session_id}/{rel_path}"
+                if SESSION_FILES_PERSIST_DIR:
+                    content = await workspace_manager.read_session_file(
+                        user_id, session_id, rel_path
+                    )
+                    if content is not None and _persist_file_bytes(
+                        SESSION_FILES_PERSIST_DIR, session_id, rel_path, content
+                    ):
+                        url = f"/persist-files/{session_id}/{rel_path}"
                 files_payload.append({
                     "name": os.path.basename(rel_path),
                     "path": rel_path,
-                    "url": f"/files/{session_id}/{rel_path}",
+                    "url": url,
                     "size": size,
                     "media_type": media_type,
+                    "message_id": assistant_message_id,
+                    "message_pair_id": message_pair_id,
                 })
     except Exception:
         logger.warning("[chat_service] 检测新文件失败", exc_info=True)
@@ -455,6 +511,8 @@ async def generate_response(
     history_messages = await _load_history_messages(session_service, session_id)
     full_messages = history_messages + messages
     final_output_parts: List[str] = []
+    # 制度问答引用（从编排流 policy_qa_citations 事件累积，随 assistant 消息落库）
+    collected_citations: List[dict] = []
     # 兜底输出：当无 summary 时（如 pipeline 失败终止、react 无 action 终止），
     # 用 pipeline_intercept.message / react_final.conclusion 作为 final_output，
     # 保证失败轮次也能持久化 assistant 消息
@@ -467,6 +525,8 @@ async def generate_response(
 
     # ② 快照工作目录（用于结束后检测新文件）
     before_files: set = set()
+    # 本轮对话配对 id：user/assistant 消息与生成/上传文件共享
+    message_pair_id = uuid.uuid4().hex
     if session_id:
         try:
             if workspace_manager is not None:
@@ -552,6 +612,9 @@ async def generate_response(
                         if event_type == "summary":
                             final_output_parts.append(payload.get("content", ""))
 
+                        if event_type == "policy_qa_citations":
+                            collected_citations.extend(payload.get("citations") or [])
+
                         # 兜底收集失败终止事件的文本（仅当无 summary 时才启用）
                         if event_type == "pipeline_intercept":
                             final_fallback_parts.append(payload.get("message", ""))
@@ -596,12 +659,14 @@ async def generate_response(
                     yield ev
 
             # ⑥ 持久化对话历史（用户输入 + 智能体输出）+ 回填上传文件 message_id
-            await _persist_conversation_history(
+            persist_ids = await _persist_conversation_history(
                 orchestrator_service, session_service, session_id, user_id,
                 messages, final_output,
                 upload_file_dao=getattr(
                     request.app.state, "upload_file_dao", None
                 ) if request is not None else None,
+                message_pair_id=message_pair_id,
+                citations=collected_citations,
             )
 
             # ⑦ 检测本轮新文件
@@ -609,6 +674,8 @@ async def generate_response(
                 session_id, before_files, session_service,
                 workspace_manager=workspace_manager,
                 user_id=user_id or "",
+                message_pair_id=message_pair_id,
+                assistant_message_id=(persist_ids or {}).get("assistant_message_id"),
             ):
                 yield ev
 
@@ -637,6 +704,8 @@ async def generate_response(
             await _persist_conversation_history(
                 orchestrator_service, session_service, session_id, user_id,
                 messages, final_output,
+                message_pair_id=message_pair_id,
+                citations=collected_citations,
             )
             # _persist 内部读 orchestrator_service.last_success（单例，不可信），补 UPDATE 强制失败
             if session_service and session_id and user_id:

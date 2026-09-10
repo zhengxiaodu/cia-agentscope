@@ -46,9 +46,9 @@ def _fallback(source: str, reason: str = "") -> Dict[str, Any]:
 def build_message_replace_event(result: Dict[str, Any], stage: str) -> Dict[str, Any]:
     """根据检测结果构造 message_replace 事件（命中时前端替换消息并停止接收）。"""
     reason = str(result.get("reason", "") or "").strip()
-    message = "您的内容涉及敏感词，请修改提问"
-    if reason:
-        message = f"您的内容涉及敏感词（{reason}），请修改提问"
+    message = "您的输入中涉及安全或敏感问题，不予显示"
+    # if reason:
+    #     message = f"您的内容涉及敏感词（{reason}），请修改提问"
     return {
         "type": "message_replace",
         "message": message,

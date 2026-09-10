@@ -205,8 +205,10 @@ class _FakeDao:
         self.file_id = file_id
         self.calls = []
 
-    async def insert(self, session_id, filename, media_type, parse_type):
-        self.calls.append(("insert", session_id, filename, media_type, parse_type))
+    async def insert(self, session_id, user_id, filename, media_type, parse_type, file_size):
+        self.calls.append(
+            ("insert", session_id, user_id, filename, media_type, parse_type, file_size)
+        )
         return self.file_id
 
     async def mark_parsing(self, file_id):
@@ -255,11 +257,13 @@ async def test_start_background_parse_inserts_and_schedules_task():
     request.app.state.upload_file_dao = dao
     with patch.object(fps, "_parse_and_store", AsyncMock()) as mock_parse:
         file_id = await fps.start_background_parse(
-            request, "s1", "a.pdf", "application/pdf", b"content"
+            request, "s1", "u1", "a.pdf", "application/pdf", b"content"
         )
         assert file_id == 42
-        # insert 参数正确
-        assert dao.calls[0] == ("insert", "s1", "a.pdf", "application/pdf", "mineru")
+        # insert 参数正确（含 user_id 与 file_size=len(content)）
+        assert dao.calls[0] == (
+            "insert", "s1", "u1", "a.pdf", "application/pdf", "mineru", 7
+        )
         # 等后台任务被调度执行
         await asyncio.sleep(0.01)
         mock_parse.assert_awaited_once_with(dao, 42, b"content", "a.pdf", "mineru")
@@ -270,4 +274,4 @@ async def test_start_background_parse_requires_dao():
     request = MagicMock()
     request.app.state.upload_file_dao = None
     with pytest.raises(RuntimeError):
-        await fps.start_background_parse(request, "s1", "a.pdf", "application/pdf", b"x")
+        await fps.start_background_parse(request, "s1", "u1", "a.pdf", "application/pdf", b"x")

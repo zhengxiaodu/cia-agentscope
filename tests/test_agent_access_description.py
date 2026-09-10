@@ -16,6 +16,7 @@ from app.routes.auth import (
     _build_auth_success,
     _enrich_agent_access,
     _merge_regulations_agents,
+    _normalize_agent_access,
 )
 from app.services.mng_service import build_agent_definition_map
 
@@ -162,17 +163,21 @@ class TestBuildAuthSuccess:
         agent_access = resp["data"]["agent_access"]
         by_id = {a["id"]: a for a in agent_access}
         assert by_id["999"]["description"] == "用于生成精美ppt"
-        # "制度问答" 项被合并为统一的 regulations_qa
-        assert by_id["regulations_qa"]["description"] == (
+        # "制度问答" 项被合并为统一的 regulations_agent
+        assert by_id["regulations_agent"]["description"] == (
             _MERGED_REGULATIONS_AGENT["description"]
         )
         assert "123" not in by_id
+        # 返回前端不带 show 字段
+        assert all("show" not in a for a in agent_access)
 
         # 存 Redis 的是已 enrich 且未合并的 permissions
         saved = save_mock.await_args.args[2]
         saved_by_id = {a["id"]: a for a in saved["agent_whitelist"]}
         assert saved_by_id["999"]["description"] == "用于生成精美ppt"
         assert "123" in saved_by_id  # 原始制度问答项保留
+        # Redis 原始权限仍含 show、未做空串兜底
+        assert all("show" in a for a in saved["agent_whitelist"])
 
     @pytest.mark.asyncio
     async def test_degrade_when_orchestrator_missing(self):
@@ -185,11 +190,13 @@ class TestBuildAuthSuccess:
         # 制度问答合并为 1 项 + 生成PPT 1 项
         assert len(agent_access) == 2
         by_id = {a["id"]: a for a in agent_access}
-        # 合并项 description 为统一文案；其余项无 description
-        assert by_id["regulations_qa"]["description"] == (
+        # 合并项 description 为统一文案；其余项 description 兜底空串
+        assert by_id["regulations_agent"]["description"] == (
             _MERGED_REGULATIONS_AGENT["description"]
         )
-        assert "description" not in by_id["999"]
+        assert by_id["999"]["description"] == ""
+        # 返回前端不带 show 字段
+        assert all("show" not in a for a in agent_access)
 
     @pytest.mark.asyncio
     async def test_degrade_when_fuse_fails(self):
@@ -201,8 +208,8 @@ class TestBuildAuthSuccess:
 
         agent_access = resp["data"]["agent_access"]
         by_id = {a["id"]: a for a in agent_access}
-        assert "description" not in by_id["999"]
-        assert by_id["regulations_qa"]["description"] == (
+        assert by_id["999"]["description"] == ""
+        assert by_id["regulations_agent"]["description"] == (
             _MERGED_REGULATIONS_AGENT["description"]
         )
         # 权限仍正常保存（未 enrich、未合并）
@@ -229,7 +236,7 @@ class TestMergeRegulationsAgents:
             dict(_MERGED_REGULATIONS_AGENT),
             {"id": "999", "name": "生成PPT智能体", "show": 0},
         ]
-        assert merged[1]["id"] == "regulations_qa"
+        assert merged[1]["id"] == "regulations_agent"
         assert merged[1]["name"] == "制度问答"
         assert merged[1]["description"] == "根据公司内部制度文件知识库回答问题"
 
@@ -257,3 +264,42 @@ class TestMergeRegulationsAgents:
         whitelist = [{"id": "123", "name": "金科制度问答"}]
         _merge_regulations_agents(whitelist)
         assert whitelist == [{"id": "123", "name": "金科制度问答"}]
+
+
+# ---------- _normalize_agent_access ----------
+class TestNormalizeAgentAccess:
+    def test_fill_empty_description_and_drop_show(self):
+        items = [
+            {"id": "111", "name": "通用问答", "show": 1},
+            {"id": "999", "name": "生成PPT智能体", "show": 0, "description": "用于生成精美ppt"},
+            {"id": "222", "name": "无show无描述"},
+        ]
+        normalized = _normalize_agent_access(items)
+        assert normalized == [
+            {"id": "111", "name": "通用问答", "description": ""},
+            {"id": "999", "name": "生成PPT智能体", "description": "用于生成精美ppt"},
+            {"id": "222", "name": "无show无描述", "description": ""},
+        ]
+
+    def test_none_description_filled_with_empty_string(self):
+        assert _normalize_agent_access(
+            [{"id": "1", "name": "a", "show": 1, "description": None}]
+        ) == [{"id": "1", "name": "a", "description": ""}]
+
+    def test_keeps_other_fields(self):
+        item = {"id": "1", "name": "a", "show": 1, "extra": "keep-me"}
+        assert _normalize_agent_access([item]) == [
+            {"id": "1", "name": "a", "extra": "keep-me", "description": ""}
+        ]
+
+    def test_non_dict_items_kept_as_is(self):
+        assert _normalize_agent_access(["bad", None]) == ["bad", None]
+
+    def test_empty_and_invalid_input(self):
+        assert _normalize_agent_access([]) == []
+        assert _normalize_agent_access("not-a-list") == "not-a-list"
+
+    def test_input_not_modified(self):
+        items = [{"id": "1", "name": "a", "show": 1}]
+        _normalize_agent_access(items)
+        assert items == [{"id": "1", "name": "a", "show": 1}]

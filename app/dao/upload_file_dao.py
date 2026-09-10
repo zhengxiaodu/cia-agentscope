@@ -20,7 +20,13 @@ class UploadFileDAO:
         self.pool = pool
 
     async def insert(
-        self, session_id: str, filename: str, media_type: str, parse_type: str
+        self,
+        session_id: str,
+        user_id: str,
+        filename: str,
+        media_type: str,
+        parse_type: str,
+        file_size: int,
     ) -> int:
         """插入一条 pending 记录，返回自增 id。"""
         async with self.pool.acquire() as conn:
@@ -29,9 +35,10 @@ class UploadFileDAO:
                 try:
                     await cur.execute(
                         "INSERT INTO upload_files "
-                        "(session_id, filename, media_type, parse_type, status) "
-                        "VALUES (%s, %s, %s, %s, 'pending')",
-                        (session_id, filename, media_type, parse_type),
+                        "(session_id, user_id, filename, media_type, parse_type, "
+                        "file_size, status) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, 'pending')",
+                        (session_id, user_id, filename, media_type, parse_type, file_size),
                     )
                     file_id = cur.lastrowid
                     await conn.commit()
@@ -88,15 +95,24 @@ class UploadFileDAO:
                 await conn.commit()
                 return [dict(r) for r in rows]
 
-    async def bind_message_id(self, session_id: str, message_id: int) -> int:
-        """把该会话全部未绑定的上传文件绑定到本轮 user 消息，返回影响行数。"""
+    async def bind_message_id(
+        self,
+        session_id: str,
+        message_id: int,
+        message_pair_id: str = None,
+    ) -> int:
+        """把该会话全部未绑定的上传文件绑定到本轮 user 消息，返回影响行数。
+
+        message_pair_id 与 message_id 一并回填（本轮问答的配对标识）。
+        """
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "UPDATE upload_files "
-                    "SET message_id = %s, updated_at = NOW() "
+                    "SET message_id = %s, message_pair_id = %s, "
+                    "updated_at = NOW() "
                     "WHERE session_id = %s AND message_id IS NULL",
-                    (message_id, session_id),
+                    (message_id, message_pair_id, session_id),
                 )
                 affected = cur.rowcount
                 await conn.commit()
@@ -118,3 +134,53 @@ class UploadFileDAO:
                 row = await cur.fetchone()
                 await conn.commit()
                 return row is not None
+
+    async def list_files_by_user(self, user_id: str) -> List[dict]:
+        """查询某用户上传过的全部文件（最新在前）。
+
+        返回每条记录的 session_id / message_id / filename / media_type /
+        file_size；message_id 未绑定（对话尚未消费）时为 None。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT session_id, message_id, filename, media_type, file_size "
+                    "FROM upload_files WHERE user_id = %s ORDER BY id DESC",
+                    (user_id,),
+                )
+                rows = await cur.fetchall()
+                await conn.commit()
+                return [dict(r) for r in rows]
+
+    async def list_files_by_session(self, session_id: str) -> List[dict]:
+        """查询某会话的全部上传文件（按上传顺序，含未被对话消费的记录）。
+
+        返回键：name / size / media_type / created_at / message_id /
+        message_pair_id；message_id、message_pair_id 未绑定（对话尚未消费）
+        时为 None。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT filename, media_type, file_size, created_at, "
+                    "message_id, message_pair_id FROM upload_files "
+                    "WHERE session_id = %s ORDER BY id ASC",
+                    (session_id,),
+                )
+                rows = await cur.fetchall()
+                await conn.commit()
+                return [
+                    {
+                        "name": r["filename"],
+                        "size": r["file_size"],
+                        "media_type": r["media_type"],
+                        "created_at": r["created_at"].strftime(
+                            "%Y-%m-%d %H:%M:%S.%f"
+                        )[:-3]
+                        if hasattr(r["created_at"], "strftime")
+                        else str(r["created_at"]),
+                        "message_id": r.get("message_id"),
+                        "message_pair_id": r.get("message_pair_id"),
+                    }
+                    for r in rows
+                ]

@@ -32,6 +32,7 @@ class TraceName(StrEnum):
     LLM_INTENT_ORCHESTRATION = "llm-intent-orchestration"
     LLM_REACT_THINK = "llm-react-think"
     LLM_RECOMMENDED_QUESTIONS = "llm-recommended-questions"
+    LLM_PARALLEL_SUMMARY = "llm-parallel-summary"
     LLM_AGENT_CALL = "llm-{model_name}"
 
     # ---- 工具（tool 类型）----

@@ -39,6 +39,11 @@ _OPTIONAL_SKILLS = [
         "nickname": "可视化图表",
         "description": "智能图表渲染技能，根据数据特征自动选择最合适的图表类型并通过工具渲染。",
     },
+    {
+        "name": "policy_qa",
+        "nickname": "制度问答",
+        "description": "根据公司内部制度文件知识库回答问题。",
+    }
 ]
 
 
@@ -72,10 +77,10 @@ def _enrich_agent_access(permissions: dict, agent_definitions: dict) -> None:
 
 
 # 制度问答类智能体合并：名称含该关键字的多个智能体（金科/信科制度问答等）
-# 在返回前端时统一为一个入口，id 固定为 regulations_qa。
+# 在返回前端时统一为一个入口，id 固定为 regulations_agent。
 _REGULATIONS_KEYWORD = "制度问答"
 _MERGED_REGULATIONS_AGENT = {
-    "id": "regulations_qa",
+    "id": "regulations_agent",
     "name": "制度问答",
     "description": "根据公司内部制度文件知识库回答问题",
 }
@@ -109,6 +114,25 @@ def _merge_regulations_agents(agent_whitelist: list) -> list:
     # dict 浅拷贝，防止调用方修改返回项污染模块常量
     kept.insert(first_hit_index, dict(_MERGED_REGULATIONS_AGENT))
     return kept
+
+
+def _normalize_agent_access(agent_access: list) -> list:
+    """返回前端前的 agent_access 统一格式：去掉 show 字段，description 兜底空串。
+
+    仅作用于响应构造层；Redis permissions 保持原始结构
+    （含 show，供权限过滤/知识库映射使用）。非 dict 项原样保留。
+    """
+    if not isinstance(agent_access, list):
+        return agent_access
+    normalized = []
+    for item in agent_access:
+        if not isinstance(item, dict):
+            normalized.append(item)
+            continue
+        cleaned = {k: v for k, v in item.items() if k != "show"}
+        cleaned["description"] = item.get("description") or ""
+        normalized.append(cleaned)
+    return normalized
 
 
 async def _build_auth_success(result: dict, request: Request) -> dict:
@@ -180,7 +204,9 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
         "refresh_token": refresh_token,
         "refresh_expires_in": JWT_REFRESH_EXPIRE_DAYS * 86400,
         "user_info": user_info,
-        "agent_access": _merge_regulations_agents(permissions["agent_whitelist"]),
+        "agent_access": _normalize_agent_access(
+            _merge_regulations_agents(permissions["agent_whitelist"])
+        ),
         "skill_blacklist": permissions["skill_blacklist"],
         "optional_skills": _OPTIONAL_SKILLS,
     })
@@ -255,8 +281,8 @@ async def _build_update_response(request: Request, user: dict, updates: dict) ->
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
-        "agent_access": _merge_regulations_agents(
-            permissions.get("agent_whitelist", [])
+        "agent_access": _normalize_agent_access(
+            _merge_regulations_agents(permissions.get("agent_whitelist", []))
         ),
         "skill_blacklist": permissions.get("skill_blacklist", []),
         "optional_skills": _OPTIONAL_SKILLS,
@@ -330,8 +356,8 @@ async def refresh_token(request: Request, body: RefreshRequest):
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
-        "agent_access": _merge_regulations_agents(
-            permissions.get("agent_whitelist", [])
+        "agent_access": _normalize_agent_access(
+            _merge_regulations_agents(permissions.get("agent_whitelist", []))
         ),
         "skill_blacklist": permissions.get("skill_blacklist", []),
         "optional_skills": _OPTIONAL_SKILLS,

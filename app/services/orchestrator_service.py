@@ -100,6 +100,8 @@ class OrchestratorService:
         orchestrator_params: dict,
         intent_client: AsyncOpenAI,
         intent_model_cfg: dict,
+        summary_client: AsyncOpenAI,
+        summary_model_cfg: dict,
         think_prompt: str,
         workspace_manager: OpenSandboxWorkspaceManager,
     ):
@@ -108,6 +110,8 @@ class OrchestratorService:
         self._orchestrator_params = orchestrator_params
         self._intent_client = intent_client
         self._intent_model_cfg = intent_model_cfg
+        self._summary_client = summary_client
+        self._summary_model_cfg = summary_model_cfg
         self._think_prompt = think_prompt
         self._workspace_manager = workspace_manager
 
@@ -134,6 +138,8 @@ class OrchestratorService:
             "intent_recognizer", default_model_cfg
         )
         intent_client = create_async_client(intent_model_cfg)
+        # 并行编排结果汇总用客户端（默认业务大模型）
+        summary_client = create_async_client(default_model_cfg)
         prompts = model_config.get("prompts", {})
 
         # 编排器参数仍从 intent_config.yml 读取一次（这些属于系统级配置，不变）
@@ -153,6 +159,8 @@ class OrchestratorService:
             orchestrator_params=orchestrator_params,
             intent_client=intent_client,
             intent_model_cfg=intent_model_cfg,
+            summary_client=summary_client,
+            summary_model_cfg=default_model_cfg,
             think_prompt=think_prompt,
             workspace_manager=workspace_manager,
         )
@@ -181,6 +189,8 @@ class OrchestratorService:
             return ParallelOrchestrator(
                 agent_factory=agent_factory,
                 timeout=self._orchestrator_params["parallel_timeout"],
+                summary_client=self._summary_client,
+                summary_model_config=self._summary_model_cfg,
             )
 
     @property
