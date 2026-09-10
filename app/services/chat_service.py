@@ -57,6 +57,10 @@ def _compute_ttft_marker(event_type: str) -> bool:
     return event_type in ("TEXT_BLOCK_DELTA", "summary")
 
 
+# 编排链路 error 事件的统一前端兜底文案（原始错误信息只进日志）
+_FRIENDLY_ERROR_MESSAGE = "抱歉，暂时无法生成回复。请重试并联系管理员"
+
+
 async def _generate_recommended_questions(
     orchestrator_service,
     user_input: str,
@@ -195,13 +199,15 @@ async def _persist_conversation_history(
     upload_file_dao: Any = None,
     message_pair_id: Optional[str] = None,
     citations: Optional[List[dict]] = None,
+    bocha_sum: Optional[List[dict]] = None,
 ) -> Optional[dict]:
     """持久化本轮对话历史（用户输入 + 智能体输出）。
 
     从 orchestrator_service 提取本轮参与的 agent_id 列表与成功标志，
     与 user/assistant 消息一同写入 messages 表。任何异常均静默吞掉。
     message_pair_id 为本轮对话配对 id（user/assistant 共享）；
-    citations 为制度问答引用（随 assistant 消息落库，空则不写）。
+    citations 为制度问答引用、bocha_sum 为博查搜索来源摘要
+    （均随 assistant 消息落库，空则不写）。
     落库成功后把本轮 user 消息 id 回填到该会话未绑定的上传文件
     （upload_files.message_id），避免下一轮重复注入解析内容。
 
@@ -257,6 +263,7 @@ async def _persist_conversation_history(
                 "tokens": _estimate_tokens(final_output),
                 "message_pair_id": message_pair_id,
                 "citations": citations if citations else None,
+                "bocha_sum": bocha_sum if bocha_sum else None,
             })
         if new_messages:
             persist_result = await session_service.append_messages(
@@ -513,6 +520,10 @@ async def generate_response(
     final_output_parts: List[str] = []
     # 制度问答引用（从编排流 policy_qa_citations 事件累积，随 assistant 消息落库）
     collected_citations: List[dict] = []
+    # 博查搜索来源摘要（从编排流 bocha_sum 事件累积，随 assistant 消息落库）
+    collected_bocha_sum: List[dict] = []
+    # 本轮编排流是否出现过 error 事件（前端文案兜底 + 落库兜底的触发标志）
+    error_occurred = False
     # 兜底输出：当无 summary 时（如 pipeline 失败终止、react 无 action 终止），
     # 用 pipeline_intercept.message / react_final.conclusion 作为 final_output，
     # 保证失败轮次也能持久化 assistant 消息
@@ -598,14 +609,39 @@ async def generate_response(
                     aborted = True
                     aborted_at_ms = int((time.perf_counter() - t0) * 1000)
                     raise asyncio.CancelledError()
-                yield event_str
+
+                # 解析提前：error 事件需替换为友好文案后再透传
+                payload = None
+                if event_str.startswith("data: ") and event_str.endswith("\n\n"):
+                    try:
+                        payload = json.loads(event_str[6:].strip())
+                    except Exception:
+                        payload = None
+                event_type = payload.get("type", "") if payload else ""
+
+                if event_type == "error":
+                    error_occurred = True
+                    logger.warning(
+                        "[chat_service] 编排错误（前端已兜底）: %s",
+                        payload.get("message", ""),
+                    )
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "error",
+                                "message": _FRIENDLY_ERROR_MESSAGE,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+                else:
+                    yield event_str
 
                 # 解析事件：提取 summary 收集输出 + 检测 CUSTOM_COMPONENT 并转发
-                try:
-                    if event_str.startswith("data: ") and event_str.endswith("\n\n"):
-                        payload = json.loads(event_str[6:].strip())
-                        event_type = payload.get("type", "")
-
+                if payload is not None:
+                    try:
                         if ttft_ms is None and _compute_ttft_marker(event_type):
                             ttft_ms = int((time.perf_counter() - t0) * 1000)
 
@@ -614,6 +650,9 @@ async def generate_response(
 
                         if event_type == "policy_qa_citations":
                             collected_citations.extend(payload.get("citations") or [])
+
+                        if event_type == "bocha_sum":
+                            collected_bocha_sum.extend(payload.get("bocha_sum") or [])
 
                         # 兜底收集失败终止事件的文本（仅当无 summary 时才启用）
                         if event_type == "pipeline_intercept":
@@ -625,13 +664,17 @@ async def generate_response(
                             delta = payload.get("delta", "")
                             for component in _extract_components_from_delta(delta):
                                 yield f"data: {json.dumps(component, ensure_ascii=False)}\n\n"
-                except Exception:
-                    logger.debug("[chat_service] 事件解析跳过", exc_info=True)
+                    except Exception:
+                        logger.debug("[chat_service] 事件解析跳过", exc_info=True)
 
             final_output = "\n".join(final_output_parts).strip()
             # 无 summary 时用失败终止事件文本兜底，保证失败轮次也有 assistant 记录
             if not final_output:
                 final_output = "\n".join(p for p in final_fallback_parts if p).strip()
+            # 报错轮兜底：无任何输出时用友好文案落库，保证会话历史该轮不空白
+            # （success=False 由编排层派生）
+            if not final_output and error_occurred:
+                final_output = _FRIENDLY_ERROR_MESSAGE
 
             # 编排流结束后的取消检查（避免后续步骤继续执行）
             if _cancelled():
@@ -667,6 +710,7 @@ async def generate_response(
                 ) if request is not None else None,
                 message_pair_id=message_pair_id,
                 citations=collected_citations,
+                bocha_sum=collected_bocha_sum,
             )
 
             # ⑦ 检测本轮新文件
@@ -706,6 +750,7 @@ async def generate_response(
                 messages, final_output,
                 message_pair_id=message_pair_id,
                 citations=collected_citations,
+                bocha_sum=collected_bocha_sum,
             )
             # _persist 内部读 orchestrator_service.last_success（单例，不可信），补 UPDATE 强制失败
             if session_service and session_id and user_id:

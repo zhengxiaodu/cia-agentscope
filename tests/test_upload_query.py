@@ -137,10 +137,13 @@ def test_uploads_401_without_jwt():
     assert resp.status_code == 401
 
 
-def test_uploads_422_when_user_id_missing():
+def test_uploads_200_without_query_params():
+    """user_id 从 JWT 解出：无 query 参数也能正常返回（旧 422 语义已废弃）。"""
     client = TestClient(_make_app())
     resp = client.get("/uploads", headers=_auth_headers())
-    assert resp.status_code == 422
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 200
 
 
 def test_uploads_200_returns_file_list():
@@ -166,7 +169,8 @@ def test_uploads_200_returns_file_list():
         assert set(item.keys()) == {
             "session_id", "message_id", "filename", "media_type", "file_size"
         }
-    dao.list_files_by_user.assert_awaited_once_with("u9")
+    # user_id 以 JWT 内的为准（query 参数被忽略）
+    dao.list_files_by_user.assert_awaited_once_with("u1")
 
 
 def test_uploads_500_when_dao_missing():

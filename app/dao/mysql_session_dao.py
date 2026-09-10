@@ -144,7 +144,8 @@ class SessionDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT role, content, timestamp, agent_ids, user_id, "
-                    "success, tokens, message_pair_id, citations FROM messages "
+                    "success, tokens, message_pair_id, citations, bocha_sum "
+                    "FROM messages "
                     "WHERE session_id = %s ORDER BY id ASC",
                     (session_id,),
                 )
@@ -165,6 +166,7 @@ class SessionDAO:
                         "tokens": int(r.get("tokens", 0) or 0),
                         "message_pair_id": r.get("message_pair_id"),
                         "citations": _parse_json_list(r.get("citations")),
+                        "bocha_sum": _parse_json_list(r.get("bocha_sum")),
                     }
                     for r in rows
                 ]
@@ -180,8 +182,9 @@ class SessionDAO:
         若 sessions 行不存在则自动创建。
         messages 中的 agent_ids（list[str]）写入 messages.agent_ids（JSON 列），
         并累积去重合并到 sessions.agent_ids。
-        消息 dict 可携带 message_pair_id（本轮 user/assistant 共享）与
-        citations（仅 assistant，list，非空时序列化写库，否则写 NULL）。
+        消息 dict 可携带 message_pair_id（本轮 user/assistant 共享）、
+        citations（制度问答引用）与 bocha_sum（博查搜索来源摘要）
+        （仅 assistant，list，非空时序列化写库，否则写 NULL）。
 
         Returns:
             {"user_message_id": 本轮 user 消息自增 id（供上传文件回填），
@@ -256,17 +259,23 @@ class SessionDAO:
                             if isinstance(citations, list) and citations
                             else None
                         )
+                        bocha_sum = msg.get("bocha_sum")
+                        bocha_sum_json = (
+                            json.dumps(bocha_sum, ensure_ascii=False)
+                            if isinstance(bocha_sum, list) and bocha_sum
+                            else None
+                        )
                         await cur.execute(
                             "INSERT INTO messages "
                             "(session_id, role, content, timestamp, agent_ids, "
-                            "user_id, success, tokens, message_pair_id, citations) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                            "user_id, success, tokens, message_pair_id, citations, bocha_sum) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                             (session_id, msg.get("role", "user"),
                              msg.get("content", ""), ts, agent_ids_json,
                              msg.get("user_id", ""),
                              int(bool(msg.get("success", True))),
                              int(msg.get("tokens", 0) or 0),
-                             msg_pair_id, citations_json),
+                             msg_pair_id, citations_json, bocha_sum_json),
                         )
                         if msg.get("role") == "user" and user_message_id is None:
                             user_message_id = cur.lastrowid

@@ -39,9 +39,12 @@ class AgentEventTracer:
         self.tool_calls = 0
         self.tool_failures = 0
         self.exceed_max_iters = False
-        # 累积从 ToolResultEndEvent.metadata 提取的 citations，
+        # 累积从 ToolResultEndEvent.metadata 提取的 citations（制度问答引用），
         # 供调用方 emit 自定义事件流。独立于 langfuse 启用状态。
         self._collected_citations: list = []
+        # 累积从 ToolResultEndEvent.metadata 提取的 bocha_sum（博查搜索来源摘要），
+        # 与 citations 同机制旁路提取。
+        self._collected_bocha_sum: list = []
 
     @property
     def _enabled(self) -> bool:
@@ -58,19 +61,24 @@ class AgentEventTracer:
             logger.debug("[AgentEventTracer] 事件埋点失败", exc_info=True)
 
     def _collect_citations(self, event: Any) -> None:
-        """从 ToolResultEndEvent.metadata 提取 citations 累积。
+        """从 ToolResultEndEvent.metadata 提取 citations 与 bocha_sum 累积。
 
         agentscope 主路径会把 ToolChunk.metadata 透传到
-        ToolResultEndEvent.metadata，任何工具把 citations 写进
-        ToolChunk.metadata 都能在此被提取。
+        ToolResultEndEvent.metadata，任何工具把 citations / bocha_sum
+        写进 ToolChunk.metadata 都能在此被提取。
         """
         try:
             if not isinstance(event, ToolResultEndEvent):
                 return
             meta = getattr(event, "metadata", None) or {}
-            meta_citations = meta.get("citations") if isinstance(meta, dict) else None
+            if not isinstance(meta, dict):
+                return
+            meta_citations = meta.get("citations")
             if isinstance(meta_citations, list) and meta_citations:
                 self._collected_citations.extend(meta_citations)
+            meta_bocha = meta.get("bocha_sum")
+            if isinstance(meta_bocha, list) and meta_bocha:
+                self._collected_bocha_sum.extend(meta_bocha)
         except Exception:
             logger.debug("[AgentEventTracer] 提取 citations 失败", exc_info=True)
 
@@ -84,6 +92,17 @@ class AgentEventTracer:
             return []
         result = self._collected_citations
         self._collected_citations = []
+        return result
+
+    def consume_bocha_sum(self) -> list:
+        """返回并清空累积的 bocha_sum（供调用方 emit 自定义事件流）。
+
+        与 consume_citations 对称：在 agent 事件流结束后调用。
+        """
+        if not self._collected_bocha_sum:
+            return []
+        result = self._collected_bocha_sum
+        self._collected_bocha_sum = []
         return result
 
     def close(self) -> None:

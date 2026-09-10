@@ -128,18 +128,20 @@ async def test_append_messages_writes_pair_id_and_citations():
     ]
     assert len(msg_inserts) == 2
     for sql, _ in msg_inserts:
-        # SQL 列清单含两个新列，占位符扩到 10 个
-        assert "message_pair_id, citations" in sql
-        assert sql.count("%s") == 10
+        # SQL 列清单含三个扩展列，占位符扩到 11 个
+        assert "message_pair_id, citations, bocha_sum" in sql
+        assert sql.count("%s") == 11
 
     user_sql, user_args = msg_inserts[0]
     asst_sql, asst_args = msg_inserts[1]
-    # user/assistant 共享同一 message_pair_id（倒数第二个参数）
-    assert user_args[-2] == "pair-1"
-    assert asst_args[-2] == "pair-1"
-    # user 消息不带 citations → None；assistant 序列化写库
+    # user/assistant 共享同一 message_pair_id（倒数第三个参数）
+    assert user_args[-3] == "pair-1"
+    assert asst_args[-3] == "pair-1"
+    # user 消息不带 citations/bocha_sum → None；assistant 序列化写库
+    assert user_args[-2] is None
+    assert asst_args[-2] == json.dumps(_CITATIONS, ensure_ascii=False)
     assert user_args[-1] is None
-    assert asst_args[-1] == json.dumps(_CITATIONS, ensure_ascii=False)
+    assert asst_args[-1] is None
     # 事务提交
     assert dao.pool.conn.committed
 
@@ -165,8 +167,45 @@ async def test_append_messages_empty_citations_written_as_none():
         if sql.startswith("INSERT INTO messages")
     ]
     assert len(msg_inserts) == 2
+    assert msg_inserts[0][1][-2] is None
+    assert msg_inserts[1][1][-2] is None
+
+
+@pytest.mark.asyncio
+async def test_append_messages_writes_bocha_sum():
+    """非空 bocha_sum（list）json.dumps 写库；空列表/None/缺键均写 NULL。
+
+    注：DAO 层对 bocha_sum 角色无关（与 citations 一致），
+    实际链路中仅 assistant 消息携带（见 chat_service._persist_conversation_history）。
+    """
+    dao, cur = _make_dao(
+        session_row={"name": "n", "agent_ids": None},
+        count_row={"cnt": 2},
+    )
+    messages = [
+        {"role": "user", "content": "搜新闻", "message_pair_id": "p"},
+        {"role": "assistant", "content": "基于搜索的回答", "message_pair_id": "p",
+         "bocha_sum": _BOCHA_SUM},
+        {"role": "assistant", "content": "无来源回答", "message_pair_id": "p",
+         "bocha_sum": []},
+        {"role": "assistant", "content": "None 回答", "message_pair_id": "p",
+         "bocha_sum": None},
+    ]
+
+    await dao.append_messages("s1", "u1", messages)
+
+    msg_inserts = [
+        (sql, args) for sql, args in cur.executed
+        if sql.startswith("INSERT INTO messages")
+    ]
+    assert len(msg_inserts) == 4
+    # user 消息（不带 bocha_sum 键）写 None
     assert msg_inserts[0][1][-1] is None
-    assert msg_inserts[1][1][-1] is None
+    # assistant 非空 bocha_sum 序列化写库
+    assert msg_inserts[1][1][-1] == json.dumps(_BOCHA_SUM, ensure_ascii=False)
+    # 空列表与 None 均写 NULL
+    assert msg_inserts[2][1][-1] is None
+    assert msg_inserts[3][1][-1] is None
 
 
 @pytest.mark.asyncio
@@ -204,39 +243,47 @@ async def test_append_messages_assistant_only_returns_none_user_id():
 # SessionDAO.load_messages：新列映射（旧记录兼容）
 # ---------------------------------------------------------------------------
 
+_BOCHA_SUM = [{"name": "网页标题", "url": "https://example.com", "snippet": "片段"}]
+
+
 @pytest.mark.asyncio
 async def test_load_messages_maps_pair_id_and_citations():
-    """旧记录 message_pair_id=None、citations=None/JSON 字符串 →
+    """旧记录 message_pair_id=None、citations/bocha_sum=None/JSON 字符串 →
     None / []；JSON 字符串解析为 list；已解析 list 原样透出。"""
     rows = [
-        # 旧 user 记录：两列均为 NULL
+        # 旧 user 记录：扩展列均为 NULL
         {"role": "user", "content": "问", "timestamp": datetime(2026, 1, 1, 12, 0, 0),
          "agent_ids": None, "user_id": "u1", "success": 1, "tokens": 3,
-         "message_pair_id": None, "citations": None},
-        # 新 assistant 记录：citations 为 JSON 字符串（aiomysql 常见形态）
+         "message_pair_id": None, "citations": None, "bocha_sum": None},
+        # 新 assistant 记录：citations/bocha_sum 为 JSON 字符串（aiomysql 常见形态）
         {"role": "assistant", "content": "答", "timestamp": datetime(2026, 1, 1, 12, 0, 1),
          "agent_ids": '["a1"]', "user_id": "u1", "success": 1, "tokens": 5,
          "message_pair_id": "pair-1",
-         "citations": json.dumps(_CITATIONS, ensure_ascii=False)},
-        # citations 已是 list（驱动解析后形态）
+         "citations": json.dumps(_CITATIONS, ensure_ascii=False),
+         "bocha_sum": json.dumps(_BOCHA_SUM, ensure_ascii=False)},
+        # citations/bocha_sum 已是 list（驱动解析后形态）
         {"role": "assistant", "content": "答2", "timestamp": datetime(2026, 1, 1, 12, 0, 2),
          "agent_ids": None, "user_id": "u1", "success": 1, "tokens": 5,
-         "message_pair_id": "pair-2", "citations": _CITATIONS},
+         "message_pair_id": "pair-2", "citations": _CITATIONS,
+         "bocha_sum": _BOCHA_SUM},
     ]
     dao, cur = _make_dao(rows=rows)
 
     result = await dao.load_messages("s1")
 
     sql, args = cur.executed[0]
-    assert "message_pair_id, citations" in sql
+    assert "message_pair_id, citations, bocha_sum" in sql
     assert args == ("s1",)
 
     assert result[0]["message_pair_id"] is None
     assert result[0]["citations"] == []
+    assert result[0]["bocha_sum"] == []
     assert result[1]["message_pair_id"] == "pair-1"
     assert result[1]["citations"] == _CITATIONS
+    assert result[1]["bocha_sum"] == _BOCHA_SUM
     assert result[2]["message_pair_id"] == "pair-2"
     assert result[2]["citations"] == _CITATIONS
+    assert result[2]["bocha_sum"] == _BOCHA_SUM
 
 
 # ---------------------------------------------------------------------------

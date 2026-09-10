@@ -174,6 +174,18 @@ class BaseOrchestrator(ABC):
                 + "\n\n"
             )
 
+        # emit 工具执行期间捕获的 bocha_sum（博查搜索来源摘要，同机制累积）
+        bocha_sum = tracer.consume_bocha_sum()
+        if bocha_sum:
+            yield (
+                "data: "
+                + json.dumps(
+                    {"type": "bocha_sum", "bocha_sum": bocha_sum},
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
+
         yield result
 
     @abstractmethod

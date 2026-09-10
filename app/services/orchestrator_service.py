@@ -545,6 +545,11 @@ class OrchestratorService:
             create_opensandbox_tools(adapter) + _chart_tools
             + [policy_qa_tool] + md_tools
         )
+        # 联网搜索工具受请求开关控制：关闭时不注入
+        # （Toolkit 的 tools 对所有 agent 全局可见，需与技能过滤同步收口）
+        if search_enabled:
+            from tools.bocha_search_tools import create_bocha_search_tool
+            all_tools.append(create_bocha_search_tool())
         # 技能列表由管理器扫描沙箱内 /workspace/skills/ 获取
         all_skills_meta = await self._workspace_manager.list_skills(
             user_id=user_id_safe, session_id=session_id_safe
@@ -763,6 +768,21 @@ class OrchestratorService:
                             {
                                 "type": "policy_qa_citations",
                                 "citations": citations,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+
+                # emit 工具执行期间捕获的 bocha_sum（博查搜索来源摘要）
+                bocha_sum = tracer.consume_bocha_sum()
+                if bocha_sum:
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "bocha_sum",
+                                "bocha_sum": bocha_sum,
                             },
                             ensure_ascii=False,
                         )

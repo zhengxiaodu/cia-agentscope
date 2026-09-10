@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS messages (
     tokens       INT NOT NULL DEFAULT 0,
     message_pair_id VARCHAR(64) NULL DEFAULT NULL,
     citations       JSON NULL,
+    bocha_sum       JSON NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -135,6 +136,7 @@ ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (user_id VARCHAR(64) NOT NULL 
 ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (file_size BIGINT NOT NULL DEFAULT 0);
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL DEFAULT NULL);
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS (citations JSON NULL);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS (bocha_sum JSON NULL);
 ALTER TABLE session_files ADD COLUMN IF NOT EXISTS (message_id BIGINT NULL);
 ALTER TABLE session_files ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL);
 ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL);

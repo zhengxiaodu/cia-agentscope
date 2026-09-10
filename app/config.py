@@ -119,6 +119,11 @@ POLICY_QA_KB_MAP = os.getenv("POLICY_QA_KB_MAP", "")
 MINERU_API_KEY = os.getenv("MINERU_API_KEY", "")
 MINERU_BASE_URL = os.getenv("MINERU_BASE_URL", "")
 
+# 博查（Bocha）网络搜索配置：Web Search API 基础地址与 API key
+# （key 留空则 bocha_web_search 工具返回未配置提示）
+BOCHA_API_BASE = os.getenv("BOCHA_API_BASE", "https://api.bocha.cn")
+BOCHA_API_KEY = os.getenv("BOCHA_API_KEY", "")
+
 # ---- 安全敏感内容检测配置 ----
 # 安全审核总开关（false 时输入输出均不做安全审核）
 SENSITIVE_ENABLED = os.getenv("SENSITIVE_ENABLED", "true").strip().lower() in (
