@@ -43,6 +43,26 @@ _OPTIONAL_SKILLS = [
         "name": "policy_qa",
         "nickname": "制度问答",
         "description": "根据公司内部制度文件知识库回答问题。",
+    },
+    {
+        "name": "dev-expert",
+        "nickname": "代码编写",
+        "description": "按照规范开发代码，覆盖软件/网站设计/代码审查/重构/Bug诊断等等",
+    },
+    {
+        "name": "deep-research",
+        "nickname": "深度调研",
+        "description": "用于系统性研究、竞品分析、方案对比、趋势分析或事实核查等等",
+    },
+    {
+        "name": "internal-comms",
+        "nickname": "撰写公司内部报告",
+        "description": "撰写各类内部通讯的技能。",
+    },
+    {
+        "name": "sn-da-excel-workflow",
+        "nickname": "表格分析处理",
+        "description": "Excel分析/数据清洗/数据统计/数据筛选等等",
     }
 ]
 
