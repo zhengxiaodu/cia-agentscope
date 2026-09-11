@@ -85,7 +85,7 @@ Agent: 调用工具 bocha_web_search，传入 query="今日科技新闻"
 - `snippet`：内容片段
 - `summary`：内容摘要
 - `siteName`：站点名称
-- `datePublished`：发布日期
+- `dateLastCrawled`：最近抓取日期
 
 ---
 

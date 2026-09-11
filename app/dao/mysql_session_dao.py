@@ -415,13 +415,15 @@ class SessionDAO:
     async def list_user_sessions(
         self,
         user_id: str,
-        limit: int = 15,
+        page: int = 1,
+        page_size: int = 15,
         pinned_limit: int = 5,
-    ) -> tuple[list[dict], list[dict]]:
-        """获取用户会话列表，返回 (top_sessions, sessions)。
+    ) -> tuple[list[dict], list[dict], int]:
+        """获取用户会话列表（分页），返回 (top_sessions, sessions, total)。
 
-        top_sessions: 置顶会话（按置顶时间降序）
-        sessions: 非置顶会话（按更新时间降序）
+        top_sessions: 置顶会话（按置顶时间降序，不参与分页）
+        sessions: 非置顶会话当前页（按更新时间降序）
+        total: 该用户非置顶会话总数（用于分页元数据）
         """
         # 置顶会话
         async with self.pool.acquire() as conn:
@@ -438,9 +440,7 @@ class SessionDAO:
                 pinned_rows = await cur.fetchall()
 
                 top_sessions = []
-                pinned_ids = set()
                 for row in pinned_rows:
-                    pinned_ids.add(row["session_id"])
                     top_sessions.append({
                         "session_id": row["session_id"],
                         "user_id": row["user_id"],
@@ -457,25 +457,30 @@ class SessionDAO:
                         "agent_ids": _parse_json_list(row.get("agent_ids")),
                     })
 
-                # 非置顶会话
-                fetch_limit = limit + len(top_sessions)
+                # 非置顶会话总数（分页元数据）
+                await cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM sessions "
+                    "WHERE user_id = %s AND is_pinned = 0",
+                    (user_id,),
+                )
+                cnt_row = await cur.fetchone()
+                total = int(cnt_row["cnt"]) if cnt_row else 0
+
+                # 非置顶会话当前页
+                offset = (page - 1) * page_size
                 await cur.execute(
                     "SELECT session_id, user_id, name, created_at, "
                     "updated_at, message_count, latest_trace_id, is_pinned, "
                     "agent_ids FROM sessions "
                     "WHERE user_id = %s AND is_pinned = 0 "
                     "ORDER BY updated_at DESC "
-                    "LIMIT %s",
-                    (user_id, fetch_limit),
+                    "LIMIT %s OFFSET %s",
+                    (user_id, page_size, offset),
                 )
                 recent_rows = await cur.fetchall()
 
                 sessions = []
                 for row in recent_rows:
-                    if row["session_id"] in pinned_ids:
-                        continue
-                    if len(sessions) >= limit:
-                        break
                     sessions.append({
                         "session_id": row["session_id"],
                         "user_id": row["user_id"],
@@ -493,7 +498,7 @@ class SessionDAO:
                     })
 
                 await conn.commit()
-                return top_sessions, sessions
+                return top_sessions, sessions, total
 
     # ================================================================
     # 置顶 / 取消置顶

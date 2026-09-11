@@ -92,14 +92,14 @@ _PAGES = [
         "snippet": "片段一",
         "summary": "摘要一",
         "siteName": "站点一",
-        "datePublished": "2026-01-01",
+        "dateLastCrawled": "2026-01-01",
         "extraField": "不应进入 bocha_sum",
     },
     {
         "name": "标题二",
         "url": "https://example.com/2",
         "snippet": "片段二",
-        # summary/siteName/datePublished 缺失 → 补空串
+        # summary/siteName/dateLastCrawled 缺失 → 补空串
     },
 ]
 
@@ -182,7 +182,7 @@ async def test_success_returns_text_and_bocha_sum_metadata(monkeypatch):
     assert len(bocha_sum) == 2
     assert bocha_sum[0] == {
         "name": "标题一", "url": "https://example.com/1", "snippet": "片段一",
-        "summary": "摘要一", "siteName": "站点一", "datePublished": "2026-01-01",
+        "summary": "摘要一", "siteName": "站点一", "dateLastCrawled": "2026-01-01",
     }
     assert bocha_sum[1]["summary"] == ""
     assert bocha_sum[1]["siteName"] == ""
