@@ -71,7 +71,7 @@ async def upload_file(
                 },
             },
             "file_id": file_id,
-            "session_id"=session_id
+            "session_id": session_id
         },
     )
 
