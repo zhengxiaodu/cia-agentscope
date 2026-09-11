@@ -95,6 +95,25 @@ class UploadFileDAO:
                 await conn.commit()
                 return [dict(r) for r in rows]
 
+    async def load_unbound_parsing(self, session_id: str) -> List[dict]:
+        """查询该会话下未绑定消息且仍在解析中（pending/parsing）的上传文件。
+
+        用于问答前轮询等待解析完成；none 类型会很快写成 completed，
+        长期停留 pending/parsing 的一般是 mineru/asr 在途任务。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT filename, parse_type FROM upload_files "
+                    "WHERE session_id = %s AND message_id IS NULL "
+                    "AND status IN ('pending', 'parsing') "
+                    "ORDER BY id",
+                    (session_id,),
+                )
+                rows = await cur.fetchall()
+                await conn.commit()
+                return [dict(r) for r in rows]
+
     async def bind_message_id(
         self,
         session_id: str,

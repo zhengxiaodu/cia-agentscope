@@ -149,3 +149,64 @@ def test_citations_aggregated_across_multiple_tool_calls(monkeypatch):
     t.on_event(FakeToolEnd("c1", "ok", metadata={"citations": [{"i": 1}]}))
     t.on_event(FakeToolEnd("c2", "ok", metadata={"citations": [{"i": 2}]}))
     assert t.consume_citations() == [{"i": 1}, {"i": 2}]
+
+
+# ---- bocha_sum 累积（博查搜索来源摘要，与 citations 同机制）----
+
+
+def test_bocha_sum_accumulated_from_metadata(monkeypatch):
+    """带 bocha_sum 的 ToolResultEndEvent 应被累积。"""
+    import app.utils.agent_event_tracer as m
+    monkeypatch.setattr(m, "ToolResultEndEvent", FakeToolEnd)
+    t, _ = _tracer()
+    bocha = [{"name": "标题", "url": "https://example.com", "snippet": "片段"}]
+    t.on_event(FakeToolEnd("c1", "ok", metadata={"bocha_sum": bocha}))
+    assert t.consume_bocha_sum() == bocha
+
+
+def test_bocha_sum_accumulated_even_when_langfuse_disabled(monkeypatch):
+    """langfuse 未启用时 bocha_sum 仍应累积（独立于埋点逻辑）。"""
+    import app.utils.agent_event_tracer as m
+    monkeypatch.setattr(m, "ToolResultEndEvent", FakeToolEnd)
+    lf = MagicMock(); lf.enabled = False
+    t = AgentEventTracer(lf, "agent-x")
+    bocha = [{"name": "标题", "url": "https://example.com"}]
+    t.on_event(FakeToolEnd("c1", "ok", metadata={"bocha_sum": bocha}))
+    assert t.consume_bocha_sum() == bocha
+
+
+def test_bocha_sum_not_collected_without_metadata(monkeypatch):
+    """无 metadata 或无 bocha_sum 字段的事件不影响累积。"""
+    import app.utils.agent_event_tracer as m
+    monkeypatch.setattr(m, "ToolResultEndEvent", FakeToolEnd)
+    t, _ = _tracer()
+    t.on_event(FakeToolEnd("c1", "ok"))  # 默认空 metadata
+    t.on_event(FakeToolEnd("c2", "ok", metadata={"citations": [{"a": 1}]}))
+    assert t.consume_bocha_sum() == []
+
+
+def test_consume_bocha_sum_clears_after_read(monkeypatch):
+    """consume_bocha_sum 二次调用返回空。"""
+    import app.utils.agent_event_tracer as m
+    monkeypatch.setattr(m, "ToolResultEndEvent", FakeToolEnd)
+    t, _ = _tracer()
+    t.on_event(FakeToolEnd("c1", "ok", metadata={"bocha_sum": [{"name": "x"}]}))
+    assert t.consume_bocha_sum() == [{"name": "x"}]
+    assert t.consume_bocha_sum() == []
+
+
+def test_bocha_sum_and_citations_coexist_in_same_metadata(monkeypatch):
+    """同一 ToolResultEndEvent.metadata 同时带 citations 与 bocha_sum 时各自累积，
+    且互不污染（consume 独立清空）。"""
+    import app.utils.agent_event_tracer as m
+    monkeypatch.setattr(m, "ToolResultEndEvent", FakeToolEnd)
+    t, _ = _tracer()
+    cites = [{"title": "制度文档", "url": "http://r"}]
+    bocha = [{"name": "网页", "url": "http://b"}]
+    t.on_event(FakeToolEnd("c1", "ok", metadata={
+        "citations": cites, "bocha_sum": bocha,
+    }))
+    assert t.consume_bocha_sum() == bocha
+    assert t.consume_citations() == cites
+    assert t.consume_bocha_sum() == []
+    assert t.consume_citations() == []

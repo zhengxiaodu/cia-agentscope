@@ -15,6 +15,8 @@
 import asyncio
 import json
 import logging
+import time
+import uuid
 from contextlib import contextmanager
 from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional
 
@@ -23,7 +25,12 @@ from fastapi import Request
 from openai import AsyncOpenAI
 
 from agentscope.state import AgentState
-from agentscope.event import AgentEvent, ReplyStartEvent
+from agentscope.event import (
+    AgentEvent,
+    ReplyStartEvent,
+    ToolCallStartEvent,
+    ToolCallEndEvent,
+)
 from agentscope.message import AssistantMsg, UserMsg
 
 from app.config import (
@@ -69,6 +76,18 @@ _HISTORY_KEEP_LAST = 6
 # 上传文件解析内容注入提示词的头部标记与单文件截断上限（防超上下文）
 _UPLOAD_CTX_HEADER = "【用户上传文件解析内容】"
 _UPLOAD_CTX_MAX_CHARS = 30000
+
+# 提问时若上传文件仍在解析：轮询等待的总超时与间隔（秒）。
+# 超时后不再等待，改为在提示词中注入解析失败提示。
+_UPLOAD_WAIT_TIMEOUT = 15.0
+_UPLOAD_WAIT_POLL_INTERVAL = 1.0
+
+# 等待超时后仍在解析中的文件，按 parse_type 注入的失败提示文案
+_UPLOAD_PARSE_TIMEOUT_HINTS = {
+    "mineru": "解析超时，MinerU服务暂时无法解析该文件",
+    "asr": "解析超时，音频解析服务暂时无法解析该文件",
+}
+_UPLOAD_PARSE_TIMEOUT_HINT_DEFAULT = "解析超时，暂时无法解析该文件"
 
 
 @contextmanager
@@ -545,6 +564,11 @@ class OrchestratorService:
             create_opensandbox_tools(adapter) + _chart_tools
             + [policy_qa_tool] + md_tools
         )
+        # 联网搜索工具受请求开关控制：关闭时不注入
+        # （Toolkit 的 tools 对所有 agent 全局可见，需与技能过滤同步收口）
+        if search_enabled:
+            from tools.bocha_search_tools import create_bocha_search_tool
+            all_tools.append(create_bocha_search_tool())
         # 技能列表由管理器扫描沙箱内 /workspace/skills/ 获取
         all_skills_meta = await self._workspace_manager.list_skills(
             user_id=user_id_safe, session_id=session_id_safe
@@ -769,6 +793,21 @@ class OrchestratorService:
                         + "\n\n"
                     )
 
+                # emit 工具执行期间捕获的 bocha_sum（博查搜索来源摘要）
+                bocha_sum = tracer.consume_bocha_sum()
+                if bocha_sum:
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "bocha_sum",
+                                "bocha_sum": bocha_sum,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+
                 # 记录本轮参与的 agent_id + 成功标志
                 self._last_agent_ids = [agent_id]
                 self._last_success = True
@@ -894,6 +933,61 @@ class OrchestratorService:
             elif not ws_task.cancelled():
                 ws_task.exception()
 
+    async def _wait_for_upload_parsing(
+        self, request: Any, session_id: Optional[str]
+    ) -> AsyncGenerator[str, None]:
+        """存在解析中的未绑定上传文件时，轮询等待其完成（最多 _UPLOAD_WAIT_TIMEOUT 秒）。
+
+        等待期间发一对 TOOL_CALL_START/TOOL_CALL_END 事件（tool_call_name
+        "等待mineru文件解析完成"，id 随机造，仅用于前端展示）；
+        DAO 异常静默结束（不等待、不发事件），不影响问答主流程。
+        """
+        if request is None or not session_id:
+            return
+        dao = getattr(request.app.state, "upload_file_dao", None)
+        if dao is None:
+            return
+        try:
+            parsing = await dao.load_unbound_parsing(session_id)
+        except Exception:
+            logger.warning("[OrchestratorService] 查询解析中上传文件失败", exc_info=True)
+            return
+        if not parsing:
+            return
+
+        reply_id = f"upload-wait-{uuid.uuid4().hex[:12]}"
+        tool_call_id = f"upload-wait-{uuid.uuid4().hex[:12]}"
+        yield (
+            "data: "
+            + ToolCallStartEvent(
+                reply_id=reply_id,
+                tool_call_id=tool_call_id,
+                tool_call_name="等待mineru文件解析完成",
+                metadata={"files": [r.get("filename", "") for r in parsing]},
+            ).model_dump_json()
+            + "\n\n"
+        )
+        deadline = time.monotonic() + _UPLOAD_WAIT_TIMEOUT
+        while True:
+            await asyncio.sleep(_UPLOAD_WAIT_POLL_INTERVAL)
+            try:
+                parsing = await dao.load_unbound_parsing(session_id)
+            except Exception:
+                logger.warning("[OrchestratorService] 轮询解析状态失败，停止等待", exc_info=True)
+                break
+            if not parsing:
+                break
+            if time.monotonic() >= deadline:
+                break
+        yield (
+            "data: "
+            + ToolCallEndEvent(
+                reply_id=reply_id,
+                tool_call_id=tool_call_id,
+            ).model_dump_json()
+            + "\n\n"
+        )
+
     async def _load_upload_context(self, request: Any, session_id: Optional[str]) -> str:
         """检索该会话未绑定消息的上传文件解析内容，拼接为提示词片段。
 
@@ -911,13 +1005,25 @@ class OrchestratorService:
         except Exception:
             logger.warning("[OrchestratorService] 检索上传文件解析内容失败", exc_info=True)
             return ""
-        if not rows:
+        # 等待超时后仍在解析中的文件：注入解析失败提示（agent 诚实告知用户）
+        try:
+            parsing_rows = await dao.load_unbound_parsing(session_id)
+        except Exception:
+            logger.warning("[OrchestratorService] 检索解析中上传文件失败", exc_info=True)
+            parsing_rows = []
+        if not rows and not parsing_rows:
             return ""
         parts = [_UPLOAD_CTX_HEADER]
         for row in rows:
             content = (row.get("parsed_content") or "")[:_UPLOAD_CTX_MAX_CHARS]
             parts.append(f"=== 文件名: {row.get('filename', '')} ===")
             parts.append(content)
+        for row in parsing_rows:
+            hint = _UPLOAD_PARSE_TIMEOUT_HINTS.get(
+                row.get("parse_type"), _UPLOAD_PARSE_TIMEOUT_HINT_DEFAULT
+            )
+            parts.append(f"=== 文件名: {row.get('filename', '')} ===")
+            parts.append(hint)
         return "\n".join(parts)
 
     @staticmethod
@@ -969,6 +1075,9 @@ class OrchestratorService:
             if ws_err:
                 yield self._event({"type": "error", "message": ws_err})
                 return
+            # 等待解析中的上传文件（向前端发 TOOL_CALL 事件对展示等待过程）
+            async for ev in self._wait_for_upload_parsing(request, session_id):
+                yield ev
             upload_ctx = await self._load_upload_context(request, session_id)
             user_input = self._append_upload_context(user_input, upload_ctx)
             async for ev in self._run_single_agent_path(
@@ -1074,6 +1183,9 @@ class OrchestratorService:
             yield self._event({"type": "error", "message": ws_err})
             return
 
+        # 等待解析中的上传文件（向前端发 TOOL_CALL 事件对展示等待过程）
+        async for ev in self._wait_for_upload_parsing(request, session_id):
+            yield ev
         # 上传文件解析内容注入：意图识别已通过，真正进入问答阶段。
         # 附加到每个 intent 的 query（pipeline/react 均以 intent.query 作为 agent 任务输入）
         upload_ctx = await self._load_upload_context(request, session_id)

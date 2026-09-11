@@ -13,6 +13,7 @@ class SessionMessage(BaseModel):
     tokens: int = 0
     message_pair_id: Optional[str] = None
     citations: List[Any] = []
+    bocha_sum: List[Any] = []
 
 
 class SessionFile(BaseModel):

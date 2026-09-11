@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from typing import Any, Dict
 
 from app.dependencies import current_user
@@ -21,15 +21,25 @@ def _get_session_service(request: Request):
 @router.get("/sessions")
 async def list_sessions(
     request: Request,
+    page: int = Query(1, ge=1, description="页码，从 1 开始"),
+    page_size: int = Query(15, ge=1, le=100, description="每页条数，默认 15，最大 100"),
     user: dict = Depends(current_user),
 ):
     service = _get_session_service(request)
-    top_session_list, session_list = await service.list_user_sessions(
-        user.get("user_id"), limit=15
+    top_session_list, session_list, total = await service.list_user_sessions(
+        user.get("user_id"), page=page, page_size=page_size
     )
+    total_pages = (total + page_size - 1) // page_size
     return success_response({
         "top_sessions": [s.model_dump(mode="json") for s in top_session_list],
         "sessions": [s.model_dump(mode="json") for s in session_list],
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total_pages,
+            "has_more": page < total_pages,
+        },
     })
 
 

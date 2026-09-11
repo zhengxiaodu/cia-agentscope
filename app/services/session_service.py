@@ -88,10 +88,21 @@ class SessionService:
         await self.dao.delete_session(session_id, user_id)
         return True
 
-    async def list_user_sessions(self, user_id: str, limit: int = 15) -> tuple[list[SessionMeta], list[SessionMeta]]:
-        """列出用户会话，返回 (top_sessions, sessions)。"""
-        raw_top, raw_list = await self.dao.list_user_sessions(user_id, limit=limit)
-        return [SessionMeta(**m) for m in raw_top], [SessionMeta(**m) for m in raw_list]
+    async def list_user_sessions(
+        self, user_id: str, page: int = 1, page_size: int = 15
+    ) -> tuple[list[SessionMeta], list[SessionMeta], int]:
+        """列出用户会话（分页），返回 (top_sessions, sessions, total)。
+
+        total: 该用户非置顶会话总数（用于分页元数据）
+        """
+        raw_top, raw_list, total = await self.dao.list_user_sessions(
+            user_id, page=page, page_size=page_size
+        )
+        return (
+            [SessionMeta(**m) for m in raw_top],
+            [SessionMeta(**m) for m in raw_list],
+            total,
+        )
 
     async def get_session_detail(
         self, session_id: str, user_id: str
