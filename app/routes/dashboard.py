@@ -23,8 +23,7 @@ router = APIRouter(prefix="/dashboard")
 
 @router.get("/kb-overview", response_model=DashboardResponse)
 async def kb_overview(
-    request: Request,
-    user: dict = Depends(current_user),
+    request: Request
 ) -> DashboardResponse:
     """知识库数据大盘聚合接口：一次返回当前页面所需全部指标。
 
@@ -40,8 +39,7 @@ async def kb_overview(
 @router.post("/knowledge-gaps/resolve", response_model=ResolveKnowledgeGapResponse)
 async def resolve_knowledge_gaps(
     request: Request,
-    body: ResolveKnowledgeGapRequest,
-    user: dict = Depends(current_user),
+    body: ResolveKnowledgeGapRequest
 ) -> ResolveKnowledgeGapResponse:
     """标记知识缺口为 resolved（按 gap_ids 或 kb_id 批量），并失效大盘缓存。"""
     if not body.gap_ids and not body.kb_id:
