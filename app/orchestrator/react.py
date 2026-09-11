@@ -13,7 +13,8 @@
 import asyncio
 import json
 import logging
-from typing import AsyncGenerator, Dict, Optional
+import time
+from typing import Any, AsyncGenerator, Dict, Optional, Union
 
 from agentscope.state import AgentState
 
@@ -21,8 +22,9 @@ from openai import AsyncOpenAI
 
 from app.agents.factory import AgentFactory
 from app.intent.models import IntentResult
-from app.orchestrator.base import BaseOrchestrator
+from app.orchestrator.base import BaseOrchestrator, TaskResult
 from app.intent.llm_client import chat_complete, extract_json
+from app.utils.trace_names import TraceName
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +72,7 @@ class ReActOrchestrator(BaseOrchestrator):
         intent_result: IntentResult,
         session_id: Optional[str] = None,
         agent_states: Optional[Dict[str, AgentState]] = None,
+        langfuse_service: Optional[Any] = None,
     ) -> AsyncGenerator[str, None]:
         """执行 ReAct 循环。"""
         yield self._event({
@@ -85,6 +88,24 @@ class ReActOrchestrator(BaseOrchestrator):
         self._last_results = []
 
         for step in range(1, self._max_steps + 1):
+            step_t0 = time.perf_counter()
+
+            def _emit_step_span(action="", is_final=False, observation_preview="", exceeded=False):
+                if not (langfuse_service and getattr(langfuse_service, "enabled", False)):
+                    return
+                try:
+                    obs = langfuse_service.start_observation(
+                        name=TraceName.REACT_STEP.format(step=step), as_type="span",
+                        input={"step": step, "max_steps": self._max_steps})
+                    out = {"action": action, "isFinal": is_final,
+                           "observationPreview": observation_preview[:200],
+                           "durationMs": int((time.perf_counter() - step_t0) * 1000)}
+                    if exceeded:
+                        out["exceeded"] = True
+                    langfuse_service.end_observation(obs, output=out)
+                except Exception:
+                    pass
+
             yield self._event({
                 "type": "react_step",
                 "step": step,
@@ -96,6 +117,7 @@ class ReActOrchestrator(BaseOrchestrator):
 
             if thought.get("is_final"):
                 conclusion = thought.get("conclusion", "")
+                _emit_step_span(action="final", is_final=True, observation_preview=conclusion)
                 yield self._event({
                     "type": "react_final",
                     "step": step,
@@ -112,6 +134,7 @@ class ReActOrchestrator(BaseOrchestrator):
             action = thought.get("next_action")
             if not action:
                 logger.warning(f"[ReAct] 第 {step} 步无 action，终止循环")
+                _emit_step_span(action="", is_final=True, observation_preview="无法确定下一步动作")
                 yield self._event({
                     "type": "react_final",
                     "step": step,
@@ -130,10 +153,17 @@ class ReActOrchestrator(BaseOrchestrator):
                 "thought": thought.get("thought", ""),
             })
 
-            # 执行智能体
-            observation = await self._execute_action(
-                action_name, action_args, intent_result, session_id, agent_states
-            )
+            # 执行智能体（实时透传事件 + 提取 observation）
+            observation = ""
+            async for item in self._execute_action(
+                action_name, action_args, intent_result, session_id, agent_states,
+                langfuse_service,
+            ):
+                if isinstance(item, TaskResult):
+                    observation = item.output if item.success else f"执行失败: {item.output}"
+                else:
+                    # 实时透传 SSE 事件
+                    yield item
 
             # Observe：追加到 scratch
             step_record = (
@@ -144,13 +174,22 @@ class ReActOrchestrator(BaseOrchestrator):
             )
             scratch += step_record
 
+            _emit_step_span(action=action_name, is_final=False, observation_preview=observation)
             yield self._event({
                 "type": "react_observe",
                 "step": step,
                 "observation_preview": observation[:200],
             })
 
-        # 步数超限兜底
+        # 步数超限兜底：补一条 exceeded span
+        if langfuse_service and getattr(langfuse_service, "enabled", False):
+            try:
+                obs = langfuse_service.start_observation(
+                    name=TraceName.REACT_STEP.format(step=self._max_steps), as_type="span",
+                    input={"exceeded": True, "max_steps": self._max_steps})
+                langfuse_service.end_observation(obs, output={"exceeded": True, "maxSteps": self._max_steps})
+            except Exception:
+                pass
         yield self._event({
             "type": "react_timeout",
             "max_steps": self._max_steps,
@@ -196,6 +235,7 @@ class ReActOrchestrator(BaseOrchestrator):
             self._think_model_config,
             system_prompt="你是一个 ReAct 推理引擎，严格输出 JSON。",
             user_prompt=prompt,
+            stage="llm-react-think",
         )
 
         data = extract_json(raw_text)
@@ -212,10 +252,26 @@ class ReActOrchestrator(BaseOrchestrator):
         intent_result: IntentResult,
         session_id: Optional[str] = None,
         agent_states: Optional[Dict[str, AgentState]] = None,
-    ) -> str:
-        """执行 ReAct 中选定的一步动作。"""
+        langfuse_service: Optional[Any] = None,
+    ) -> AsyncGenerator[Union[str, "TaskResult"], None]:
+        """执行 ReAct 中选定的一步动作，实时 yield 事件，最后 yield TaskResult。
+
+        约定：最后一定 yield 一个 TaskResult 作为哨兵，其 output 字段即 observation。
+        中间 yield 的 str 为 SSE 事件（实时透传）。
+
+        Yields:
+            str: SSE 事件字符串（实时透传）
+            TaskResult: 哨兵，output 字段作为 observation（调用方据此判断结束）
+        """
         if action_name == "final":
-            return action_args.get("conclusion", "")
+            conclusion = action_args.get("conclusion", "")
+            yield TaskResult(
+                intent_id="react_final",
+                agent_id="",
+                success=True,
+                output=conclusion,
+            )
+            return
 
         if action_name == "call_agent":
             agent_id = action_args.get("agent_id", "general_agent")
@@ -229,13 +285,36 @@ class ReActOrchestrator(BaseOrchestrator):
             )
 
             agent_state = (agent_states or {}).get(agent_id)
-            result = await self._run_single_agent(
+            result = None
+            async for item in self._run_single_agent(
                 intent,
                 session_id=session_id,
                 agent_state=agent_state,
-            )
+                langfuse_service=langfuse_service,
+            ):
+                if isinstance(item, TaskResult):
+                    result = item
+                else:
+                    # 实时透传 SSE 事件
+                    yield item
+            if result is None:
+                # 理论上不会，兜底
+                yield TaskResult(
+                    intent_id=f"react_{agent_id}",
+                    agent_id=agent_id,
+                    success=False,
+                    output="执行失败: 未获取到结果",
+                )
+                return
             if result.final_state:
                 self._last_results.append(result)
-            return result.output if result.success else f"执行失败: {result.output}"
+            # 最后 yield TaskResult 哨兵（output 即 observation）
+            yield result
+            return
 
-        return f"未知动作: {action_name}"
+        yield TaskResult(
+            intent_id="react_unknown",
+            agent_id="",
+            success=False,
+            output=f"未知动作: {action_name}",
+        )

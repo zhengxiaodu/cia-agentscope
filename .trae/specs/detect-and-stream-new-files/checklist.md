@@ -1,0 +1,16 @@
+- [x] 新增 `app/services/file_change_detector.py`，提供 `snapshot` / `diff` / `build_file_meta` 三个函数
+- [x] `snapshot(workdir)` 递归扫描返回相对路径集合（POSIX 风格），跳过顶层 `data/` 子目录；目录不存在返回空集合不抛异常
+- [x] `diff(before, after)` 返回 `after - before` 排序后的新相对路径列表
+- [x] `build_file_meta(workdir, rel_path, session_id)` 返回 `{name, path, url, size, media_type}`；文件不存在返回 None；`url` 形如 `/files/{session_id}/{rel_path}`；`media_type` 用 `mimetypes.guess_type`，失败回退 `application/octet-stream`
+- [x] 新增 `app/routes/files.py`，提供 `GET /files/{session_id}/{path:path}`
+- [x] 下载接口带 `Depends(current_user)` 鉴权，未登录返回 401
+- [x] 下载接口用 `os.path.realpath` 解析后做 `startswith(base + os.sep)` 越权校验，逃逸返回 403
+- [x] 下载接口文件不存在返回 404；存在返回 `FileResponse`（带 filename、media_type）
+- [x] `chat_service.generate_response` 在 orchestrator run 之前对 `{WORKSPACE_BASEDIR}/{session_id}` 做快照（session_id 为空或目录不存在则空集合，失败记 warning 不阻断）
+- [x] `generate_response` 在消息持久化之后、`trace_ready` 之前，扫描 + diff + 构造 `files_generated` 事件并 yield
+- [x] `files_generated` 事件 payload 含 `{"type": "files_generated", "files": [...]}`；空列表也发事件
+- [x] 事件顺序：`session_ready` → 编排事件 → 持久化 → `files_generated` → `trace_ready`
+- [x] 检测/diff/构造/yield 全程 try/except，任何异常记 warning 后仍 yield 空 `files_generated`，不阻断 `trace_ready`
+- [x] `app/main.py` 注册 `files` router（`include_router(files.router, tags=["files"])`）
+- [x] `python -m py_compile` 通过 `file_change_detector.py`、`files.py`、`chat_service.py`、`main.py`
+- [x] grep 确认 `files_generated` 事件仅在 `chat_service.py` yield；`/files/` 路由仅在 `files.py` 注册
