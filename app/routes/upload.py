@@ -60,7 +60,6 @@ async def upload_file(
     return UploadResponse(
         code=200,
         msg="success",
-        session_id=session_id,
         data={
             "datablock": {
                 "id": uuid.uuid4().hex,
@@ -68,9 +67,11 @@ async def upload_file(
                 "source": {
                     "url": f"uploaded://{filename}",
                     "media_type": media_type,
+                    "size": len(content)
                 },
             },
             "file_id": file_id,
+            "session_id"=session_id
         },
     )
 
