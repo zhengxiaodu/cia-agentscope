@@ -14,7 +14,7 @@ import asyncio
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional, Tuple
 
 import yaml
@@ -32,6 +32,9 @@ from app.services.sensitive_service import (
 from app.intent.llm_client import chat_complete, extract_json
 
 logger = logging.getLogger(__name__)
+
+# 东八区（Asia/Shanghai）：消息时间戳统一按北京时间生成
+_BEIJING_TZ = timezone(timedelta(hours=8))
 
 
 @contextmanager
@@ -227,7 +230,7 @@ async def _persist_conversation_history(
 
     persist_result: Optional[dict] = None
     try:
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        now_str = datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         user_input = _extract_user_input(messages)
 
         new_messages = []

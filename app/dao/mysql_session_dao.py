@@ -5,13 +5,16 @@
 """
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import aiomysql
 from agentscope.state import AgentState
 
 logger = logging.getLogger(__name__)
+
+# 东八区（Asia/Shanghai）：所有表时间字段统一按北京时间写入
+_BEIJING_TZ = timezone(timedelta(hours=8))
 
 
 def _parse_json_list(raw) -> list:
@@ -91,7 +94,7 @@ class SessionDAO:
 
         若 sessions 行不存在则自动创建（含会话名称提取）。
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(_BEIJING_TZ)
         state_json = json.dumps(state_dict, ensure_ascii=False, default=str)
 
         async with self.pool.acquire() as conn:
@@ -191,7 +194,7 @@ class SessionDAO:
              "assistant_message_id": 本轮 assistant 消息自增 id}；
             本轮没有对应角色的消息时相应 id 为 None。
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(_BEIJING_TZ)
         now_str = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
         # 汇总本轮 new_messages 中所有 agent_ids（去重保序）
@@ -242,7 +245,7 @@ class SessionDAO:
                             try:
                                 ts = datetime.strptime(
                                     ts_raw, "%Y-%m-%d %H:%M:%S.%f"
-                                ).replace(tzinfo=timezone.utc)
+                                ).replace(tzinfo=_BEIJING_TZ)
                             except ValueError:
                                 ts = now
                         else:
@@ -506,7 +509,7 @@ class SessionDAO:
 
     async def pin_session(self, user_id: str, session_id: str) -> None:
         """将会话置顶。"""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(_BEIJING_TZ)
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
@@ -526,6 +529,23 @@ class SessionDAO:
                     (session_id, user_id),
                 )
                 await conn.commit()
+
+    async def rename_session(
+        self, user_id: str, session_id: str, name: str
+    ) -> bool:
+        """修改会话名称。返回 False 表示会话不存在（或不属于该用户）。
+
+        不更新 updated_at：改名不应改变会话在列表中的排序。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "UPDATE sessions SET name = %s "
+                    "WHERE session_id = %s AND user_id = %s",
+                    (name, session_id, user_id),
+                )
+                await conn.commit()
+                return cur.rowcount > 0
 
     # ================================================================
     # 删除会话
@@ -669,7 +689,7 @@ class SessionDAO:
 
         对应 AgentScope 原生 RedisStorage.update_session_state() 语义。
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(_BEIJING_TZ)
         state_json = json.dumps(
             state.model_dump(mode="json"),
             ensure_ascii=False,

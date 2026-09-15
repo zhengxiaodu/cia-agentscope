@@ -59,6 +59,25 @@ async def pin_session(
     return success_response({"pinned": pinned})
 
 
+@router.put("/sessions/{session_id}/name")
+async def rename_session(
+    session_id: str,
+    request: Request,
+    user: dict = Depends(current_user),
+):
+    service = _get_session_service(request)
+    body = await request.json()
+    name = str(body.get("name", "")).strip()
+    if not name:
+        return error_response(400, "会话名称不能为空")
+    if len(name) > 255:
+        return error_response(400, "会话名称不能超过255个字符")
+    ok = await service.rename_session(user.get("user_id"), session_id, name)
+    if not ok:
+        return error_response(404, "会话不存在")
+    return success_response({"session_id": session_id, "name": name})
+
+
 @router.delete("/sessions/{session_id}")
 async def delete_session(
     session_id: str,

@@ -109,6 +109,7 @@ async def lifespan(app: FastAPI):
         minsize=2,
         maxsize=10,
         autocommit=False,
+        init_command="SET time_zone = '+08:00'",
     )
     await init_mysql_tables(mysql_pool)  # 自动建表
     app.state.mysql_pool = mysql_pool

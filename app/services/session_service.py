@@ -81,6 +81,12 @@ class SessionService:
         """取消置顶会话。"""
         await self.dao.unpin_session(user_id, session_id)
 
+    async def rename_session(
+        self, user_id: str, session_id: str, name: str
+    ) -> bool:
+        """修改会话名称。返回 False 表示会话不存在。"""
+        return await self.dao.rename_session(user_id, session_id, name)
+
     async def delete_session(self, user_id: str, session_id: str) -> bool:
         """删除会话。返回 False 表示会话不存在。"""
         if not await self.dao.session_exists(session_id):
