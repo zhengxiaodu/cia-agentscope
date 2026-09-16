@@ -22,7 +22,7 @@ def _get_session_service(request: Request):
 async def list_sessions(
     request: Request,
     page: int = Query(1, ge=1, description="页码，从 1 开始"),
-    page_size: int = Query(30, ge=1, le=100, description="每页条数，默认 15，最大 100"),
+    page_size: int = Query(30, ge=1, le=100, description="每页条数，默认 30，最大 100"),
     user: dict = Depends(current_user),
 ):
     service = _get_session_service(request)
