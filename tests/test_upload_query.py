@@ -73,9 +73,9 @@ class _FakePool:
 @pytest.mark.asyncio
 async def test_list_files_by_user_sql_and_mapping():
     rows = [
-        {"session_id": "s2", "message_id": None, "filename": "b.pdf",
+        {"id": 2, "session_id": "s2", "message_id": None, "filename": "b.pdf",
          "media_type": "application/pdf", "file_size": 2048},
-        {"session_id": "s1", "message_id": 7, "filename": "a.m4a",
+        {"id": 1, "session_id": "s1", "message_id": 7, "filename": "a.m4a",
          "media_type": "audio/mp4", "file_size": 1024},
     ]
     pool = _FakePool(rows)
@@ -87,7 +87,14 @@ async def test_list_files_by_user_sql_and_mapping():
     assert "FROM upload_files WHERE user_id = %s" in sql
     assert "ORDER BY id DESC" in sql
     assert args == ("u1",)
-    assert result == rows
+    # id 映射为 upload_file_id，其余键保持不变
+    assert result == [
+        {"upload_file_id": 2, "session_id": "s2", "message_id": None,
+         "filename": "b.pdf", "media_type": "application/pdf",
+         "file_size": 2048},
+        {"upload_file_id": 1, "session_id": "s1", "message_id": 7,
+         "filename": "a.m4a", "media_type": "audio/mp4", "file_size": 1024},
+    ]
     assert pool.conn.committed
 
 
@@ -148,10 +155,11 @@ def test_uploads_200_without_query_params():
 
 def test_uploads_200_returns_file_list():
     rows = [
-        {"session_id": "s2", "message_id": None, "filename": "b.pdf",
-         "media_type": "application/pdf", "file_size": 2048},
-        {"session_id": "s1", "message_id": 7, "filename": "a.m4a",
-         "media_type": "audio/mp4", "file_size": 1024},
+        {"upload_file_id": 2, "session_id": "s2", "message_id": None,
+         "filename": "b.pdf", "media_type": "application/pdf",
+         "file_size": 2048},
+        {"upload_file_id": 1, "session_id": "s1", "message_id": 7,
+         "filename": "a.m4a", "media_type": "audio/mp4", "file_size": 1024},
     ]
     dao = MagicMock()
     dao.list_files_by_user = AsyncMock(return_value=rows)
@@ -167,7 +175,8 @@ def test_uploads_200_returns_file_list():
     # 每条记录契约字段齐全（message_id 未绑定为 None）
     for item in body["data"]["files"]:
         assert set(item.keys()) == {
-            "session_id", "message_id", "filename", "media_type", "file_size"
+            "upload_file_id", "session_id", "message_id", "filename",
+            "media_type", "file_size"
         }
     # user_id 以 JWT 内的为准（query 参数被忽略）
     dao.list_files_by_user.assert_awaited_once_with("u1")

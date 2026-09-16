@@ -92,6 +92,39 @@ CREATE TABLE IF NOT EXISTS upload_files (
 CREATE INDEX idx_upload_files_session_msg ON upload_files(session_id, message_id);
 CREATE INDEX idx_upload_files_user_id ON upload_files(user_id);
 
+-- 消息分享记录：shared_id 为 16 位随机十六进制串；不设 FK（分享记录独立于会话生命周期）
+CREATE TABLE IF NOT EXISTS message_shares (
+    id               BIGINT AUTO_INCREMENT PRIMARY KEY,
+    shared_id        VARCHAR(32) NOT NULL,
+    session_id       VARCHAR(64) NOT NULL,
+    user_id          VARCHAR(64) NOT NULL DEFAULT '',
+    message_pair_ids JSON NOT NULL,
+    created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE UNIQUE INDEX uniq_message_shares_shared_id ON message_shares(shared_id);
+CREATE INDEX idx_message_shares_session_id ON message_shares(session_id);
+
+-- 收藏消息：表结构与 messages 相同，仅新增 favorite_id（一批收藏共享一个 favorite_id）
+-- 不设 FK 到 sessions（收藏是消息副本，会话删除后保留）；自增 id 即收藏时间顺序
+CREATE TABLE IF NOT EXISTS message_favorites (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    favorite_id     VARCHAR(32) NOT NULL,
+    session_id      VARCHAR(64) NOT NULL,
+    role            VARCHAR(32) NOT NULL,
+    content         TEXT NOT NULL,
+    timestamp       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    agent_ids       JSON NULL DEFAULT NULL,
+    user_id         VARCHAR(64) NOT NULL DEFAULT '',
+    success         TINYINT(1) NOT NULL DEFAULT 1,
+    tokens          INT NOT NULL DEFAULT 0,
+    message_pair_id VARCHAR(64) NULL DEFAULT NULL,
+    citations       JSON NULL,
+    bocha_sum       JSON NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX idx_message_favorites_user_fid ON message_favorites(user_id, favorite_id);
+
 CREATE TABLE IF NOT EXISTS action_audit (
     id         BIGINT AUTO_INCREMENT PRIMARY KEY,
     userId     VARCHAR(64) NOT NULL,

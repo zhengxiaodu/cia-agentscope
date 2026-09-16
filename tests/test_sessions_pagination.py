@@ -206,20 +206,20 @@ def _make_service(top=None, sessions=None, total=0):
 
 
 def test_sessions_default_params_backward_compatible():
-    """不传参数 → 默认 page=1 / page_size=15（与旧行为一致）+ pagination 字段。"""
+    """不传参数 → 默认 page=1 / page_size=30（commit ba83c4a 起默认 30）+ pagination 字段。"""
     service = _make_service(total=15)
     client = TestClient(_make_app(service))
 
     resp = client.get("/sessions", headers=_auth_headers())
 
     assert resp.status_code == 200
-    service.list_user_sessions.assert_awaited_once_with("u1", page=1, page_size=15)
+    service.list_user_sessions.assert_awaited_once_with("u1", page=1, page_size=30)
     body = resp.json()
     assert body["code"] == 200
     assert body["data"]["top_sessions"] == []
     assert body["data"]["sessions"] == []
     assert body["data"]["pagination"] == {
-        "page": 1, "page_size": 15, "total": 15,
+        "page": 1, "page_size": 30, "total": 15,
         "total_pages": 1, "has_more": False,
     }
 

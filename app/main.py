@@ -30,13 +30,15 @@ from app.services.orchestrator_service import OrchestratorService
 from app.dao.mysql_session_dao import SessionDAO
 from app.dao.action_audit_dao import ActionAuditDAO
 from app.dao.upload_file_dao import UploadFileDAO
+from app.dao.message_share_dao import MessageShareDAO
+from app.dao.message_favorite_dao import MessageFavoriteDAO
 from app.dao.init_mysql import init_mysql_tables
 from app.services.session_service import SessionService
 from app.services.action_audit_service import ActionAuditService
 from app.services.langfuse_service import LangfuseService
 from app.routes import (
     auth, chat, feedback, files, health, mng_proxy, sessions, upload, action_audit,
-    policy_qa, dashboard,
+    policy_qa, dashboard, message_share, message_favorite,
 )
 
 import logging
@@ -117,6 +119,8 @@ async def lifespan(app: FastAPI):
     app.state.session_dao = session_dao
     upload_file_dao = UploadFileDAO(mysql_pool)
     app.state.upload_file_dao = upload_file_dao
+    app.state.message_share_dao = MessageShareDAO(mysql_pool)
+    app.state.message_favorite_dao = MessageFavoriteDAO(mysql_pool)
     app.state.session_service = SessionService(session_dao, upload_file_dao=upload_file_dao)
     action_audit_dao = ActionAuditDAO(mysql_pool)
     app.state.action_audit_dao = action_audit_dao
@@ -202,6 +206,8 @@ app.include_router(upload.router, tags=["upload"])
 app.include_router(mng_proxy.router, tags=["mng"])
 app.include_router(action_audit.router, tags=["action-audit"])
 app.include_router(policy_qa.router, tags=["policy-qa"])
+app.include_router(message_share.router, tags=["message-share"])
+app.include_router(message_favorite.router, tags=["message-favorite"])
 app.include_router(dashboard.router, tags=["dashboard"])
 
 if __name__ == "__main__":
