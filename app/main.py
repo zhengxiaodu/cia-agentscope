@@ -173,9 +173,6 @@ async def lifespan(app: FastAPI):
     await workspace_manager.close_all()
     logger.info("Workspace manager closed")
 
-    cleanup_service.stop()
-    logger.info("Workspace cleanup service stopped")
-
     # 关闭 MySQL 连接池
     mysql_pool.close()
     await mysql_pool.wait_closed()
