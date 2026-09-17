@@ -25,12 +25,13 @@ async def fetch_external_intents(jwt_token: str) -> List[dict]:
         jwt_token: 本系统登录签发的 JWT，作为 Authorization 转发给 mng
 
     Returns:
-        外部意图配置列表，mng 返回格式：
+        外部意图配置列表（已过滤禁用意图），mng 返回格式：
         [
             {
                 "id": 123,
                 "name": "生成PPT",
                 "intentCode": "generate_ppt",
+                "status": 1,
                 "agents": [
                     {"id": "999", "name": "生成PPT智能体",
                      "code": "agent_ppt", "prompt": ""}
@@ -41,6 +42,7 @@ async def fetch_external_intents(jwt_token: str) -> List[dict]:
                 ]
             }
         ]
+        status=0 表示禁用（返回前已剔除）；字段缺失/None 视为启用。
     """
     if not MNG_INTENT_URL:
         logger.warning("[mng_service] MNG_INTENT_URL 未配置，跳过获取外部意图")
@@ -73,7 +75,16 @@ async def fetch_external_intents(jwt_token: str) -> List[dict]:
             if not isinstance(data, list):
                 logger.warning("[mng_service] 外部意图 data 格式异常（非列表）")
                 return []
-            return data
+            # 过滤禁用意图：status=0 禁用；字段缺失/None 视为启用（兼容旧版 mng）
+            enabled = [
+                x for x in data
+                if not (isinstance(x, dict) and x.get("status") == 0)
+            ]
+            if len(enabled) < len(data):
+                logger.info(
+                    f"[mng_service] 已过滤 {len(data) - len(enabled)} 个禁用意图"
+                )
+            return enabled
     except Exception:
         logger.exception("[mng_service] 调用 mng 获取外部意图异常，降级跳过")
         return []

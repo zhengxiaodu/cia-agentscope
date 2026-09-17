@@ -171,10 +171,12 @@ async def test_dao_list_favorites_formats_rows():
 # ---------------------------------------------------------------------------
 
 
-def _make_app(dao) -> FastAPI:
+def _make_app(dao, session_dao=None, upload_file_dao=None) -> FastAPI:
     app = FastAPI()
     app.include_router(favorite_route.router)
     app.state.message_favorite_dao = dao
+    app.state.session_dao = session_dao
+    app.state.upload_file_dao = upload_file_dao
     return app
 
 
@@ -189,6 +191,26 @@ def _make_dao():
     dao.delete_favorite = AsyncMock(return_value=2)
     dao.list_favorites = AsyncMock(return_value=[])
     return dao
+
+
+def _make_session_daos(files_by_session=None, uploads_by_session=None):
+    """构造 session_dao / upload_file_dao mock。
+
+    load_session_files / list_files_by_session 按 session_id 从
+    files_by_session / uploads_by_session 取返回值（缺省 []）。
+    """
+    files_by_session = files_by_session or {}
+    uploads_by_session = uploads_by_session or {}
+
+    session_dao = MagicMock()
+    session_dao.load_session_files = AsyncMock(
+        side_effect=lambda sid: files_by_session.get(sid, [])
+    )
+    upload_dao = MagicMock()
+    upload_dao.list_files_by_session = AsyncMock(
+        side_effect=lambda sid: uploads_by_session.get(sid, [])
+    )
+    return session_dao, upload_dao
 
 
 def test_post_favorite_success():
@@ -258,9 +280,29 @@ def test_delete_favorite_not_found():
     assert resp.json()["code"] == 404
 
 
+def _file(name, pair, **extra):
+    return {
+        "name": name, "path": name, "url": f"/files/x/{name}", "size": 1,
+        "media_type": "text/markdown",
+        "created_at": "2026-09-15 10:00:00.000",
+        "message_id": 101, "message_pair_id": pair,
+        **extra,
+    }
+
+
+def _upload(name, pair, **extra):
+    return {
+        "name": name, "size": 2, "media_type": "application/pdf",
+        "created_at": "2026-09-15 09:59:00.000",
+        "message_id": 100, "message_pair_id": pair,
+        **extra,
+    }
+
+
 def test_get_favorites_grouped():
     """按 favorite_id 分组，组间保持收藏先后、组内保持消息顺序。"""
     dao = _make_dao()
+    session_dao, upload_dao = _make_session_daos()
 
     def _msg(fid, role, content, pair):
         return {
@@ -275,7 +317,7 @@ def test_get_favorites_grouped():
         _msg("f1", "assistant", "答1", "p1"),
         _msg("f2", "user", "问2", "p2"),
     ])
-    client = TestClient(_make_app(dao))
+    client = TestClient(_make_app(dao, session_dao, upload_dao))
 
     resp = client.get("/message_favorites", headers=_auth_headers())
 
@@ -284,14 +326,136 @@ def test_get_favorites_grouped():
     assert [g["favorite_id"] for g in favorites] == ["f1", "f2"]
     assert [m["content"] for m in favorites[0]["messages"]] == ["问1", "答1"]
     assert favorites[1]["messages"][0]["message_pair_id"] == "p2"
+    # 新增字段默认存在（无文件时为空列表）
+    assert favorites[0]["files"] == []
+    assert favorites[0]["upload_files"] == []
+    assert favorites[1]["files"] == []
+    assert favorites[1]["upload_files"] == []
+
+
+def test_get_favorites_files_filtered_by_pair():
+    """分组下 files/upload_files 仅含与组内 message_pair_id 关联的文件。"""
+    dao = _make_dao()
+
+    def _msg(fid, pair, sid="s1"):
+        return {
+            "favorite_id": fid, "session_id": sid, "role": "user",
+            "content": "问", "timestamp": "2026-09-15 10:00:00.000",
+            "agent_ids": [], "user_id": "u1", "success": True, "tokens": 1,
+            "message_pair_id": pair, "citations": [], "bocha_sum": [],
+        }
+
+    dao.list_favorites = AsyncMock(return_value=[
+        _msg("f1", "p1"), _msg("f1", "p1"), _msg("f2", "p2"),
+    ])
+    session_dao, upload_dao = _make_session_daos(
+        files_by_session={
+            "s1": [
+                _file("a.md", "p1"),                    # f1 关联 → 保留
+                _file("b.md", "p2"),                    # f2 关联，f1 剔除
+                _file("c.md", None),                    # 未绑定 pair → 全部剔除
+            ],
+        },
+        uploads_by_session={
+            "s1": [
+                _upload("up1.pdf", "p1"),               # f1 关联 → 保留
+                _upload("up2.pdf", None),               # 未消费 → 全部剔除
+            ],
+        },
+    )
+    client = TestClient(_make_app(dao, session_dao, upload_dao))
+
+    resp = client.get("/message_favorites", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    favorites = resp.json()["data"]["favorites"]
+    by_fid = {g["favorite_id"]: g for g in favorites}
+    assert [f["name"] for f in by_fid["f1"]["files"]] == ["a.md"]
+    assert [f["name"] for f in by_fid["f1"]["upload_files"]] == ["up1.pdf"]
+    assert [f["name"] for f in by_fid["f2"]["files"]] == ["b.md"]
+    assert by_fid["f2"]["upload_files"] == []
+    # 文件字段与历史会话详情接口对齐
+    f1_file = by_fid["f1"]["files"][0]
+    assert set(f1_file.keys()) == {
+        "name", "path", "url", "size", "media_type", "created_at",
+        "message_id", "message_pair_id",
+    }
+
+
+def test_get_favorites_cross_session_matching():
+    """跨会话收藏：文件按 (session_id, message_pair_id) 匹配，不跨会话错配。"""
+    dao = _make_dao()
+
+    def _msg(fid, pair, sid):
+        return {
+            "favorite_id": fid, "session_id": sid, "role": "user",
+            "content": "问", "timestamp": "2026-09-15 10:00:00.000",
+            "agent_ids": [], "user_id": "u1", "success": True, "tokens": 1,
+            "message_pair_id": pair, "citations": [], "bocha_sum": [],
+        }
+
+    # 同一收藏组内两个 pair 来自不同会话；两会话存在同名 pair_id "px"
+    dao.list_favorites = AsyncMock(return_value=[
+        _msg("f1", "p1", "s1"),
+        _msg("f1", "px", "s2"),
+    ])
+    session_dao, upload_dao = _make_session_daos(
+        files_by_session={
+            "s1": [_file("s1-file.md", "p1"), _file("s1-x.md", "px")],
+            "s2": [_file("s2-file.md", "px")],
+        },
+    )
+    client = TestClient(_make_app(dao, session_dao, upload_dao))
+
+    resp = client.get("/message_favorites", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    group = resp.json()["data"]["favorites"][0]
+    # s1 的 px 文件不属于该组（组内 s1 只涉及 p1）；s2 的 px 属于该组
+    assert [f["name"] for f in group["files"]] == ["s1-file.md", "s2-file.md"]
+    # 每个 session 只查一次库（set 迭代顺序不定，按参数集合断言）
+    awaited_sids = [
+        c.args[0] for c in session_dao.load_session_files.await_args_list
+    ]
+    assert sorted(awaited_sids) == ["s1", "s2"]
+    assert session_dao.load_session_files.await_count == 2
+
+
+def test_get_favorites_upload_dao_error_tolerated():
+    """upload_file_dao 查询异常 → 该会话 upload_files 降级为 []，不阻断。"""
+    dao = _make_dao()
+    dao.list_favorites = AsyncMock(return_value=[{
+        "favorite_id": "f1", "session_id": "s1", "role": "user",
+        "content": "问", "timestamp": "2026-09-15 10:00:00.000",
+        "agent_ids": [], "user_id": "u1", "success": True, "tokens": 1,
+        "message_pair_id": "p1", "citations": [], "bocha_sum": [],
+    }])
+    session_dao, upload_dao = _make_session_daos(
+        files_by_session={"s1": [_file("a.md", "p1")]},
+    )
+    upload_dao.list_files_by_session = AsyncMock(
+        side_effect=RuntimeError("db down")
+    )
+    client = TestClient(_make_app(dao, session_dao, upload_dao))
+
+    resp = client.get("/message_favorites", headers=_auth_headers())
+
+    assert resp.status_code == 200
+    group = resp.json()["data"]["favorites"][0]
+    assert [f["name"] for f in group["files"]] == ["a.md"]
+    assert group["upload_files"] == []
 
 
 def test_get_favorites_empty():
-    client = TestClient(_make_app(_make_dao()))
+    session_dao, upload_dao = _make_session_daos()
+    client = TestClient(_make_app(_make_dao(), session_dao, upload_dao))
 
     resp = client.get("/message_favorites", headers=_auth_headers())
 
     assert resp.json()["data"] == {"favorites": []}
+    # 无收藏时不触发文件查询
+    session_dao.load_session_files.assert_not_awaited()
+    upload_dao.list_files_by_session.assert_not_awaited()
 
 
 def test_get_favorites_401_without_jwt():
