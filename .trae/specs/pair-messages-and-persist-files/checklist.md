@@ -1,0 +1,17 @@
+- [x] `app/dao/init_mysql.py`：messages 加 message_pair_id/citations，session_files 加 message_id/message_pair_id，upload_files 加 message_pair_id（CREATE TABLE + ALTER IF NOT EXISTS 双写，存量库幂等）
+- [x] 存量旧数据兼容：旧 messages 的 message_pair_id 为 null、citations 为 []；旧 session_files 的 message_id/message_pair_id 为 null；接口原样返回不报错
+- [x] 每轮对话 user 与 assistant 消息共享同一个 message_pair_id（uuid4().hex），正常与中断路径均落库
+- [x] `GET /sessions/{session_id}` 的 messages 每条含 message_pair_id 与 citations（无引用为 `[]`）
+- [x] 编排流中的 `policy_qa_citations` 事件被 chat_service 捕获并累积，随本轮 assistant 消息写入 messages.citations；非制度问答轮次 citations 为空
+- [x] session_files 每条记录含 message_id（本轮 assistant 消息 id）与 message_pair_id；UPSERT 时两列同步更新
+- [x] `GET /sessions/{session_id}` 的 files 每条含 message_id 与 message_pair_id
+- [x] .env/.env.example/app/config.py 新增 SESSION_FILES_PERSIST_DIR（默认 data/session_files，留空禁用）
+- [x] 新文件字节流经 read_session_file 读取并写入 {SESSION_FILES_PERSIST_DIR}/{session_id}/{rel_path}，保留子目录结构
+- [x] 持久化成功时 session_files.url 与 files_generated 事件中的 url 为 /persist-files/{session_id}/{rel_path}；读取/写盘失败或未配置目录时回退 /files/{session_id}/{rel_path}，仅 warning 不中断
+- [x] 顺序：先持久化对话历史（⑥），后检测新文件并搬运字节流（⑦）；session_files 记录的 message_id/message_pair_id 来自 messages 落库返回值
+- [x] `GET /persist-files/{session_id}/{path}`：登录可下载、404 不存在、403 路径穿越、中文名 Content-Disposition 正确、mode=inline 与 /files 行为一致
+- [x] upload_files 表 bind 时同时回填 message_id 与 message_pair_id
+- [x] `GET /sessions/{session_id}` 新增 upload_files 字段：name/size/media_type/created_at/message_id/message_pair_id，含未消费记录（message_id/message_pair_id 为 null）
+- [x] `SessionDAO.append_messages` 返回 `{"user_message_id", "assistant_message_id"}`，chat_service 与 test_upload_inject_and_bind.py 已同步
+- [x] files_generated 事件与 trace_ready 等后续事件顺序未改变（新增字段为 additive）
+- [x] `python -m py_compile` 通过全部修改文件；全量 pytest 通过（377 passed）
