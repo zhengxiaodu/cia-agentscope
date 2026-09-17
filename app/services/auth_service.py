@@ -10,8 +10,8 @@ logger = logging.getLogger(__name__)
 
 # Redis key 前缀：用户权限数据
 _REDIS_KEY_PERMISSIONS = "user_permissions:{user_id}"
-# 权限数据在 Redis 中的默认 TTL（秒），与 JWT 过期时间一致
-_PERMISSIONS_TTL = JWT_EXPIRE_HOURS * 3600
+# 权限数据在 Redis 中的默认 TTL（秒），与 JWT_REFRESH 过期时间一致
+_PERMISSIONS_TTL = JWT_EXPIRE_HOURS * 3600 * 24 * JWT_REFRESH_EXPIRE_DAYS
 
 
 def create_access_token(payload: dict, expire_hours: int = JWT_EXPIRE_HOURS) -> str:
