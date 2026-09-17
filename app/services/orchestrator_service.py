@@ -39,6 +39,7 @@ from app.config import (
     SKILL_CONFIG_PATH,
     EXTERNAL_SKILLS_DIR,
     JWT_EXPIRE_HOURS,
+    JWT_REFRESH_EXPIRE_DAYS
 )
 from app.agents.base import AgentDefinition
 from app.agents.factory import AgentFactory
@@ -65,7 +66,7 @@ logger = logging.getLogger(__name__)
 
 # Redis key：用户融合后的配置（登录时写入，会话时读取）
 _REDIS_KEY_USER_CONFIG = "user_config:{user_id}"
-_USER_CONFIG_TTL = JWT_EXPIRE_HOURS * 3600  # 与 user_permissions 同 TTL
+_USER_CONFIG_TTL = 3600 * 24 * JWT_REFRESH_EXPIRE_DAYS   # 与 user_permissions 同 TTL
 
 # 联网搜索技能名（与 skill_config.yml / agent_config.yml 中的 name 一致）
 _SEARCH_SKILL_NAME = "bocha_search"
