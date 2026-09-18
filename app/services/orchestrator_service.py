@@ -141,6 +141,9 @@ class OrchestratorService:
         self._last_agent_ids: List[str] = []
         # 最近一次编排是否成功（单 agent 路径标志位；多 agent 路径从 _last_results 派生）
         self._last_success: bool = True
+        # 最近一轮 agent 事件流捕捉的真实 token 用量（MODEL_CALL_END 累积）
+        self._last_input_tokens: int = 0
+        self._last_output_tokens: int = 0
 
     @classmethod
     async def create(
@@ -247,6 +250,40 @@ class OrchestratorService:
         if self._last_orchestrator and self._last_orchestrator._last_results:
             return all(r.success for r in self._last_orchestrator._last_results)
         return self._last_success
+
+    @property
+    def last_input_tokens(self) -> int:
+        """最近一轮编排的真实输入 token 总和（MODEL_CALL_END 事件累积）。"""
+        return self._last_input_tokens
+
+    @property
+    def last_output_tokens(self) -> int:
+        """最近一轮编排的真实输出 token 总和（MODEL_CALL_END 事件累积）。"""
+        return self._last_output_tokens
+
+    async def _capture_tokens_from_stream(self, source):
+        """转发 SSE 事件流，旁路解析 MODEL_CALL_END 事件累积真实 token。
+
+        agentscope 的事件以 "data: {...}\\n\\n" 字符串流转经本方法；先做
+        子串快速判断（避免每条事件都 json.loads），命中后解析并校验 type，
+        再累加 input_tokens / output_tokens。解析失败静默容错，不影响转发。
+        """
+        async for ev in source:
+            try:
+                if "MODEL_CALL_END" in ev:
+                    payload = json.loads(ev.removeprefix("data: ").strip())
+                    if payload.get("type") == "MODEL_CALL_END":
+                        self._last_input_tokens += int(
+                            payload.get("input_tokens") or 0
+                        )
+                        self._last_output_tokens += int(
+                            payload.get("output_tokens") or 0
+                        )
+            except Exception:
+                logger.debug(
+                    "[OrchestratorService] token 拦截解析失败", exc_info=True
+                )
+            yield ev
 
     @staticmethod
     def _event(data: dict) -> str:
@@ -871,6 +908,10 @@ class OrchestratorService:
         user_input = self._extract_last_user_message(messages)
         history = self._extract_history(messages)
 
+        # 重置本轮 token 累积（服务为单例，跨请求复用，避免上一轮残留）
+        self._last_input_tokens = 0
+        self._last_output_tokens = 0
+
         if not user_input:
             yield self._event({"type": "error", "message": "未检测到有效用户输入"})
             return
@@ -1081,9 +1122,11 @@ class OrchestratorService:
                 yield ev
             upload_ctx = await self._load_upload_context(request, session_id)
             user_input = self._append_upload_context(user_input, upload_ctx)
-            async for ev in self._run_single_agent_path(
-                registry, agent_factory, agent_id, user_input,
-                session_id, user_id, session_service, langfuse_service,
+            async for ev in self._capture_tokens_from_stream(
+                self._run_single_agent_path(
+                    registry, agent_factory, agent_id, user_input,
+                    session_id, user_id, session_service, langfuse_service,
+                )
             ):
                 yield ev
             return
@@ -1208,11 +1251,13 @@ class OrchestratorService:
         # ⑥ 执行编排（内部实时 yield SSE 事件）
         self._last_agent_ids = []  # 重置，避免上一轮残留
         self._last_success = True  # 重置
-        async for event_str in orchestrator.run(
-            intent_result,
-            session_id=session_id,
-            agent_states=agent_states,
-            langfuse_service=langfuse_service,
+        async for event_str in self._capture_tokens_from_stream(
+            orchestrator.run(
+                intent_result,
+                session_id=session_id,
+                agent_states=agent_states,
+                langfuse_service=langfuse_service,
+            )
         ):
             yield event_str
 

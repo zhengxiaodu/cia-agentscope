@@ -258,12 +258,23 @@ async def _persist_conversation_history(
                     last_success = orchestrator_service.last_success
                 except Exception:
                     last_success = False
+            # 真实 token 消耗：MODEL_CALL_END 事件累积的 input+output 之和；
+            # 为 0（如自有 LLM 链路未发事件、异常降级）时回退文本估算
+            real_tokens = 0
+            if orchestrator_service is not None:
+                try:
+                    real_tokens = (
+                        int(orchestrator_service.last_input_tokens or 0)
+                        + int(orchestrator_service.last_output_tokens or 0)
+                    )
+                except Exception:
+                    real_tokens = 0
             new_messages.append({
                 "role": "assistant", "content": final_output, "timestamp": now_str,
                 "agent_ids": involved_agent_ids,
                 "user_id": user_id,
                 "success": last_success,
-                "tokens": _estimate_tokens(final_output),
+                "tokens": real_tokens if real_tokens > 0 else _estimate_tokens(final_output),
                 "message_pair_id": message_pair_id,
                 "citations": citations if citations else None,
                 "bocha_sum": bocha_sum if bocha_sum else None,
