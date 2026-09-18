@@ -15,38 +15,18 @@
 import asyncio
 import json
 import logging
-import time
-import uuid
 from contextlib import contextmanager
 from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional
 
-import yaml
 from fastapi import Request
 from openai import AsyncOpenAI
 
 from agentscope.state import AgentState
-from agentscope.event import (
-    AgentEvent,
-    ReplyStartEvent,
-    ToolCallStartEvent,
-    ToolCallEndEvent,
-)
 from agentscope.message import AssistantMsg, UserMsg
 
-from app.config import (
-    AGENT_CONFIG_PATH,
-    INTENT_CONFIG_PATH,
-    SKILL_CONFIG_PATH,
-    EXTERNAL_SKILLS_DIR,
-    JWT_EXPIRE_HOURS,
-    JWT_REFRESH_EXPIRE_DAYS
-)
-from app.agents.base import AgentDefinition
+from app.config import INTENT_CONFIG_PATH
 from app.agents.factory import AgentFactory
-from app.agents.registry import (
-    AgentRegistry,
-    load_agent_definitions,
-)
+from app.agents.registry import AgentRegistry
 from app.services.opensandbox_workspace_manager import OpenSandboxWorkspaceManager
 from app.intent.models import Intent, IntentConfig, IntentResult
 from app.intent.rewriter import QueryRewriter
@@ -56,39 +36,23 @@ from app.orchestrator.parallel import ParallelOrchestrator
 from app.orchestrator.pipeline import PipelineOrchestrator
 from app.orchestrator.react import ReActOrchestrator
 from app.services.chat_service import create_model_from_config
-from app.services.mng_service import (
-    build_agent_definition_map,
-    fetch_external_intents,
-    merge_external_into_memory,
+from app.services.agent_state_store import (
+    load_agent_state,
+    persist_agent_state,
 )
+from app.services.upload_context_provider import (
+    append_upload_context,
+    has_unbound_uploads,
+    load_upload_context,
+    wait_for_upload_parsing,
+)
+from app.services.user_config_service import (
+    build_and_cache_user_config as user_config_build_and_cache,
+    load_config_bundle,
+)
+from app.services.workspace_assembler import assemble_workspace_components
 
 logger = logging.getLogger(__name__)
-
-# Redis key：用户融合后的配置（登录时写入，会话时读取）
-_REDIS_KEY_USER_CONFIG = "user_config:{user_id}"
-_USER_CONFIG_TTL = 3600 * 24 * JWT_REFRESH_EXPIRE_DAYS   # 与 user_permissions 同 TTL
-
-# 联网搜索技能名（与 skill_config.yml / agent_config.yml 中的 name 一致）
-_SEARCH_SKILL_NAME = "bocha_search"
-
-# 历史上下文保留条数（3 轮 = 6 条 user/assistant 消息），用于截断 AgentState.context
-_HISTORY_KEEP_LAST = 6
-
-# 上传文件解析内容注入提示词的头部标记与单文件截断上限（防超上下文）
-_UPLOAD_CTX_HEADER = "【用户上传文件解析内容】"
-_UPLOAD_CTX_MAX_CHARS = 30000
-
-# 提问时若上传文件仍在解析：轮询等待的总超时与间隔（秒）。
-# 超时后不再等待，改为在提示词中注入解析失败提示。
-_UPLOAD_WAIT_TIMEOUT = 15.0
-_UPLOAD_WAIT_POLL_INTERVAL = 1.0
-
-# 等待超时后仍在解析中的文件，按 parse_type 注入的失败提示文案
-_UPLOAD_PARSE_TIMEOUT_HINTS = {
-    "mineru": "解析超时，MinerU服务暂时无法解析该文件",
-    "asr": "解析超时，音频解析服务暂时无法解析该文件",
-}
-_UPLOAD_PARSE_TIMEOUT_HINT_DEFAULT = "解析超时，暂时无法解析该文件"
 
 
 @contextmanager
@@ -323,66 +287,6 @@ class OrchestratorService:
                 history.append({"role": role, "content": content})
         return history
 
-    @staticmethod
-    def _trim_state_context(state_dict: dict, keep_last: int = _HISTORY_KEEP_LAST) -> dict:
-        """截断 AgentState.context 为最后 N 条消息，控制模型输入 token。
-
-        AgentState.context 是完整对话历史 Msg_dict 列表；大模型上下文有限时
-        仅保留最近 keep_last 条（默认 6 = 3 轮）。仅内存截断，不落库。
-        """
-        if not state_dict:
-            return state_dict
-        ctx = state_dict.get("context")
-        if isinstance(ctx, list) and len(ctx) > keep_last:
-            state_dict = {**state_dict, "context": ctx[-keep_last:]}
-        return state_dict
-
-    async def _fuse_user_config(
-        self, jwt_token: str, permissions: dict
-    ) -> dict:
-        """步骤 1-4：加载 YAML + 请求 mng 外部意图 + 权限过滤 + 合并。
-
-        返回可 JSON 序列化的 dict，供登录时写入 Redis。
-        mng 请求失败仅记日志，降级为只用基础配置。
-        """
-        # ---- 1. 加载基础配置到内存 ----
-        base_agent_defs = load_agent_definitions(AGENT_CONFIG_PATH)
-        base_intents_raw = load_intent_config(INTENT_CONFIG_PATH)
-
-        with open(SKILL_CONFIG_PATH, "r", encoding="utf-8") as f:
-            base_skill_config = yaml.safe_load(f)
-        base_skills = base_skill_config.get("skills", [])
-
-        # ---- 2-3. 请求 mng 获取外部意图 ----
-        external_intents = []
-        if jwt_token:
-            try:
-                external_intents = await fetch_external_intents(jwt_token)
-            except Exception:
-                logger.exception(
-                    "[OrchestratorService] 登录时获取外部意图失败，仅用基础配置"
-                )
-                external_intents = []
-
-        # ---- 4. 权限过滤 + 合并配置 ----
-        merged_intents, merged_agents, merged_skills = merge_external_into_memory(
-            base_intents=base_intents_raw.get("intents", []),
-            base_agents=[a.model_dump() for a in base_agent_defs],
-            base_skills=base_skills,
-            external_intents=external_intents,
-            permissions=permissions or {},
-            external_skills_dir=EXTERNAL_SKILLS_DIR,
-        )
-        return {
-            "merged_intents": merged_intents,
-            "merged_agents": merged_agents,
-            "merged_skills": merged_skills,
-            "default_orchestration": base_intents_raw.get("default_orchestration", {}),
-            # agent_id → 意图 definition 映射，供登录接口为
-            # agent_access 注入 description（取自 /api/intents 原始返回）
-            "agent_definitions": build_agent_definition_map(external_intents),
-        }
-
     async def build_and_cache_user_config(
         self,
         user_id: str,
@@ -390,51 +294,14 @@ class OrchestratorService:
         permissions: dict,
         redis_client,
     ) -> dict:
-        """登录时融合（YAML + mng 外部意图 + 权限过滤）并写入 Redis。
+        """登录时融合并缓存用户配置（委托 user_config_service，供 auth 路由调用）。"""
+        return await user_config_build_and_cache(
+            user_id, jwt_token, permissions, redis_client,
+        )
 
-        供 /chat 会话时直接读取。失败不阻断登录：mng 不可用或 Redis
-        写失败均仅记日志，会话时读取不到缓存则走 base-only 兜底。
-
-        Returns:
-            融合后的配置 dict（含 agent_definitions 映射，供登录接口
-            为 agent_access 注入 description）；_fuse_user_config 异常时
-            由调用方兜底（该异常不在此吞掉，由 auth 侧 try/except 处理）。
-        """
-        fused = await self._fuse_user_config(jwt_token, permissions)
-        if redis_client is not None and user_id:
-            try:
-                key = _REDIS_KEY_USER_CONFIG.format(user_id=user_id)
-                await redis_client.set(
-                    key,
-                    json.dumps(fused, ensure_ascii=False).encode("utf-8"),
-                    ex=_USER_CONFIG_TTL,
-                )
-                logger.info(f"[OrchestratorService] 用户配置已缓存: {key}")
-            except Exception:
-                logger.exception(
-                    f"[OrchestratorService] 缓存用户配置失败 user={user_id}"
-                )
-        return fused
-
-    async def _load_cached_user_config(
-        self, user_id: str, redis_client
-    ) -> Optional[dict]:
-        """会话时从 Redis 读取登录时缓存的融合配置。不存在或失败返回 None。"""
-        if not user_id or redis_client is None:
-            return None
-        try:
-            key = _REDIS_KEY_USER_CONFIG.format(user_id=user_id)
-            raw = await redis_client.get(key)
-            if raw is None:
-                return None
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
-            return json.loads(raw)
-        except Exception:
-            logger.exception(
-                f"[OrchestratorService] 读取用户配置缓存失败 user={user_id}"
-            )
-            return None
+    async def _load_config_bundle(self, user_id: str, redis_client) -> dict:
+        """读取登录时缓存的融合配置，未命中 base-only 兜底（委托 user_config_service）。"""
+        return await load_config_bundle(user_id, redis_client)
 
     async def _resolve_workspace_task(self, ws_task: "asyncio.Task") -> tuple:
         """等待工作区准备任务完成。
@@ -452,28 +319,6 @@ class OrchestratorService:
             logger.exception("[OrchestratorService] 工作区准备失败")
             self._last_success = False
             return None, None, f"环境准备失败: {str(e)}"
-
-    async def _load_config_bundle(self, user_id: str, redis_client) -> dict:
-        """读取登录时缓存的融合配置（步骤 1-4 的产物），未命中则 base-only 兜底。
-
-        缓存命中 → 直接用登录时融合好的 merged_intents/agents/skills；
-        缓存未命中 → base-only 兜底融合（不请求 mng，无外部意图），
-        外部意图在下次登录后恢复。会话路径永不发起 mng HTTP 调用。
-        """
-        fused = await self._load_cached_user_config(user_id, redis_client)
-        if fused is not None:
-            return {
-                "merged_intents": fused.get("merged_intents", []),
-                "merged_agents": fused.get("merged_agents", []),
-                "merged_skills": fused.get("merged_skills", []),
-                "default_orchestration": fused.get("default_orchestration", {}),
-            }
-        # 缓存未命中兜底：base-only 融合（不请求 mng，无外部意图）
-        logger.warning(
-            f"[OrchestratorService] 用户配置缓存未命中 user={user_id}，"
-            f"走 base-only 兜底（无外部意图），下次登录后恢复"
-        )
-        return await self._fuse_user_config(jwt_token="", permissions={})
 
     def _build_intent_components(self, fused: dict) -> tuple:
         """构建请求级改写器与识别器（纯内存，不依赖工作区）。
@@ -509,139 +354,26 @@ class OrchestratorService:
         skills: Optional[List[str]] = None,
         langfuse_service: Optional[Any] = None,
     ) -> tuple:
-        """获取/创建工作区并组装注册表与工厂（依赖沙箱，可与意图链路并行）。
+        """获取/创建工作区并组装注册表与工厂（委托 workspace_assembler）。
 
-        含 workspace-load 环节埋点。本方法会被 run() 放进 asyncio.create_task，
+        本方法会被 run() 放进 asyncio.create_task，
         因此不得读写 self 上的请求级状态（_last_agent_ids / _last_success 等）。
 
         Returns:
             (registry, agent_factory)
         """
-        merged_agents = fused["merged_agents"]
-        merged_skills = fused["merged_skills"]
-        all_skill_dirs = [s["directory"] for s in merged_skills]
-
-        # ---- 获取/创建工作区 ----
-
-        # 环节埋点：工作区获取/创建子 span
-        ws_ctx = (
-            langfuse_service.start_span(
-                "workspace-load",
-                input={"user_id": user_id_safe, "session_id": session_id_safe},
-            )
-            if langfuse_service
-            else _noop_ctx()
-        )
-        with ws_ctx as ws_span:
-            workspace = await self._workspace_manager.get_workspace(user_id_safe, session_id_safe)
-            if workspace is None:
-                # 首次创建：create_workspace 内部会在 ws.initialize() 处单独记录 workspace-initialize 子 span
-                workspace = await self._workspace_manager.create_workspace(
-                    user_id=user_id_safe,
-                    session_id=session_id_safe,
-                    skill_dirs=all_skill_dirs,
-                    langfuse_service=langfuse_service,
-                )
-            if ws_span:
-                try:
-                    ws_span.update(output={
-                        "workspace_id": getattr(workspace, "workspace_id", None),
-                    })
-                except Exception:
-                    pass
-            
-        from tools.chart_tools import (
-            render_bar_chart, render_line_chart, render_pie_chart,
-            render_generic_card, render_metric_card, render_confirm_action,
-            render_indicator_table, render_selectable_list,
-        )
-        from agentscope.tool import FunctionTool
-        from tools.md_export_tools import create_md_export_tools
-        from tools.policy_qa_tools import create_policy_qa_tool
-
-        # 工具层：根据后端选择 agentscope 原生工具 / OpenSandbox 桥接工具
-        _chart_tools = [
-            FunctionTool(render_pie_chart), FunctionTool(render_bar_chart),
-            FunctionTool(render_line_chart), FunctionTool(render_generic_card),
-            FunctionTool(render_metric_card), FunctionTool(render_confirm_action),
-            FunctionTool(render_indicator_table), FunctionTool(render_selectable_list),
-        ]
-        # 制度问答工具（宿主侧 FunctionTool，知识库 ID 由用户权限自动映射，不依赖工作区后端）
-        policy_qa_tool = create_policy_qa_tool(user_id=user_id, redis_client=redis_client)
-
-        import base64
-
-        from app.services.opensandbox_adapter import OpenSandboxToolAdapter
-        from app.services.opensandbox_tool_bridge import create_opensandbox_tools
-        # workspace 此处是 OpenSandbox Sandbox 实例
-        adapter = OpenSandboxToolAdapter(
-            workspace, workdir=f"/data/workspaces/{session_id_safe}"
-        )
-
-        # Markdown 导出工具的沙箱读写闭包：文本读直接走 adapter.read；
-        # 二进制写经 base64 文本通道 + bash 解码落盘
-        # （与 opensandbox_workspace_manager.read_session_file 的二进制读取模式对称）
-        async def _sandbox_read_file(rel_path: str) -> str:
-            return await adapter.read(f"{adapter.workdir}/{rel_path}")
-
-        async def _sandbox_write_file(rel_path: str, data: bytes) -> None:
-            abs_path = f"{adapter.workdir}/{rel_path}"
-            b64_path = f"{abs_path}.b64"
-            await adapter.write(b64_path, base64.b64encode(data).decode("ascii"))
-            result = await adapter.bash(f"base64 -d '{b64_path}' > '{abs_path}'")
-            # 解码成败均清理临时 b64，避免残留进入 files_generated 快照差分
-            await adapter.bash(f"rm -f '{b64_path}'")
-            if result["exit_code"] != 0:
-                raise RuntimeError(
-                    f"base64 解码写入沙箱失败 exit={result['exit_code']} "
-                    f"stderr={result['stderr']}"
-                )
-
-        md_tools = create_md_export_tools(_sandbox_read_file, _sandbox_write_file)
-        all_tools = (
-            create_opensandbox_tools(adapter) + _chart_tools
-            + [policy_qa_tool] + md_tools
-        )
-        # 联网搜索工具受请求开关控制：关闭时不注入
-        # （Toolkit 的 tools 对所有 agent 全局可见，需与技能过滤同步收口）
-        if search_enabled:
-            from tools.bocha_search_tools import create_bocha_search_tool
-            all_tools.append(create_bocha_search_tool())
-        # 技能列表由管理器扫描沙箱内 /workspace/skills/ 获取
-        all_skills_meta = await self._workspace_manager.list_skills(
-            user_id=user_id_safe, session_id=session_id_safe
-        )
-
-        # 按请求开关显隐联网搜索技能（workspace 始终装载全部技能，此处按轮次过滤）
-        if not search_enabled:
-            all_skills_meta = [
-                m for m in all_skills_meta
-                if (getattr(m, "name", None) or
-                    (m.get("name") if isinstance(m, dict) else None)
-                    ) != _SEARCH_SKILL_NAME
-            ]
-
-        # ---- 6. 构建临时注册表 ----
-        agent_defs = [AgentDefinition(**a) for a in merged_agents]
-
-        # 请求级附加技能：用户请求 skills ∪（search_enabled 时追加 bocha_search）
-        # bocha_search 追加到 extra 后会 union 到每个 agent；
-        # search_enabled=False 时 all_skills_meta 已移除 bocha_search，
-        # extra 中的声明匹配不到 loader 自动失效，行为不变
-        extra_skills = list(skills or [])
-        if search_enabled:
-            extra_skills.append(_SEARCH_SKILL_NAME)
-
-        registry = AgentRegistry(
-            definitions=agent_defs,
-            workspace=workspace,
-            all_tools=all_tools,
-            all_skills_meta=all_skills_meta,
+        return await assemble_workspace_components(
+            workspace_manager=self._workspace_manager,
             create_model_fn=self._create_model_fn,
-            extra_skill_names=extra_skills,
+            fused=fused,
+            user_id=user_id,
+            redis_client=redis_client,
+            user_id_safe=user_id_safe,
+            session_id_safe=session_id_safe,
+            search_enabled=search_enabled,
+            skills=skills,
+            langfuse_service=langfuse_service,
         )
-        agent_factory = AgentFactory(registry)
-        return registry, agent_factory
 
     def _span(self, langfuse_service: Any, name: str, input_dict: dict) -> Any:
         """统一 span 创建：启用 langfuse 时启动子 span，否则返回空 context manager。
@@ -651,84 +383,6 @@ class OrchestratorService:
         if langfuse_service:
             return langfuse_service.start_span(name, input=input_dict)
         return _noop_ctx()
-
-    @staticmethod
-    def _migrate_legacy_enum_values(state_dict: dict) -> dict:
-        """修正历史脏数据中枚举被 str() 序列化的问题。
-
-        根因：早期保存使用 model_dump() + json.dumps(default=str)，枚举实例
-        （如 PermissionMode.BYPASS）被 str() 转成 "PermissionMode.BYPASS"
-        而非 "bypass"，导致反序列化时 PermissionMode("PermissionMode.BYPASS")
-        抛 ValueError。此处检测并修正为合法的枚举值。
-        """
-        if not isinstance(state_dict, dict):
-            return state_dict
-
-        # permission_context.mode: "PermissionMode.BYPASS" → "bypass"
-        perm = state_dict.get("permission_context")
-        if isinstance(perm, dict):
-            mode = perm.get("mode")
-            if isinstance(mode, str) and mode.startswith("PermissionMode."):
-                perm["mode"] = mode.split(".", 1)[1].lower()
-        return state_dict
-
-    async def _load_agent_state(
-        self,
-        session_service: Any,
-        session_id: Optional[str],
-        agent_id: str,
-    ) -> Optional[AgentState]:
-        """加载单个 agent 的 AgentState：从 session_service 读取 + 历史脏数据迁移
-        + trim 截断 + 异常兜底。
-
-        session_service 为空或读取失败均返回 None（调用方创建新状态）。
-        反序列化失败时记录 warning（含异常栈），便于定位 schema 不兼容问题。
-        """
-        if not (session_service and session_id):
-            return None
-        try:
-            state_dict = await session_service.load_agent_state(session_id, agent_id)
-        except Exception:
-            logger.warning(
-                f"[OrchestratorService] 读取 {agent_id} 状态失败，将新建",
-                exc_info=True,
-            )
-            return None
-        if not state_dict:
-            return None
-
-        # 历史脏数据迁移：修正 "PermissionMode.BYPASS" → "bypass" 等
-        state_dict = self._migrate_legacy_enum_values(state_dict)
-        # 截断 context 为最近 N 条，控制模型输入 token
-        state_dict = self._trim_state_context(state_dict)
-        try:
-            return AgentState.model_validate(state_dict)
-        except Exception:
-            logger.warning(
-                f"[OrchestratorService] 反序列化 {agent_id} 状态失败，将新建",
-                exc_info=True,
-            )
-            return None
-
-    async def _persist_agent_state(
-        self,
-        session_service: Any,
-        session_id: Optional[str],
-        user_id: Optional[str],
-        agent_id: str,
-        state_dict: dict,
-    ) -> None:
-        """保存单个 agent 的 AgentState（带非空校验与异常兜底）。"""
-        if not (session_service and session_id and user_id and state_dict):
-            return
-        try:
-            await session_service.save_agent_state(
-                session_id, user_id, agent_id, state_dict,
-            )
-        except Exception:
-            logger.exception(
-                f"[OrchestratorService] 保存 agent {agent_id} 状态失败"
-            )
 
     async def _run_single_agent_path(
         self,
@@ -763,7 +417,7 @@ class OrchestratorService:
         intent = Intent(id=f"direct_{agent_id}", query=user_input, agent=agent_id)
 
         # 加载已有 AgentState
-        agent_state = await self._load_agent_state(session_service, session_id, agent_id)
+        agent_state = await load_agent_state(session_service, session_id, agent_id)
 
         # 创建 agent 实例
         agent = agent_factory.create_for_agent(
@@ -812,7 +466,7 @@ class OrchestratorService:
 
                 # 保存 AgentState（mode="json" 确保枚举等类型序列化为值，避免落库后无法反序列化）
                 final_state = agent.state.model_dump(mode="json")
-                await self._persist_agent_state(
+                await persist_agent_state(
                     session_service, session_id, user_id, agent_id, final_state,
                 )
 
@@ -975,122 +629,6 @@ class OrchestratorService:
             elif not ws_task.cancelled():
                 ws_task.exception()
 
-    async def _wait_for_upload_parsing(
-        self, request: Any, session_id: Optional[str]
-    ) -> AsyncGenerator[str, None]:
-        """存在解析中的未绑定上传文件时，轮询等待其完成（最多 _UPLOAD_WAIT_TIMEOUT 秒）。
-
-        等待期间发一对 TOOL_CALL_START/TOOL_CALL_END 事件（tool_call_name
-        "等待mineru文件解析完成"，id 随机造，仅用于前端展示）；
-        DAO 异常静默结束（不等待、不发事件），不影响问答主流程。
-        """
-        if request is None or not session_id:
-            return
-        dao = getattr(request.app.state, "upload_file_dao", None)
-        if dao is None:
-            return
-        try:
-            parsing = await dao.load_unbound_parsing(session_id)
-        except Exception:
-            logger.warning("[OrchestratorService] 查询解析中上传文件失败", exc_info=True)
-            return
-        if not parsing:
-            return
-
-        reply_id = f"upload-wait-{uuid.uuid4().hex[:12]}"
-        tool_call_id = f"upload-wait-{uuid.uuid4().hex[:12]}"
-        yield (
-            "data: "
-            + ToolCallStartEvent(
-                reply_id=reply_id,
-                tool_call_id=tool_call_id,
-                tool_call_name="等待mineru文件解析完成",
-                metadata={"files": [r.get("filename", "") for r in parsing]},
-            ).model_dump_json()
-            + "\n\n"
-        )
-        deadline = time.monotonic() + _UPLOAD_WAIT_TIMEOUT
-        while True:
-            await asyncio.sleep(_UPLOAD_WAIT_POLL_INTERVAL)
-            try:
-                parsing = await dao.load_unbound_parsing(session_id)
-            except Exception:
-                logger.warning("[OrchestratorService] 轮询解析状态失败，停止等待", exc_info=True)
-                break
-            if not parsing:
-                break
-            if time.monotonic() >= deadline:
-                break
-        yield (
-            "data: "
-            + ToolCallEndEvent(
-                reply_id=reply_id,
-                tool_call_id=tool_call_id,
-            ).model_dump_json()
-            + "\n\n"
-        )
-
-    async def _load_upload_context(self, request: Any, session_id: Optional[str]) -> str:
-        """检索该会话未绑定消息的上传文件解析内容，拼接为提示词片段。
-
-        上传文件在 /upload 时即后台解析入库（见 file_parse_service）；
-        此处只取 message_id IS NULL 且解析内容非空的记录（失败文案也算，
-        让 agent 诚实告知用户）。检索失败静默返回空串，不影响问答主流程。
-        """
-        if request is None or not session_id:
-            return ""
-        dao = getattr(request.app.state, "upload_file_dao", None)
-        if dao is None:
-            return ""
-        try:
-            rows = await dao.load_unbound_parsed(session_id)
-        except Exception:
-            logger.warning("[OrchestratorService] 检索上传文件解析内容失败", exc_info=True)
-            return ""
-        # 等待超时后仍在解析中的文件：注入解析失败提示（agent 诚实告知用户）
-        try:
-            parsing_rows = await dao.load_unbound_parsing(session_id)
-        except Exception:
-            logger.warning("[OrchestratorService] 检索解析中上传文件失败", exc_info=True)
-            parsing_rows = []
-        if not rows and not parsing_rows:
-            return ""
-        parts = [_UPLOAD_CTX_HEADER]
-        for row in rows:
-            content = (row.get("parsed_content") or "")[:_UPLOAD_CTX_MAX_CHARS]
-            parts.append(f"=== 文件名: {row.get('filename', '')} ===")
-            parts.append(content)
-        for row in parsing_rows:
-            hint = _UPLOAD_PARSE_TIMEOUT_HINTS.get(
-                row.get("parse_type"), _UPLOAD_PARSE_TIMEOUT_HINT_DEFAULT
-            )
-            parts.append(f"=== 文件名: {row.get('filename', '')} ===")
-            parts.append(hint)
-        return "\n".join(parts)
-
-    @staticmethod
-    def _append_upload_context(text: str, upload_ctx: str) -> str:
-        """把上传文件上下文追加到文本尾部（上下文为空时原样返回）。"""
-        if not upload_ctx:
-            return text
-        return f"{text}\n\n{upload_ctx}"
-
-    async def _has_unbound_uploads(self, request: Any, session_id: Optional[str]) -> bool:
-        """该会话是否存在未绑定消息的上传文件（用于跳过问题改写）。
-
-        检索失败静默返回 False（不影响问答主流程，仅照常做改写）。
-        """
-        if request is None or not session_id:
-            return False
-        dao = getattr(request.app.state, "upload_file_dao", None)
-        if dao is None:
-            return False
-        try:
-            return await dao.has_unbound_files(session_id)
-        except Exception:
-            logger.warning("[OrchestratorService] 检查未绑定上传文件失败", exc_info=True)
-            return False
-
     async def _run_with_workspace_task(
         self,
         ws_task: "asyncio.Task",
@@ -1118,10 +656,10 @@ class OrchestratorService:
                 yield self._event({"type": "error", "message": ws_err})
                 return
             # 等待解析中的上传文件（向前端发 TOOL_CALL 事件对展示等待过程）
-            async for ev in self._wait_for_upload_parsing(request, session_id):
+            async for ev in wait_for_upload_parsing(request, session_id):
                 yield ev
-            upload_ctx = await self._load_upload_context(request, session_id)
-            user_input = self._append_upload_context(user_input, upload_ctx)
+            upload_ctx = await load_upload_context(request, session_id)
+            user_input = append_upload_context(user_input, upload_ctx)
             async for ev in self._capture_tokens_from_stream(
                 self._run_single_agent_path(
                     registry, agent_factory, agent_id, user_input,
@@ -1134,7 +672,7 @@ class OrchestratorService:
         # ③ 查询改写（联系上下文，失败降级为原始输入）。
         # 有未消费的上传文件时跳过改写：文件解析内容将在编排前注入 query，
         # 原始问题已足够完整，改写反而可能引入偏差
-        skip_rewrite = await self._has_unbound_uploads(request, session_id)
+        skip_rewrite = await has_unbound_uploads(request, session_id)
         with self._span(
             langfuse_service, "query-rewrite",
             {"original": user_input, "history_len": len(history)},
@@ -1228,14 +766,14 @@ class OrchestratorService:
             return
 
         # 等待解析中的上传文件（向前端发 TOOL_CALL 事件对展示等待过程）
-        async for ev in self._wait_for_upload_parsing(request, session_id):
+        async for ev in wait_for_upload_parsing(request, session_id):
             yield ev
         # 上传文件解析内容注入：意图识别已通过，真正进入问答阶段。
         # 附加到每个 intent 的 query（pipeline/react 均以 intent.query 作为 agent 任务输入）
-        upload_ctx = await self._load_upload_context(request, session_id)
+        upload_ctx = await load_upload_context(request, session_id)
         if upload_ctx:
             for intent in intent_result.intents:
-                intent.query = self._append_upload_context(intent.query, upload_ctx)
+                intent.query = append_upload_context(intent.query, upload_ctx)
 
         # ⑥ 选择编排器并加载各 agent 状态
         mode = recognizer.get_orchestration_mode(intent_result)
@@ -1244,7 +782,7 @@ class OrchestratorService:
         agent_states: Dict[str, AgentState] = {}
         for intent in intent_result.intents:
             aid = intent.agent or "general_agent"
-            agent_states[aid] = await self._load_agent_state(
+            agent_states[aid] = await load_agent_state(
                 session_service, session_id, aid,
             )
 
@@ -1269,6 +807,6 @@ class OrchestratorService:
         ))
         for r in orchestrator._last_results:
             if r.final_state:
-                await self._persist_agent_state(
+                await persist_agent_state(
                     session_service, session_id, user_id, r.agent_id, r.final_state,
                 )

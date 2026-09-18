@@ -4,15 +4,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.services import orchestrator_service as orch_mod
-from app.services.orchestrator_service import OrchestratorService
+from app.services import upload_context_provider as ucp
+from app.services.upload_context_provider import (
+    append_upload_context,
+    has_unbound_uploads,
+    load_upload_context,
+    wait_for_upload_parsing,
+)
 from app.services.chat_service import _persist_conversation_history
 from app.dao.upload_file_dao import UploadFileDAO
-
-
-def _make_service() -> OrchestratorService:
-    """绕过 __init__ 构造服务实例（被测方法不依赖实例状态）。"""
-    return object.__new__(OrchestratorService)
 
 
 def _make_request(dao=None):
@@ -51,8 +51,8 @@ async def test_load_upload_context_joins_files():
         {"filename": "报告.pdf", "parsed_content": "# 报告内容"},
         {"filename": "语音.m4a", "parsed_content": "测试语音"},
     ])
-    ctx = await _make_service()._load_upload_context(_make_request(dao), "s1")
-    assert ctx.startswith(orch_mod._UPLOAD_CTX_HEADER)
+    ctx = await load_upload_context(_make_request(dao), "s1")
+    assert ctx.startswith(ucp._UPLOAD_CTX_HEADER)
     assert "=== 文件名: 报告.pdf ===" in ctx
     assert "# 报告内容" in ctx
     assert "=== 文件名: 语音.m4a ===" in ctx
@@ -64,40 +64,40 @@ async def test_load_upload_context_joins_files():
 @pytest.mark.asyncio
 async def test_load_upload_context_truncates_single_file():
     dao = _FakeUploadDao(rows=[
-        {"filename": "big.pdf", "parsed_content": "x" * (orch_mod._UPLOAD_CTX_MAX_CHARS + 100)},
+        {"filename": "big.pdf", "parsed_content": "x" * (ucp._UPLOAD_CTX_MAX_CHARS + 100)},
     ])
-    ctx = await _make_service()._load_upload_context(_make_request(dao), "s1")
+    ctx = await load_upload_context(_make_request(dao), "s1")
     body = ctx.split("=== 文件名: big.pdf ===\n", 1)[1]
-    assert len(body) == orch_mod._UPLOAD_CTX_MAX_CHARS
+    assert len(body) == ucp._UPLOAD_CTX_MAX_CHARS
 
 
 @pytest.mark.asyncio
 async def test_load_upload_context_empty_when_no_files():
     dao = _FakeUploadDao(rows=[])
-    assert await _make_service()._load_upload_context(_make_request(dao), "s1") == ""
+    assert await load_upload_context(_make_request(dao), "s1") == ""
 
 
 @pytest.mark.asyncio
 async def test_load_upload_context_empty_when_no_session():
     dao = _FakeUploadDao(rows=[{"filename": "a.pdf", "parsed_content": "c"}])
-    assert await _make_service()._load_upload_context(_make_request(dao), None) == ""
-    assert await _make_service()._load_upload_context(_make_request(dao), "") == ""
+    assert await load_upload_context(_make_request(dao), None) == ""
+    assert await load_upload_context(_make_request(dao), "") == ""
 
 
 @pytest.mark.asyncio
 async def test_load_upload_context_empty_when_no_request():
-    assert await _make_service()._load_upload_context(None, "s1") == ""
+    assert await load_upload_context(None, "s1") == ""
 
 
 @pytest.mark.asyncio
 async def test_load_upload_context_empty_when_dao_missing():
-    assert await _make_service()._load_upload_context(_make_request(None), "s1") == ""
+    assert await load_upload_context(_make_request(None), "s1") == ""
 
 
 @pytest.mark.asyncio
 async def test_load_upload_context_swallows_dao_exception():
     dao = _FakeUploadDao(exc=RuntimeError("db down"))
-    assert await _make_service()._load_upload_context(_make_request(dao), "s1") == ""
+    assert await load_upload_context(_make_request(dao), "s1") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -105,12 +105,12 @@ async def test_load_upload_context_swallows_dao_exception():
 # ---------------------------------------------------------------------------
 
 def test_append_upload_context_appends():
-    result = OrchestratorService._append_upload_context("用户问题", "【文件】内容")
+    result = append_upload_context("用户问题", "【文件】内容")
     assert result == "用户问题\n\n【文件】内容"
 
 
 def test_append_upload_context_empty_ctx_untouched():
-    assert OrchestratorService._append_upload_context("用户问题", "") == "用户问题"
+    assert append_upload_context("用户问题", "") == "用户问题"
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +127,8 @@ async def test_load_upload_context_includes_timeout_hints():
             {"filename": "语音.m4a", "parse_type": "asr"},
         ],
     )
-    ctx = await _make_service()._load_upload_context(_make_request(dao), "s1")
-    assert ctx.startswith(orch_mod._UPLOAD_CTX_HEADER)
+    ctx = await load_upload_context(_make_request(dao), "s1")
+    assert ctx.startswith(ucp._UPLOAD_CTX_HEADER)
     # parsed 在前
     assert "=== 文件名: 报告.pdf ===" in ctx
     assert "# 报告内容" in ctx
@@ -145,8 +145,8 @@ async def test_load_upload_context_only_parsing_files():
     dao = _FakeUploadDao(
         parsing_rows=[{"filename": "大文件.pdf", "parse_type": "mineru"}],
     )
-    ctx = await _make_service()._load_upload_context(_make_request(dao), "s1")
-    assert ctx.startswith(orch_mod._UPLOAD_CTX_HEADER)
+    ctx = await load_upload_context(_make_request(dao), "s1")
+    assert ctx.startswith(ucp._UPLOAD_CTX_HEADER)
     assert "=== 文件名: 大文件.pdf ===" in ctx
     assert "解析超时，MinerU服务暂时无法解析该文件" in ctx
 
@@ -157,8 +157,8 @@ async def test_load_upload_context_unknown_parse_type_default_hint():
     dao = _FakeUploadDao(
         parsing_rows=[{"filename": "a.bin", "parse_type": "whatever"}],
     )
-    ctx = await _make_service()._load_upload_context(_make_request(dao), "s1")
-    assert orch_mod._UPLOAD_PARSE_TIMEOUT_HINT_DEFAULT in ctx
+    ctx = await load_upload_context(_make_request(dao), "s1")
+    assert ucp._UPLOAD_PARSE_TIMEOUT_HINT_DEFAULT in ctx
 
 
 @pytest.mark.asyncio
@@ -170,7 +170,7 @@ async def test_load_upload_context_swallows_parsing_dao_exception():
         raise RuntimeError("db down")
 
     dao.load_unbound_parsing = _raise
-    ctx = await _make_service()._load_upload_context(_make_request(dao), "s1")
+    ctx = await load_upload_context(_make_request(dao), "s1")
     assert "=== 文件名: a.pdf ===" in ctx
     assert "内容" in ctx
 
@@ -210,7 +210,7 @@ def _parse_sse(raw: str) -> dict:
 async def test_wait_no_events_without_parsing_files(dao, session_id):
     """无解析中文件/无会话：不 yield 任何事件（普通路径零扰动）。"""
     events = [
-        ev async for ev in _make_service()._wait_for_upload_parsing(
+        ev async for ev in wait_for_upload_parsing(
             _make_request(dao), session_id,
         )
     ]
@@ -220,7 +220,7 @@ async def test_wait_no_events_without_parsing_files(dao, session_id):
 @pytest.mark.asyncio
 async def test_wait_no_events_when_dao_missing():
     assert [
-        ev async for ev in _make_service()._wait_for_upload_parsing(_make_request(None), "s1")
+        ev async for ev in wait_for_upload_parsing(_make_request(None), "s1")
     ] == []
 
 
@@ -228,22 +228,22 @@ async def test_wait_no_events_when_dao_missing():
 async def test_wait_no_events_when_dao_raises():
     dao = _ScriptedParsingDao([RuntimeError("db down")])
     assert [
-        ev async for ev in _make_service()._wait_for_upload_parsing(_make_request(dao), "s1")
+        ev async for ev in wait_for_upload_parsing(_make_request(dao), "s1")
     ] == []
 
 
 @pytest.mark.asyncio
 async def test_wait_emits_start_end_pair_on_completion(monkeypatch):
     """解析中→完成：恰好 START+END 两个事件，id 复用、字段正确。"""
-    monkeypatch.setattr(orch_mod, "_UPLOAD_WAIT_TIMEOUT", 5.0)
-    monkeypatch.setattr(orch_mod, "_UPLOAD_WAIT_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(ucp, "_UPLOAD_WAIT_TIMEOUT", 5.0)
+    monkeypatch.setattr(ucp, "_UPLOAD_WAIT_POLL_INTERVAL", 0.01)
     dao = _ScriptedParsingDao([
         [{"filename": "a.pdf", "parse_type": "mineru"}],  # 首查：解析中
         [],                                               # 第一次轮询：已完成
     ])
 
     events = [
-        ev async for ev in _make_service()._wait_for_upload_parsing(_make_request(dao), "s1")
+        ev async for ev in wait_for_upload_parsing(_make_request(dao), "s1")
     ]
 
     assert len(events) == 2
@@ -263,14 +263,14 @@ async def test_wait_emits_start_end_pair_on_completion(monkeypatch):
 @pytest.mark.asyncio
 async def test_wait_times_out_and_emits_end(monkeypatch):
     """始终未完成：超时后停止轮询并发 END（同样恰好两个事件）。"""
-    monkeypatch.setattr(orch_mod, "_UPLOAD_WAIT_TIMEOUT", 0.05)
-    monkeypatch.setattr(orch_mod, "_UPLOAD_WAIT_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(ucp, "_UPLOAD_WAIT_TIMEOUT", 0.05)
+    monkeypatch.setattr(ucp, "_UPLOAD_WAIT_POLL_INTERVAL", 0.01)
     dao = _ScriptedParsingDao([
         [{"filename": "a.pdf", "parse_type": "mineru"}],  # 永远解析中
     ])
 
     events = [
-        ev async for ev in _make_service()._wait_for_upload_parsing(_make_request(dao), "s1")
+        ev async for ev in wait_for_upload_parsing(_make_request(dao), "s1")
     ]
 
     assert len(events) == 2
@@ -285,15 +285,15 @@ async def test_wait_times_out_and_emits_end(monkeypatch):
 @pytest.mark.asyncio
 async def test_wait_stops_polling_on_dao_error(monkeypatch):
     """轮询中 DAO 异常：立即停止等待，END 事件仍发出收尾。"""
-    monkeypatch.setattr(orch_mod, "_UPLOAD_WAIT_TIMEOUT", 5.0)
-    monkeypatch.setattr(orch_mod, "_UPLOAD_WAIT_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(ucp, "_UPLOAD_WAIT_TIMEOUT", 5.0)
+    monkeypatch.setattr(ucp, "_UPLOAD_WAIT_POLL_INTERVAL", 0.01)
     dao = _ScriptedParsingDao([
         [{"filename": "a.pdf", "parse_type": "mineru"}],  # 首查：解析中
         RuntimeError("db down"),                          # 第一次轮询：异常
     ])
 
     events = [
-        ev async for ev in _make_service()._wait_for_upload_parsing(_make_request(dao), "s1")
+        ev async for ev in wait_for_upload_parsing(_make_request(dao), "s1")
     ]
 
     assert len(events) == 2
@@ -528,31 +528,31 @@ class _HasFilesDao:
 @pytest.mark.asyncio
 async def test_has_unbound_uploads_true():
     dao = _HasFilesDao(result=True)
-    assert await _make_service()._has_unbound_uploads(_make_request(dao), "s1") is True
+    assert await has_unbound_uploads(_make_request(dao), "s1") is True
     assert dao.calls == ["s1"]
 
 
 @pytest.mark.asyncio
 async def test_has_unbound_uploads_false():
     dao = _HasFilesDao(result=False)
-    assert await _make_service()._has_unbound_uploads(_make_request(dao), "s1") is False
+    assert await has_unbound_uploads(_make_request(dao), "s1") is False
 
 
 @pytest.mark.asyncio
 async def test_has_unbound_uploads_no_session_or_request():
     dao = _HasFilesDao(result=True)
-    assert await _make_service()._has_unbound_uploads(_make_request(dao), None) is False
-    assert await _make_service()._has_unbound_uploads(_make_request(dao), "") is False
-    assert await _make_service()._has_unbound_uploads(None, "s1") is False
+    assert await has_unbound_uploads(_make_request(dao), None) is False
+    assert await has_unbound_uploads(_make_request(dao), "") is False
+    assert await has_unbound_uploads(None, "s1") is False
     assert dao.calls == []
 
 
 @pytest.mark.asyncio
 async def test_has_unbound_uploads_no_dao():
-    assert await _make_service()._has_unbound_uploads(_make_request(None), "s1") is False
+    assert await has_unbound_uploads(_make_request(None), "s1") is False
 
 
 @pytest.mark.asyncio
 async def test_has_unbound_uploads_swallows_exception():
     dao = _HasFilesDao(result=True, exc=RuntimeError("db down"))
-    assert await _make_service()._has_unbound_uploads(_make_request(dao), "s1") is False
+    assert await has_unbound_uploads(_make_request(dao), "s1") is False
