@@ -71,7 +71,7 @@ async def delete_message_favorite(
     return success_response({"deleted": deleted})
 
 
-@router.get("/message_favorites")
+@router.get("/message_favorites/list")
 async def list_message_favorites(
     request: Request,
     user: dict = Depends(current_user),
