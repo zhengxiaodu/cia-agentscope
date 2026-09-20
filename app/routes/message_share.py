@@ -38,6 +38,19 @@ def _clean_pair_ids(raw) -> List[str]:
     return result
 
 
+def _truncate_title(text: str) -> str:
+    """标题 = 首条用户消息截断 50 字符（与会话名称生成逻辑一致）。"""
+    return (text or "")[:50]
+
+
+def _first_user_message_title(messages: List[dict]) -> str:
+    """从消息 dict 列表取首条 user 消息文本截断；无则空串（旧数据兜底）。"""
+    for m in messages:
+        if m.get("role") == "user" and m.get("content"):
+            return _truncate_title(str(m["content"]))
+    return ""
+
+
 @router.post("/message_share")
 async def create_message_share(
     request: Request,
@@ -65,8 +78,14 @@ async def create_message_share(
     if meta.get("user_id") != user.get("user_id"):
         return error_response(403, "会话不属于当前用户")
 
+    # 分享标题：取被分享首条用户消息截断 50 字符（查询失败返回空串，不阻断创建）
+    raw = await share_dao.get_first_user_message(
+        user.get("user_id"), session_id, pair_ids
+    )
+    title = _truncate_title(raw)
+
     shared_id = await share_dao.create_share(
-        session_id, user.get("user_id"), pair_ids
+        session_id, user.get("user_id"), pair_ids, title
     )
     return success_response({"shared_id": shared_id})
 
@@ -105,4 +124,8 @@ async def get_message_share(shared_id: str, request: Request):
         f for f in data["upload_files"]
         if f.get("message_pair_id") in pair_ids
     ]
+    # 分享标题：创建时持久化；存量旧数据（title 为空）从被分享消息动态兜底
+    data["title"] = share.get("title") or _first_user_message_title(
+        data["messages"]
+    )
     return success_response(data)

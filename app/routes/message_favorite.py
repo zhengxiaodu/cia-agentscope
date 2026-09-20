@@ -12,7 +12,13 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, Request
 
 from app.dependencies import current_user
-from app.routes.message_share import _clean_pair_ids, error_response, success_response
+from app.routes.message_share import (
+    _clean_pair_ids,
+    _first_user_message_title,
+    _truncate_title,
+    error_response,
+    success_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +40,12 @@ async def create_message_favorite(
     if not pair_ids:
         return error_response(400, "message_pair_ids 不能为空")
 
+    # 收藏标题：取组内首条用户消息截断 50 字符（查询失败返回空串，不阻断创建）
+    raw = await favorite_dao.get_first_user_message(user.get("user_id"), pair_ids)
+    title = _truncate_title(raw)
+
     favorite_id, copied = await favorite_dao.create_favorite(
-        user.get("user_id"), pair_ids
+        user.get("user_id"), pair_ids, title
     )
     if copied == 0:
         return error_response(404, "未找到对应消息")
@@ -113,6 +123,9 @@ async def list_message_favorites(
             )
         favorites.append({
             "favorite_id": fid,
+            # 组内各行共享同一 title（创建时写入）；空则从组内消息兜底（存量旧数据）
+            "title": (messages[0].get("title") if messages else "")
+                     or _first_user_message_title(messages),
             "messages": messages,
             "files": files,
             "upload_files": upload_files,

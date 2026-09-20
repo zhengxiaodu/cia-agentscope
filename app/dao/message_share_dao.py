@@ -28,11 +28,13 @@ class MessageShareDAO:
         session_id: str,
         user_id: str,
         message_pair_ids: List[str],
+        title: str = "",
     ) -> str:
         """创建分享记录，返回生成的 shared_id。
 
         shared_id 为 secrets.token_hex(8)（16 位十六进制小写）；
         命中唯一键冲突（MySQL 1062）时换 id 重试。
+        title：分享标题（创建时取被分享首条用户消息截断，可为空）。
         """
         pair_ids_json = json.dumps(message_pair_ids, ensure_ascii=False)
         last_err: Optional[Exception] = None
@@ -43,9 +45,9 @@ class MessageShareDAO:
                     async with conn.cursor(aiomysql.DictCursor) as cur:
                         await cur.execute(
                             "INSERT INTO message_shares "
-                            "(shared_id, session_id, user_id, message_pair_ids) "
-                            "VALUES (%s, %s, %s, %s)",
-                            (shared_id, session_id, user_id, pair_ids_json),
+                            "(shared_id, session_id, user_id, message_pair_ids, "
+                            "title) VALUES (%s, %s, %s, %s, %s)",
+                            (shared_id, session_id, user_id, pair_ids_json, title),
                         )
                         await conn.commit()
                         return shared_id
@@ -57,18 +59,49 @@ class MessageShareDAO:
                 raise
         raise last_err or RuntimeError("create_share 重试耗尽")
 
+    async def get_first_user_message(
+        self, user_id: str, session_id: str, message_pair_ids: List[str]
+    ) -> str:
+        """查这批 message_pair_ids 中最早的一条用户消息文本（分享标题来源）。
+
+        无匹配行或查询异常返回空串（标题失败不阻断创建流程）。
+        ORDER BY id ASC 与收藏复制的排序语义一致。
+        """
+        if not message_pair_ids:
+            return ""
+        placeholders = ", ".join(["%s"] * len(message_pair_ids))
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute(
+                        "SELECT content FROM messages "
+                        f"WHERE user_id = %s AND session_id = %s "
+                        f"AND message_pair_id IN ({placeholders}) "
+                        "AND role = 'user' ORDER BY id ASC LIMIT 1",
+                        [user_id, session_id] + list(message_pair_ids),
+                    )
+                    row = await cur.fetchone()
+                    await conn.commit()
+                    if row is None:
+                        return ""
+                    return str(row.get("content") or "")
+        except Exception:
+            logger.warning("[MessageShareDAO] 查询首条用户消息失败", exc_info=True)
+            return ""
+
     async def get_share(self, shared_id: str) -> Optional[dict]:
         """按 shared_id 查询分享记录。
 
-        返回 {shared_id, session_id, user_id, message_pair_ids: list, created_at}；
-        不存在返回 None。message_pair_ids 的 MySQL JSON 列可能返回 str 或
-        已解析的 list，统一兜底为 list。
+        返回 {shared_id, session_id, user_id, message_pair_ids: list, title,
+        created_at}；不存在返回 None。message_pair_ids 的 MySQL JSON 列可能
+        返回 str 或已解析的 list，统一兜底为 list。
         """
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT shared_id, session_id, user_id, message_pair_ids, "
-                    "created_at FROM message_shares WHERE shared_id = %s",
+                    "title, created_at FROM message_shares "
+                    "WHERE shared_id = %s",
                     (shared_id,),
                 )
                 row = await cur.fetchone()

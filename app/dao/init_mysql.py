@@ -93,23 +93,27 @@ CREATE INDEX idx_upload_files_session_msg ON upload_files(session_id, message_id
 CREATE INDEX idx_upload_files_user_id ON upload_files(user_id);
 
 -- 消息分享记录：shared_id 为 16 位随机十六进制串；不设 FK（分享记录独立于会话生命周期）
+-- title：分享标题（创建时取被分享首条用户消息截断 50 字符）
 CREATE TABLE IF NOT EXISTS message_shares (
     id               BIGINT AUTO_INCREMENT PRIMARY KEY,
     shared_id        VARCHAR(32) NOT NULL,
     session_id       VARCHAR(64) NOT NULL,
     user_id          VARCHAR(64) NOT NULL DEFAULT '',
     message_pair_ids JSON NOT NULL,
+    title            VARCHAR(255) NOT NULL DEFAULT '',
     created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE UNIQUE INDEX uniq_message_shares_shared_id ON message_shares(shared_id);
 CREATE INDEX idx_message_shares_session_id ON message_shares(session_id);
 
--- 收藏消息：表结构与 messages 相同，仅新增 favorite_id（一批收藏共享一个 favorite_id）
+-- 收藏消息：表结构与 messages 相同，仅新增 favorite_id 与 title（一批收藏共享两者）
+-- title：收藏标题（创建时取组内首条用户消息截断 50 字符，组内各行冗余同值）
 -- 不设 FK 到 sessions（收藏是消息副本，会话删除后保留）；自增 id 即收藏时间顺序
 CREATE TABLE IF NOT EXISTS message_favorites (
     id              BIGINT AUTO_INCREMENT PRIMARY KEY,
     favorite_id     VARCHAR(32) NOT NULL,
+    title           VARCHAR(255) NOT NULL DEFAULT '',
     session_id      VARCHAR(64) NOT NULL,
     role            VARCHAR(32) NOT NULL,
     content         TEXT NOT NULL,
@@ -173,6 +177,8 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS (bocha_sum JSON NULL);
 ALTER TABLE session_files ADD COLUMN IF NOT EXISTS (message_id BIGINT NULL);
 ALTER TABLE session_files ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL);
 ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL);
+ALTER TABLE message_shares ADD COLUMN IF NOT EXISTS (title VARCHAR(255) NOT NULL DEFAULT '');
+ALTER TABLE message_favorites ADD COLUMN IF NOT EXISTS (title VARCHAR(255) NOT NULL DEFAULT '');
 
 -- 存量回填：按所属会话反查上传者（幂等；会话已删除的孤儿记录保持空串，不误归属）
 UPDATE upload_files uf
