@@ -73,6 +73,10 @@ UPLOAD_ALLOWED_MEDIA_TYPES = [
 # 供会话结束后继续下载；留空则禁用持久化，下载地址回退沙箱）
 SESSION_FILES_PERSIST_DIR = os.getenv("SESSION_FILES_PERSIST_DIR", "data/session_files")
 
+# SSE 流式响应心跳间隔（秒）：源流静默超过该时长时发送 ': ping' 注释行，
+# 防止反向代理按空闲连接切断；<=0 禁用心跳
+SSE_HEARTBEAT_INTERVAL = float(os.getenv("SSE_HEARTBEAT_INTERVAL", "15"))
+
 # Langfuse 可观测性配置
 LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")

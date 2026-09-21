@@ -7,11 +7,64 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.dependencies import current_user
+from app.config import SSE_HEARTBEAT_INTERVAL
 from app.models.chat import ChatRequest
 from app.services.chat_service import generate_response
 from app.dao.user_dao import fire_notify_mng_active
 
 router = APIRouter()
+
+_SSE_HEARTBEAT = ": ping\n\n"   # SSE 注释行：EventSource/data: 解析器均忽略
+_DONE = object()                 # 队列结束哨兵
+
+
+async def _with_heartbeat(source):
+    """SSE 心跳包装器：源流超过 SSE_HEARTBEAT_INTERVAL 秒无事件时发送 ': ping'。
+
+    用 queue + pump 而非 wait_for(anext)：后者超时会取消底层生成器的当前 await，
+    等于心跳本身"中断"会话。pump task 全程独立运行，仅在消费方退出（正常结束/
+    客户端断开）时被 cancel——取消语义与现状一致（CancelledError 照常传入
+    generate_response 的中断处理分支，落库/trace 收尾逻辑不变）。
+    源流抛异常时经队列透传给消费方，避免消费方无限心跳。
+    SSE_HEARTBEAT_INTERVAL <= 0 时直接透传源流。
+    """
+    if SSE_HEARTBEAT_INTERVAL <= 0:
+        async for ev in source:
+            yield ev
+        return
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def pump():
+        try:
+            async for ev in source:
+                await queue.put(ev)
+        except Exception as e:          # 源流异常 → 透传（否则消费方会无限心跳）
+            await queue.put(e)
+            return
+        await queue.put(_DONE)
+
+    pump_task = asyncio.create_task(pump())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(
+                    queue.get(), timeout=SSE_HEARTBEAT_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                yield _SSE_HEARTBEAT
+                continue
+            if item is _DONE:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        pump_task.cancel()
+        try:
+            await pump_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 class StopRequest(BaseModel):
@@ -49,8 +102,9 @@ async def chat(request: Request, body: ChatRequest, user: dict = Depends(current
             # 用户输入的敏感检测（纯词典）在 generate_response 的根 span 内执行，
             # 使 sensitive-dict-check span 嵌套在本轮会话 trace 中（非独立 trace）
 
-            # 再发送聊天流式事件（多智能体编排 / 单智能体直接问答）
-            async for event in generate_response(
+            # 再发送聊天流式事件（多智能体编排 / 单智能体直接问答）；
+            # _with_heartbeat 包一层：静默超阈值时发 ': ping' 注释行防代理切断
+            async for event in _with_heartbeat(generate_response(
                 orchestrator_service=request.app.state.orchestrator_service,
                 messages=body.messages,
                 session_id=session_id,
@@ -63,7 +117,7 @@ async def chat(request: Request, body: ChatRequest, user: dict = Depends(current
                 skills=body.skills,
                 cancel_event=cancel_event,
                 workspace_manager=getattr(request.app.state, "workspace_manager", None),
-            ):
+            )):
                 yield event
         finally:
             # 流结束（正常/异常/中断）后清理注册表
