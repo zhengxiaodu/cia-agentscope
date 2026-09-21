@@ -71,6 +71,35 @@ async def delete_message_favorite(
     return success_response({"deleted": deleted})
 
 
+@router.put("/message_favorite/name")
+async def rename_message_favorite(
+    request: Request,
+    user: dict = Depends(current_user),
+):
+    """重命名收藏：输入 favorite_id 与新名称，修改该组收藏的 title。"""
+    favorite_dao = getattr(request.app.state, "message_favorite_dao", None)
+    if favorite_dao is None:
+        return error_response(500, "收藏服务未初始化")
+
+    body = await request.json()
+    favorite_id = str(body.get("favorite_id", "")).strip()
+    name = str(body.get("name", "")).strip()
+
+    if not favorite_id:
+        return error_response(400, "favorite_id 不能为空")
+    if not name:
+        return error_response(400, "收藏名称不能为空")
+    if len(name) > 255:
+        return error_response(400, "收藏名称不能超过255个字符")
+
+    updated = await favorite_dao.rename_favorite(
+        user.get("user_id"), favorite_id, name
+    )
+    if updated == 0:
+        return error_response(404, "收藏不存在")
+    return success_response({"favorite_id": favorite_id, "name": name})
+
+
 @router.get("/message_favorites/list")
 async def list_message_favorites(
     request: Request,

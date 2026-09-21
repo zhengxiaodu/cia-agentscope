@@ -562,6 +562,34 @@ class SessionDAO:
                 )
                 await conn.commit()
 
+    async def delete_messages_by_pair(
+        self, session_id: str, message_pair_id: str
+    ) -> int:
+        """删除会话中指定 message_pair_id 的消息（一轮 user+assistant），返回删除行数。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "DELETE FROM messages "
+                    "WHERE session_id = %s AND message_pair_id = %s",
+                    (session_id, message_pair_id),
+                )
+                deleted = cur.rowcount
+                await conn.commit()
+                return deleted
+
+    async def count_messages(self, session_id: str) -> int:
+        """统计会话剩余消息数（判断删空后是否整删会话）。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM messages "
+                    "WHERE session_id = %s",
+                    (session_id,),
+                )
+                row = await cur.fetchone()
+                await conn.commit()
+                return int(row["cnt"]) if row else 0
+
     # ================================================================
     # Session 文件元信息
     # ================================================================

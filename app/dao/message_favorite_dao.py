@@ -97,6 +97,21 @@ class MessageFavoriteDAO:
                 await conn.commit()
                 return deleted
 
+    async def rename_favorite(
+        self, user_id: str, favorite_id: str, title: str
+    ) -> int:
+        """重命名收藏：更新该 favorite_id 全部行的 title，返回更新行数。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "UPDATE message_favorites SET title = %s "
+                    "WHERE user_id = %s AND favorite_id = %s",
+                    (title, user_id, favorite_id),
+                )
+                updated = cur.rowcount
+                await conn.commit()
+                return updated
+
     async def list_favorites(self, user_id: str) -> List[dict]:
         """查询该用户全部收藏消息（按插入顺序 = 收藏时间顺序）。
 

@@ -91,6 +91,29 @@ async def delete_session(
     return success_response({"deleted": True})
 
 
+@router.delete("/sessions/{session_id}/messages/{message_pair_id}")
+async def delete_session_message(
+    session_id: str,
+    message_pair_id: str,
+    request: Request,
+    user: dict = Depends(current_user),
+):
+    """删除会话中一轮消息；若删空（会话中唯一一轮）则整删会话。"""
+    service = _get_session_service(request)
+    try:
+        result = await service.delete_message(
+            user.get("user_id"), session_id, message_pair_id
+        )
+    except PermissionError:
+        return error_response(403, "会话不属于当前用户")
+
+    if result is None:
+        return error_response(404, "会话不存在")
+    if result["deleted"] == 0:
+        return error_response(404, "消息不存在")
+    return success_response(result)
+
+
 @router.get("/sessions/{session_id}")
 async def get_session_detail(
     session_id: str,
