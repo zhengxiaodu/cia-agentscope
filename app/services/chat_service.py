@@ -442,9 +442,8 @@ def create_model_from_config(model_config: dict):
 
     if provider == "openai":
         credential = OpenAICredential(api_key=api_key, base_url=base_url)
-        # context_size 按 max_tokens * 0.8 赋值，为输出预留余量
         max_tokens = parameters.get("max_tokens", 0)
-        context_size = int(max_tokens * 0.8) if max_tokens else None
+        context_size = int(max_tokens) if max_tokens else None
         model = OpenAIChatModel(
             credential=credential,
             model=model_name,
