@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from typing import Any, Dict
 
 from app.dependencies import current_user
+from app.routes.message_share import _clean_pair_ids
 
 router = APIRouter()
 
@@ -91,18 +92,25 @@ async def delete_session(
     return success_response({"deleted": True})
 
 
-@router.delete("/sessions/{session_id}/messages/{message_pair_id}")
-async def delete_session_message(
+@router.delete("/sessions/{session_id}/messages")
+async def delete_session_messages(
     session_id: str,
-    message_pair_id: str,
     request: Request,
     user: dict = Depends(current_user),
 ):
-    """删除会话中一轮消息；若删空（会话中唯一一轮）则整删会话。"""
+    """批量删除会话中多轮消息；若删空则整删会话。
+
+    请求体：{"message_pair_ids": ["...", ...]}（一个或多个）。
+    """
     service = _get_session_service(request)
+    body = await request.json()
+    pair_ids = _clean_pair_ids(body.get("message_pair_ids"))
+    if not pair_ids:
+        return error_response(400, "message_pair_ids 不能为空")
+
     try:
         result = await service.delete_message(
-            user.get("user_id"), session_id, message_pair_id
+            user.get("user_id"), session_id, pair_ids
         )
     except PermissionError:
         return error_response(403, "会话不属于当前用户")

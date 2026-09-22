@@ -1,6 +1,6 @@
 import logging
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 from agentscope.state import AgentState
 
@@ -95,14 +95,15 @@ class SessionService:
         return True
 
     async def delete_message(
-        self, user_id: str, session_id: str, message_pair_id: str
+        self, user_id: str, session_id: str, message_pair_ids: List[str]
     ) -> Optional[dict]:
-        """删除会话中一轮消息（按 message_pair_id）；删空则整删会话。
+        """删除会话中多轮消息（按 message_pair_id 列表）；删空则整删会话。
 
         Returns:
             None: 会话不存在
             {"deleted": 0, "session_deleted": False}: 消息不存在
             {"deleted": n>0, "session_deleted": bool}: 删除成功
+            （deleted 为删除的消息行数，一轮 user+assistant 通常 2 行）
         Raises:
             PermissionError: 会话不属于当前用户（对齐 get_session_detail）。
         """
@@ -112,11 +113,13 @@ class SessionService:
         if meta.get("user_id") != user_id:
             raise PermissionError("会话不属于当前用户")
 
-        deleted = await self.dao.delete_messages_by_pair(session_id, message_pair_id)
+        deleted = await self.dao.delete_messages_by_pair(
+            session_id, message_pair_ids
+        )
         if deleted == 0:
             return {"deleted": 0, "session_deleted": False}
 
-        # 删空（被删的是会话中唯一一轮消息）→ 整删会话（CASCADE 清理关联表）
+        # 删空（会话中已无剩余消息）→ 整删会话（CASCADE 清理关联表）
         if await self.dao.count_messages(session_id) == 0:
             await self.dao.delete_session(session_id, user_id)
             return {"deleted": deleted, "session_deleted": True}

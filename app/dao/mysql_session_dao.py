@@ -563,15 +563,22 @@ class SessionDAO:
                 await conn.commit()
 
     async def delete_messages_by_pair(
-        self, session_id: str, message_pair_id: str
+        self, session_id: str, message_pair_ids: List[str]
     ) -> int:
-        """删除会话中指定 message_pair_id 的消息（一轮 user+assistant），返回删除行数。"""
+        """删除会话中指定 message_pair_id 的消息（多轮，一批），返回删除行数。
+
+        空列表不发 SQL 直接返回 0。
+        """
+        if not message_pair_ids:
+            return 0
+        placeholders = ", ".join(["%s"] * len(message_pair_ids))
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "DELETE FROM messages "
-                    "WHERE session_id = %s AND message_pair_id = %s",
-                    (session_id, message_pair_id),
+                    "WHERE session_id = %s "
+                    f"AND message_pair_id IN ({placeholders})",
+                    [session_id] + list(message_pair_ids),
                 )
                 deleted = cur.rowcount
                 await conn.commit()
