@@ -16,6 +16,13 @@ from app.dao.mysql_session_dao import _parse_json_list
 logger = logging.getLogger(__name__)
 
 
+def _format_timestamp(value) -> str:
+    """timestamp 列格式化为 'YYYY-MM-DD HH:MM:SS.mmm'（与消息风格一致）。"""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    return str(value)
+
+
 class MessageFavoriteDAO:
     """收藏消息数据访问层"""
 
@@ -131,25 +138,109 @@ class MessageFavoriteDAO:
                 )
                 rows = await cur.fetchall()
                 await conn.commit()
+                return self._format_rows(rows)
+
+    async def get_favorite_messages(
+        self, user_id: str, favorite_id: str
+    ) -> List[dict]:
+        """查询单个收藏组的全部消息（详情接口专用，按复制顺序）。
+
+        无匹配返回空列表；行格式与 list_favorites 一致。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT favorite_id, title, session_id, role, content, "
+                    "timestamp, agent_ids, user_id, success, tokens, "
+                    "message_pair_id, citations, bocha_sum "
+                    "FROM message_favorites "
+                    "WHERE user_id = %s AND favorite_id = %s "
+                    "ORDER BY id ASC",
+                    (user_id, favorite_id),
+                )
+                rows = await cur.fetchall()
+                await conn.commit()
+                return self._format_rows(rows)
+
+    async def list_favorite_summaries(self, user_id: str) -> List[dict]:
+        """查询该用户全部收藏的摘要（列表接口专用，不含消息内容）。
+
+        GROUP BY favorite_id 一条 SQL 完成：title（组内同值取 MAX）、
+        message_count（组内消息数）、first_message_time（组内最早消息时间）。
+        ORDER BY MIN(id)：id 序 = 收藏先后顺序。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT favorite_id, MAX(title) AS title, "
+                    "COUNT(*) AS message_count, "
+                    "MIN(`timestamp`) AS first_message_time "
+                    "FROM message_favorites "
+                    "WHERE user_id = %s "
+                    "GROUP BY favorite_id "
+                    "ORDER BY MIN(id) ASC",
+                    (user_id,),
+                )
+                rows = await cur.fetchall()
+                await conn.commit()
                 return [
                     {
                         "favorite_id": r["favorite_id"],
                         "title": r.get("title") or "",
-                        "session_id": r["session_id"],
-                        "role": r["role"],
-                        "content": r["content"],
-                        "timestamp": r["timestamp"].strftime(
-                            "%Y-%m-%d %H:%M:%S.%f"
-                        )[:-3]
-                        if hasattr(r["timestamp"], "strftime")
-                        else str(r["timestamp"]),
-                        "agent_ids": _parse_json_list(r.get("agent_ids")),
-                        "user_id": r.get("user_id", "") or "",
-                        "success": bool(r.get("success", 1)),
-                        "tokens": int(r.get("tokens", 0) or 0),
-                        "message_pair_id": r.get("message_pair_id"),
-                        "citations": _parse_json_list(r.get("citations")),
-                        "bocha_sum": _parse_json_list(r.get("bocha_sum")),
+                        "message_count": int(r.get("message_count", 0) or 0),
+                        "first_message_time": _format_timestamp(
+                            r.get("first_message_time")
+                        ),
                     }
                     for r in rows
                 ]
+
+    async def get_favorite_first_user_message(
+        self, user_id: str, favorite_id: str
+    ) -> str:
+        """查询收藏组内首条用户消息文本（列表接口存量空标题的兜底来源）。
+
+        无匹配行或查询异常返回空串（对齐 get_first_user_message 风格）。
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute(
+                        "SELECT content FROM message_favorites "
+                        "WHERE user_id = %s AND favorite_id = %s "
+                        "AND role = 'user' ORDER BY id ASC LIMIT 1",
+                        (user_id, favorite_id),
+                    )
+                    row = await cur.fetchone()
+                    await conn.commit()
+                    if row is None:
+                        return ""
+                    return str(row.get("content") or "")
+        except Exception:
+            logger.warning(
+                "[MessageFavoriteDAO] 查询收藏组首条用户消息失败",
+                exc_info=True,
+            )
+            return ""
+
+    @staticmethod
+    def _format_rows(rows: List[dict]) -> List[dict]:
+        """收藏行格式化：timestamp strftime、JSON 列解析、bool/int 归一化。"""
+        return [
+            {
+                "favorite_id": r["favorite_id"],
+                "title": r.get("title") or "",
+                "session_id": r["session_id"],
+                "role": r["role"],
+                "content": r["content"],
+                "timestamp": _format_timestamp(r["timestamp"]),
+                "agent_ids": _parse_json_list(r.get("agent_ids")),
+                "user_id": r.get("user_id", "") or "",
+                "success": bool(r.get("success", 1)),
+                "tokens": int(r.get("tokens", 0) or 0),
+                "message_pair_id": r.get("message_pair_id"),
+                "citations": _parse_json_list(r.get("citations")),
+                "bocha_sum": _parse_json_list(r.get("bocha_sum")),
+            }
+            for r in rows
+        ]

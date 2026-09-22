@@ -2,12 +2,13 @@
 
 - POST /message_favorite：收藏（一批 message_pair_id 复制到收藏表，共享一个 favorite_id）
 - DELETE /message_favorite/{favorite_id}：取消收藏（删除该 favorite_id 整组记录）
-- GET /message_favorites：收藏详情（该用户全部收藏，按 favorite_id 分组，
-  每个分组附 files 系统产出文件与 upload_files 用户上传文件，
-  字段格式与历史会话详情接口对齐）
+- GET /message_favorites/list：收藏列表（轻量摘要：favorite_id / title /
+  message_count / first_message_time，不含消息内容与文件）
+- GET /message_favorites/{favorite_id}：收藏详情（该收藏完整消息 + files
+  系统产出文件与 upload_files 用户上传文件，字段格式与历史会话详情接口对齐）
 """
 import logging
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from fastapi import APIRouter, Depends, Request
 
@@ -105,61 +106,81 @@ async def list_message_favorites(
     request: Request,
     user: dict = Depends(current_user),
 ):
-    """收藏消息详情：返回该用户全部收藏，按 favorite_id 分组（收藏时间序）。
+    """收藏列表：返回该用户全部收藏的轻量摘要（收藏时间序）。
 
-    每个分组附 files（系统产出文件）与 upload_files（用户上传文件），
-    按 (session_id, message_pair_id) 与组内消息关联；跨会话收藏时
-    各消息只匹配所属会话的文件。
+    每条仅含 favorite_id / title / message_count / first_message_time，
+    不含消息内容与文件；详情按 favorite_id 走详情接口。
+    title 为空的存量旧数据从组内首条用户消息兜底。
     """
     favorite_dao = getattr(request.app.state, "message_favorite_dao", None)
     if favorite_dao is None:
         return error_response(500, "收藏服务未初始化")
 
-    rows = await favorite_dao.list_favorites(user.get("user_id"))
-
-    # 按 favorite_id 分组（dict 插入序 = 收藏先后；组内已按复制顺序排列）
-    groups: Dict[str, List[dict]] = {}
-    for row in rows:
-        groups.setdefault(row["favorite_id"], []).append(row)
-
-    # 每个分组涉及的 {session_id: set(message_pair_id)}
-    group_pair_keys: Dict[str, Dict[str, set]] = {
-        fid: _collect_session_pair_keys(messages)
-        for fid, messages in groups.items()
-    }
-
-    # 全局收集唯一 session_id，每个 session 只查一次库，结果缓存复用
-    session_files_cache: Dict[str, Dict[str, list]] = {}
-    for sid in {sid for keys in group_pair_keys.values() for sid in keys}:
-        session_files_cache[sid] = await _load_session_files_pair(
-            request, sid
-        )
+    user_id = user.get("user_id")
+    summaries = await favorite_dao.list_favorite_summaries(user_id)
 
     favorites = []
-    for fid, messages in groups.items():
-        keys = group_pair_keys[fid]
-        files: List[dict] = []
-        upload_files: List[dict] = []
-        for sid, pair_ids in keys.items():
-            cached = session_files_cache.get(sid, {"files": [], "uploads": []})
-            files.extend(
-                f for f in cached["files"]
-                if f.get("message_pair_id") in pair_ids
+    for s in summaries:
+        title = s["title"]
+        if not title:  # 存量旧数据兜底：组内首条用户消息截断
+            raw = await favorite_dao.get_favorite_first_user_message(
+                user_id, s["favorite_id"]
             )
-            upload_files.extend(
-                f for f in cached["uploads"]
-                if f.get("message_pair_id") in pair_ids
-            )
+            title = _truncate_title(raw)
         favorites.append({
-            "favorite_id": fid,
-            # 组内各行共享同一 title（创建时写入）；空则从组内消息兜底（存量旧数据）
-            "title": (messages[0].get("title") if messages else "")
-                     or _first_user_message_title(messages),
-            "messages": messages,
-            "files": files,
-            "upload_files": upload_files,
+            "favorite_id": s["favorite_id"],
+            "title": title,
+            "message_count": s["message_count"],
+            "first_message_time": s["first_message_time"],
         })
     return success_response({"favorites": favorites})
+
+
+@router.get("/message_favorites/{favorite_id}")
+async def get_message_favorite_detail(
+    favorite_id: str,
+    request: Request,
+    user: dict = Depends(current_user),
+):
+    """收藏详情：按 favorite_id 返回该收藏的完整消息与关联文件。
+
+    每条消息按 (session_id, message_pair_id) 匹配 files（系统产出文件）
+    与 upload_files（用户上传文件）；跨会话收藏时各消息只匹配
+    所属会话的文件。favorite_id 不存在或不属于当前用户返回 404。
+    """
+    favorite_dao = getattr(request.app.state, "message_favorite_dao", None)
+    if favorite_dao is None:
+        return error_response(500, "收藏服务未初始化")
+
+    messages = await favorite_dao.get_favorite_messages(
+        user.get("user_id"), favorite_id
+    )
+    if not messages:
+        return error_response(404, "收藏不存在")
+
+    # 按消息所属会话加载文件，再按 message_pair_id 过滤到组内
+    keys = _collect_session_pair_keys(messages)
+    files: List[dict] = []
+    upload_files: List[dict] = []
+    for sid, pair_ids in keys.items():
+        loaded = await _load_session_files_pair(request, sid)
+        files.extend(
+            f for f in loaded["files"]
+            if f.get("message_pair_id") in pair_ids
+        )
+        upload_files.extend(
+            f for f in loaded["uploads"]
+            if f.get("message_pair_id") in pair_ids
+        )
+
+    return success_response({
+        "favorite_id": favorite_id,
+        # 组内各行共享同一 title（创建时写入）；空则从组内消息兜底（存量旧数据）
+        "title": messages[0].get("title") or _first_user_message_title(messages),
+        "messages": messages,
+        "files": files,
+        "upload_files": upload_files,
+    })
 
 
 def _collect_session_pair_keys(messages: List[dict]) -> Dict[str, set]:
