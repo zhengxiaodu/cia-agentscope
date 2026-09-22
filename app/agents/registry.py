@@ -157,7 +157,7 @@ class AgentRegistry:
             toolkit=toolkit,
             state=agent_state,
             context_config=ContextConfig(
-                trigger_ratio=0.8,
+                trigger_ratio=0.7,
                 reserve_ratio=0.4,
                 tool_result_limit=3000,
             ),
