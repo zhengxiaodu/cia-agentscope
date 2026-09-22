@@ -152,10 +152,16 @@ class OrchestratorService:
             workspace_manager=workspace_manager,
         )
 
-    def _create_model_fn(self):
-        """创建模型实例的工厂函数（每次调用返回新实例）。"""
+    def _create_model_fn(self, message_pair_id: Optional[str] = None):
+        """创建模型实例的工厂函数（每次调用返回新实例）。
+
+        message_pair_id 非空时模型请求带 app_serial_number 请求头
+        （OIA-AGENTSCOPE-{message_pair_id}）。
+        """
         default_model_cfg = self._model_config.get("models", {}).get("default", {})
-        return create_model_from_config(default_model_cfg)
+        return create_model_from_config(
+            default_model_cfg, message_pair_id=message_pair_id or ""
+        )
 
     def _create_orchestrator(self, mode: str, agent_factory: AgentFactory):
         """根据模式创建编排器实例（每次请求独立创建，不缓存）。"""
@@ -353,6 +359,7 @@ class OrchestratorService:
         search_enabled: bool = True,
         skills: Optional[List[str]] = None,
         langfuse_service: Optional[Any] = None,
+        message_pair_id: Optional[str] = None,
     ) -> tuple:
         """获取/创建工作区并组装注册表与工厂（委托 workspace_assembler）。
 
@@ -364,7 +371,9 @@ class OrchestratorService:
         """
         return await assemble_workspace_components(
             workspace_manager=self._workspace_manager,
-            create_model_fn=self._create_model_fn,
+            # 闭包绑定本轮 message_pair_id：模型实例创建时注入
+            # app_serial_number 请求头（registry 侧仍以无参形式调用）
+            create_model_fn=lambda: self._create_model_fn(message_pair_id),
             fused=fused,
             user_id=user_id,
             redis_client=redis_client,
@@ -540,6 +549,7 @@ class OrchestratorService:
         search_enabled: bool = True,
         langfuse_service: Optional[Any] = None,
         skills: Optional[List[str]] = None,
+        message_pair_id: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """编排主流程：改写 → 识别 → 选择编排器 → 执行。
 
@@ -555,6 +565,8 @@ class OrchestratorService:
             session_service: 会话服务
             agent_id: 可选，指定后走单智能体直接问答
             request: FastAPI Request 对象（用于访问 app.state.redis_client）
+            message_pair_id: 本轮对话配对 id（非空时业务智能体 LLM 请求
+                带 app_serial_number 请求头）
 
         Yields:
             SSE 事件字符串（"data: {...}\n\n" 格式）
@@ -602,6 +614,7 @@ class OrchestratorService:
                 search_enabled=search_enabled,
                 skills=skills or [],
                 langfuse_service=langfuse_service,
+                message_pair_id=message_pair_id,
             ),
             name="workspace-prepare",
         )

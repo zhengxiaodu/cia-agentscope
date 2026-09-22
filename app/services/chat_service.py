@@ -426,10 +426,13 @@ def load_model_config(config_path: str = MODEL_CONFIG_PATH) -> dict:
         return yaml.safe_load(f)
 
 
-def create_model_from_config(model_config: dict):
+def create_model_from_config(model_config: dict, message_pair_id: str = ""):
     """根据配置创建模型实例（业务智能体流式对话用）。
 
     被 AgentRegistry 的 create_model_fn 调用，每次返回新实例。
+    message_pair_id 非空时通过 client_kwargs 注入请求头
+    app_serial_number: OIA-AGENTSCOPE-{message_pair_id}（意图识别/改写/编排
+    走独立 AsyncOpenAI 客户端，不经此路径，天然不带该头）。
     """
     provider = model_config.get("provider", "openai")
     base_url = model_config.get("base_url", "https://api.deepseek.com/v1")
@@ -444,6 +447,13 @@ def create_model_from_config(model_config: dict):
         credential = OpenAICredential(api_key=api_key, base_url=base_url)
         max_tokens = parameters.get("max_tokens", 0)
         context_size = int(max_tokens) if max_tokens else None
+        # 每轮对话附加请求头：app_serial_number = OIA-AGENTSCOPE-{message_pair_id}
+        client_kwargs = (
+            {"default_headers": {
+                "app_serial_number": f"OIA-AGENTSCOPE-{message_pair_id}"
+            }}
+            if message_pair_id else None
+        )
         model = OpenAIChatModel(
             credential=credential,
             model=model_name,
@@ -453,6 +463,7 @@ def create_model_from_config(model_config: dict):
             # vLLM 部署的 Qwen3 等模型默认开启 thinking，显式关闭，
             # 通过 extra_body 透传 chat_template_kwargs 到请求体
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            **({"client_kwargs": client_kwargs} if client_kwargs else {}),
         )
     else:
         raise ValueError(f"不支持的 provider: {provider}")
@@ -616,6 +627,7 @@ async def generate_response(
                 search_enabled=search_enabled,
                 skills=skills or [],
                 langfuse_service=langfuse_service,
+                message_pair_id=message_pair_id,
             ):
                 # 取消检查点：每个事件之间检测一次（LLM chunk 之间会回到本循环）
                 if _cancelled():
