@@ -81,6 +81,7 @@ async def assemble_workspace_components(
     from agentscope.tool import FunctionTool
     from tools.md_export_tools import create_md_export_tools
     from tools.policy_qa_tools import create_policy_qa_tool
+    from tools.feedback_tools import create_feedback_tool
 
     # 工具层：根据后端选择 agentscope 原生工具 / OpenSandbox 桥接工具
     _chart_tools = [
@@ -91,6 +92,8 @@ async def assemble_workspace_components(
     ]
     # 制度问答工具（宿主侧 FunctionTool，知识库 ID 由用户权限自动映射，不依赖工作区后端）
     policy_qa_tool = create_policy_qa_tool(user_id=user_id, redis_client=redis_client)
+    # 卡片反馈工具（同轮暂停-恢复，闭包注入 session_id）
+    feedback_tool = create_feedback_tool(session_id=session_id_safe)
 
     import base64
 
@@ -123,7 +126,7 @@ async def assemble_workspace_components(
     md_tools = create_md_export_tools(_sandbox_read_file, _sandbox_write_file)
     all_tools = (
         create_opensandbox_tools(adapter) + _chart_tools
-        + [policy_qa_tool] + md_tools
+        + [policy_qa_tool, feedback_tool] + md_tools
     )
     # 联网搜索工具受请求开关控制：关闭时不注入
     # （Toolkit 的 tools 对所有 agent 全局可见，需与技能过滤同步收口）

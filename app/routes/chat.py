@@ -10,6 +10,7 @@ from app.dependencies import current_user
 from app.config import SSE_HEARTBEAT_INTERVAL
 from app.models.chat import ChatRequest
 from app.services.chat_service import generate_response
+from app.services.feedback_service import cancel_feedback, resolve_feedback
 from app.dao.user_dao import fire_notify_mng_active
 
 router = APIRouter()
@@ -71,6 +72,14 @@ class StopRequest(BaseModel):
     session_id: str
 
 
+class FeedbackRequest(BaseModel):
+    """卡片反馈回传：唤醒挂起中的 render_feedback_card 工具。"""
+    session_id: str
+    feedback_id: str
+    action: str  # confirm / cancel / submit
+    payload: dict = {}
+
+
 @router.post("/chat")
 async def chat(request: Request, body: ChatRequest, user: dict = Depends(current_user)):
     # 异步上报 mng 用户活跃（fire-and-forget，失败不影响对话）
@@ -120,8 +129,9 @@ async def chat(request: Request, body: ChatRequest, user: dict = Depends(current
             )):
                 yield event
         finally:
-            # 流结束（正常/异常/中断）后清理注册表
+            # 流结束（正常/异常/中断）后清理注册表与挂起反馈
             request.app.state.chat_tasks.pop(session_id, None)
+            cancel_feedback(session_id)
 
     try:
         return StreamingResponse(stream(), media_type="text/event-stream")
@@ -149,3 +159,18 @@ async def stop_chat(
         return {"ok": False, "msg": "会话不在运行中或已结束"}
     cancel_event.set()
     return {"ok": True, "msg": "已发送停止信号"}
+
+
+@router.post("/chat/feedback")
+async def submit_feedback(body: FeedbackRequest, user: dict = Depends(current_user)):
+    """回传确认/表单卡片的用户反馈，唤醒同轮挂起的 render_feedback_card 工具。
+
+    返回 404 表示反馈已失效（超时、已处理或会话已结束），前端据此禁用卡片。
+    """
+    ok = resolve_feedback(
+        body.session_id, body.feedback_id,
+        {"action": body.action, "payload": body.payload},
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="反馈已失效（超时、已处理或会话已结束）")
+    return {"ok": True}
