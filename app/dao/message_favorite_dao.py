@@ -162,15 +162,30 @@ class MessageFavoriteDAO:
                 await conn.commit()
                 return self._format_rows(rows)
 
-    async def list_favorite_summaries(self, user_id: str) -> List[dict]:
-        """查询该用户全部收藏的摘要（列表接口专用，不含消息内容）。
+    async def list_favorite_summaries(
+        self, user_id: str, page: int = 1, page_size: int = 20
+    ) -> Tuple[int, List[dict]]:
+        """查询该用户收藏的摘要（列表接口专用，分页，不含消息内容）。
 
         GROUP BY favorite_id 一条 SQL 完成：title（组内同值取 MAX）、
         message_count（组内消息数）、first_message_time（组内最早消息时间）。
         ORDER BY MIN(id)：id 序 = 收藏先后顺序。
+
+        Returns:
+            (total, summaries)：total 为该用户收藏组总数（不分页），
+            summaries 为当前页摘要列表。
         """
+        offset = (page - 1) * page_size
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT COUNT(DISTINCT favorite_id) AS cnt "
+                    "FROM message_favorites WHERE user_id = %s",
+                    (user_id,),
+                )
+                cnt_row = await cur.fetchone()
+                total = int(cnt_row["cnt"]) if cnt_row else 0
+
                 await cur.execute(
                     "SELECT favorite_id, MAX(title) AS title, "
                     "COUNT(*) AS message_count, "
@@ -178,12 +193,13 @@ class MessageFavoriteDAO:
                     "FROM message_favorites "
                     "WHERE user_id = %s "
                     "GROUP BY favorite_id "
-                    "ORDER BY MIN(id) ASC",
-                    (user_id,),
+                    "ORDER BY MIN(id) ASC "
+                    "LIMIT %s OFFSET %s",
+                    (user_id, page_size, offset),
                 )
                 rows = await cur.fetchall()
                 await conn.commit()
-                return [
+                summaries = [
                     {
                         "favorite_id": r["favorite_id"],
                         "title": r.get("title") or "",
@@ -194,6 +210,7 @@ class MessageFavoriteDAO:
                     }
                     for r in rows
                 ]
+                return total, summaries
 
     async def get_favorite_first_user_message(
         self, user_id: str, favorite_id: str

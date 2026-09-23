@@ -10,7 +10,7 @@
 import logging
 from typing import Dict, List
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from app.dependencies import current_user
 from app.routes.message_share import (
@@ -104,9 +104,11 @@ async def rename_message_favorite(
 @router.get("/message_favorites/list")
 async def list_message_favorites(
     request: Request,
+    page: int = Query(1, ge=1, description="页码，从 1 开始"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数，默认 20，最大 100"),
     user: dict = Depends(current_user),
 ):
-    """收藏列表：返回该用户全部收藏的轻量摘要（收藏时间序）。
+    """收藏列表：分页返回该用户收藏的轻量摘要（收藏时间序）。
 
     每条仅含 favorite_id / title / message_count / first_message_time，
     不含消息内容与文件；详情按 favorite_id 走详情接口。
@@ -117,7 +119,9 @@ async def list_message_favorites(
         return error_response(500, "收藏服务未初始化")
 
     user_id = user.get("user_id")
-    summaries = await favorite_dao.list_favorite_summaries(user_id)
+    total, summaries = await favorite_dao.list_favorite_summaries(
+        user_id, page=page, page_size=page_size
+    )
 
     favorites = []
     for s in summaries:
@@ -133,7 +137,16 @@ async def list_message_favorites(
             "message_count": s["message_count"],
             "first_message_time": s["first_message_time"],
         })
-    return success_response({"favorites": favorites})
+
+    total_pages = (total + page_size - 1) // page_size
+    return success_response({
+        "favorites": favorites,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+        "has_more": page < total_pages,
+    })
 
 
 @router.get("/message_favorites/{favorite_id}")
