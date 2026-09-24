@@ -1,0 +1,11 @@
+- [x]`app/dao/init_mysql.py` 的 `INIT_SQL` 包含 `session_files` 建表语句，含 `(session_id, path)` 唯一索引、`session_id` 普通索引、外键 `ON DELETE CASCADE`
+- [x]`app/dao/mysql_session_dao.py` 实现 `append_session_files`（UPSERT，空列表直接 return）与 `load_session_files`（按 id 升序，created_at 格式化为字符串）
+- [x]`app/models/session.py` 定义 `SessionFile` 模型（name/path/url/size/media_type/created_at），`SessionDetailResponse` 含 `files: List[SessionFile] = []`
+- [x]`app/services/session_service.py` 新增 `append_session_files` / `load_session_files` 转调 DAO；`get_session_detail` 在权限校验后加载并填充 `files`
+- [x]`app/services/chat_service.py` 在 yield `files_generated` 之后、`trace_ready` 之前，对非空 `files_payload` 调用 `append_session_files`，包裹 try/except 记 warning 不阻断
+- [x]`files_generated` 事件 payload 与 `trace_ready` 事件顺序未改变
+- [x]本轮无新文件时不写库（`files_payload` 为空不调用 `append_session_files`）
+- [x]持久化失败仅记 warning，不抛错、不阻断后续事件
+- [x]`GET /sessions/{session_id}` 响应包含 `files` 字段（有记录返回列表，无记录返回 `[]`）
+- [x]非会话拥有者请求返回 403，不泄露文件列表；会话不存在返回 404
+- [x]`python -m py_compile` 通过所有修改文件

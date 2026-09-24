@@ -1,0 +1,15 @@
+- [x] `upload.py` 函数签名含 `request: Request` 参数
+- [x] `upload.py` 当 `session_id` 为空时调用 `session_service.get_or_create_session(None, user_id)` 获取新 session_id
+- [x] `upload.py` 已传 `session_id` 时行为不变
+- [x] `orchestrator_service.py` 顶部有 `from agentscope.tool import Bash, Read, Write, Edit, Glob, Grep`
+- [x] `orchestrator_service.py` 中 `all_tools = [Bash(), Read(), Write(), Edit(), Glob(), Grep()]`，不再调用 `workspace.list_tools()`
+- [x] `file_change_detector.py` 中 `_EXCLUDED_TOP_DIRS` 包含 `{"data", "skills"}`
+- [x] `file_change_detector.py` snapshot 函数跳过文件名为 `.mcp` 的文件
+- [x] `config.py` 新增 `WORKSPACE_RETENTION_DAYS` 和 `WORKSPACE_CLEANUP_INTERVAL_HOURS`
+- [x] `.env` 和 `.env.example` 新增 `WORKSPACE_RETENTION_DAYS` 和 `WORKSPACE_CLEANUP_INTERVAL_HOURS`
+- [x] `workspace_cleanup_service.py` 实现 `WorkspaceCleanupService` 类，含 `cleanup()`/`start()`/`stop()` 方法
+- [x] `cleanup()` 按 `os.path.getmtime` + `retention_days` 判断过期，过期目录用 `shutil.rmtree` 删除
+- [x] `start()` 用 `apscheduler AsyncIOScheduler` + `interval_trigger` 注册定时任务
+- [x] `stop()` 调用 `scheduler.shutdown(wait=False)`
+- [x] `main.py` lifespan 启动阶段构造并 `start()` 清理服务；关闭阶段 `stop()`
+- [x] 全部改动文件 `python -m py_compile` 通过
