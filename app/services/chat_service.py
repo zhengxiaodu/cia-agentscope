@@ -472,7 +472,7 @@ def create_model_from_config(model_config: dict, message_pair_id: str = ""):
 
 
 # 需要拦截并转发为 CUSTOM_COMPONENT 事件的组件类型
-_COMPONENT_TYPES = {"chart", "volume_chart", "selectable_list", "confirm_action"}
+_COMPONENT_TYPES = {"chart", "volume_chart", "selectable_list", "confirm_action","feedback_chart"}
 
 
 def _extract_components_from_delta(delta: str):
