@@ -36,7 +36,7 @@ async def _feedback_card_stream(
     """
     feedback_id = str(uuid.uuid4())
     payload: Dict[str, Any] = {
-        "type": "chart",
+        "type": "feedback_chart",
         "chartType": card_type,
         "schema": {**(schema or {}), "feedbackId": feedback_id},
     }
