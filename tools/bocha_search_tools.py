@@ -95,7 +95,7 @@ def create_bocha_search_tool() -> FunctionTool:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {BOCHA_API_KEY}",
         }
-        payload = {"query": query.strip()}
+        payload = {"query": query.strip(), "summary": True, "count": 10}
 
         try:
             async with httpx.AsyncClient(timeout=_BOCHA_TIMEOUT) as client:
