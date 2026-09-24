@@ -497,7 +497,12 @@ def _extract_components_from_delta(delta: str):
             if depth == 0:
                 try:
                     data = json.loads(delta[i:j])
-                    if isinstance(data, dict) and data.get("type") in _COMPONENT_TYPES:
+                    if isinstance(data, dict) and data.get("type") == "feedback_chart":
+                        yield {
+                            "type": "FEEDBACK_COMPONENT",
+                            "component": data,
+                        }
+                    elif isinstance(data, dict) and data.get("type") in _COMPONENT_TYPES:
                         yield {
                             "type": "CUSTOM_COMPONENT",
                             "component": data,
