@@ -35,19 +35,9 @@ router = APIRouter()
 # 文档/音频解析已改为上传时后台完成（见 file_parse_service），不再作为可选技能
 _OPTIONAL_SKILLS = [
     {
-        "name": "chart_renderer",
-        "nickname": "可视化图表",
-        "description": "智能图表渲染技能，根据数据特征自动选择最合适的图表类型并通过工具渲染。",
-    },
-    {
         "name": "policy_qa",
         "nickname": "制度问答",
         "description": "根据公司内部制度文件知识库回答问题。",
-    },
-    {
-        "name": "dev-expert",
-        "nickname": "代码编写",
-        "description": "按照规范开发代码，覆盖软件/网站设计/代码审查/重构/Bug诊断等等",
     },
     {
         "name": "deep-research",
@@ -63,6 +53,11 @@ _OPTIONAL_SKILLS = [
         "name": "sn-da-excel-workflow",
         "nickname": "表格分析处理",
         "description": "Excel分析/数据清洗/数据统计/数据筛选等等",
+    },
+    {
+        "name": "chart_renderer",
+        "nickname": "可视化图表",
+        "description": "智能图表渲染技能，根据数据特征自动选择最合适的图表类型并通过工具渲染。",
     }
 ]
 
