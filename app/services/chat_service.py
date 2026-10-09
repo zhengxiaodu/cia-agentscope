@@ -377,7 +377,7 @@ async def _detect_and_emit_files(
                 })
     except Exception:
         logger.warning("[chat_service] 检测新文件失败", exc_info=True)
-    yield f"data: {json.dumps({'type': 'files_generated', 'files': files_payload}, ensure_ascii=False)}\n\n"
+    yield f"data: {json.dumps({'type': 'files_generated', 'files': files_payload, 'message_pair_id':message_pair_id}, ensure_ascii=False)}\n\n"
 
     # 持久化本轮生成的文件元信息（供 /sessions/{session_id} 回看）
     if files_payload and session_service and session_id:
