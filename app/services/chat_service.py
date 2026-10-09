@@ -462,7 +462,7 @@ def create_model_from_config(model_config: dict, message_pair_id: str = ""):
             context_size=context_size,
             # vLLM 部署的 Qwen3 等模型默认开启 thinking，显式关闭，
             # 通过 extra_body 透传 chat_template_kwargs 到请求体
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            extra_body={"chat_template_kwargs": {"enable_thinking": True,"reasoning_effort":"low"}},
             **({"client_kwargs": client_kwargs} if client_kwargs else {}),
         )
     else:
