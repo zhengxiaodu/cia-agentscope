@@ -1,0 +1,31 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+
+# Python 缓存
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+
+# Trae 文档
+.trae
+
+# 环境与密钥（运行时挂载，不打入镜像）
+.env
+.env.example
+
+# 工作区数据
+app/my-workspace
+
+# 杂项
+*.html
+=2.0.0
+test.py
+docker-compose.yml
+Dockerfile
+.dockerignore

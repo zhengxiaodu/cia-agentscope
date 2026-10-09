@@ -32,12 +32,15 @@ class IntentResult(BaseModel):
 
     Attributes:
         rewritten_query: 查询改写后的完整查询（独立于子意图，用于上下文/日志）
-        intents: 拆解出的意图列表（1个或多个）
+        intents: 拆解出的意图列表（1个或多个），已按 execution_order 重排
         relation: 意图间关系
+        execution_order: 执行顺序（intents 原始索引排列，如 [1,0] 表示先执行原 intents[1] 再执行 intents[0]）；
+            空列表表示按原顺序执行
     """
     rewritten_query: str
     intents: List[Intent]
     relation: RelationType = "independent"
+    execution_order: List[int] = Field(default_factory=list)
 
     @property
     def is_single_intent(self) -> bool:
@@ -49,8 +52,12 @@ class IntentResult(BaseModel):
 
 
 class IntentConfig(BaseModel):
-    """显式意图配置（来自 intent_config.yml）。"""
+    """显式意图配置（来自 intent_config.yml 或 mng 外部意图）。"""
     id: str
     name: str
     description: str = ""
     agent: str
+    # 意图层级：1=一级意图, 2=二级意图, None=基础意图（视为一级）
+    level: Optional[int] = None
+    # 父意图 code（仅二级意图有，指向一级意图的 id）
+    parent_code: Optional[str] = None
