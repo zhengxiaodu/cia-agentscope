@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="tokyo-night">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="x-content-type" content="presentation" />
+<meta name="x-presentation-version" content="1.0" />
+<meta name="x-presentation-indicator" content="deck-stage .slide" />
+<title>从 LLM 到 Harness · 项目分享</title>
+<link rel="stylesheet" href="./_shared/fonts.css">
+<link rel="stylesheet" href="./_shared/base.css">
+<link id="theme-link" rel="stylesheet" href="./_shared/themes/tokyo-night.css">
+<link rel="stylesheet" href="./_shared/animations/animations.css">
+<link rel="stylesheet" href="./_shared/decorations.css">
+<style>
+/* ---- cover ---- */
+.cover-bg{position:absolute;inset:0;overflow:hidden}
+.cover-bg img{width:100%;height:100%;object-fit:cover}
+.cover-scrim{position:absolute;inset:0;background:linear-gradient(180deg,rgba(5,10,25,.35) 0%,rgba(5,10,25,.72) 100%)}
+.cover-content{position:relative;z-index:2;height:100%;display:flex;flex-direction:column;justify-content:center;padding:56px 88px}
+.cover-content .h1{color:#fff;font-size:78px;font-weight:900;line-height:1.1;letter-spacing:-.02em;margin:0}
+.cover-content .lede{color:rgba(255,255,255,.85);font-size:22px;margin:22px 0 0;max-width:60ch}
+.cover-content .deck-header,.cover-content .deck-footer{color:rgba(255,255,255,.7)}
+/* ---- arch ---- */
+.arch{margin-top:22px;display:grid;grid-template-rows:auto auto auto;gap:20px}
+.arch .tier{display:grid;grid-template-columns:150px 1fr;align-items:stretch;gap:20px}
+.arch .tname{display:flex;align-items:center;justify-content:center;background:var(--surface-2);border-radius:var(--radius);padding:16px;font-weight:700;font-size:14px;color:var(--text-2);text-align:center;line-height:1.5}
+.arch .cells{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}
+.arch .cell{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:15px 12px;text-align:center;box-shadow:var(--shadow)}
+.arch .cell .ic{font-size:24px}
+.arch .cell h4{font-size:15px;margin:6px 0 3px}
+.arch .cell p{font-size:12px;color:var(--text-3);margin:0;line-height:1.5}
+.arch .tier.hl .cell{border-top:3px solid var(--accent)}
+/* ---- flow ---- */
+.flow{display:flex;align-items:center;gap:14px;margin-top:44px;max-width:1720px}
+.flow .node{flex:1;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px 14px;text-align:center;box-shadow:var(--shadow);position:relative}
+.flow .node .ic{font-size:30px;margin-bottom:6px}
+.flow .node h4{font-size:15px}
+.flow .node p{font-size:12px;color:var(--text-3);margin:0;line-height:1.5}
+.flow .arr{color:var(--text-3);font-size:26px;flex-shrink:0}
+.flow .node.hl{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 18%,transparent),var(--shadow)}
+/* ---- steps ---- */
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:24px;margin-top:44px}
+.step{position:relative;padding:26px 24px 20px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);box-shadow:var(--shadow)}
+.step .num{position:absolute;top:-22px;left:20px;width:44px;height:44px;border-radius:50%;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:19px;box-shadow:var(--shadow)}
+.step h4{margin:14px 0 8px;font-size:17px}
+.step p{font-size:13px;color:var(--text-2);line-height:1.65}
+.step .tag{display:inline-block;margin-top:10px;font-size:11px;padding:3px 10px;border-radius:999px;background:var(--surface-2);color:var(--text-3)}
+/* ---- comparison ---- */
+.vs{display:grid;grid-template-columns:1fr 80px 1fr;gap:26px;align-items:stretch;margin-top:32px}
+.vs .side{padding:28px}
+.vs .mid{font-size:52px;font-weight:800;color:var(--text-3);display:flex;align-items:center;justify-content:center}
+.vs .bad-side{border-top:3px solid var(--bad)}
+.vs .good-side{border-top:3px solid var(--good)}
+.vs h3{font-size:23px}
+.vs ul{padding-left:20px;font-size:15px;line-height:1.85;color:var(--text-2)}
+.vs li::marker{color:var(--bad)}
+.vs .good-side li::marker{color:var(--good)}
+/* ---- glass ---- */
+.glass-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px;margin-top:30px}
+.glass-card{position:relative;overflow:hidden;border-radius:var(--radius,16px);padding:26px 24px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);backdrop-filter:blur(20px) saturate(160%);box-shadow:0 8px 32px rgba(0,0,0,.3),inset 0 1px 0 rgba(255,255,255,.08)}
+.glass-card::before{content:'';position:absolute;top:0;left:0;right:0;height:50%;background:linear-gradient(180deg,rgba(255,255,255,.08),transparent);pointer-events:none}
+.glass-card.warm{background:rgba(232,168,124,.06);border-color:rgba(232,168,124,.25)}
+.glass-card.blue{background:rgba(126,184,218,.06);border-color:rgba(126,184,218,.25)}
+.glass-card.green{background:rgba(126,211,164,.06);border-color:rgba(126,211,164,.25)}
+.glass-card h3{margin:0 0 8px;font-size:20px;font-weight:700;color:var(--text-1)}
+.glass-card p{margin:0;font-size:14px;line-height:1.65;color:var(--text-2)}
+.glass-card .icon{font-size:42px;margin-bottom:12px;display:block}
+.glass-card .cfg{display:inline-block;margin-top:10px;font-size:11px;padding:3px 10px;border-radius:999px;background:rgba(255,255,255,.08);color:var(--text-3);font-family:var(--font-mono,monospace)}
+/* ---- quote page chips ---- */
+.chips{display:flex;flex-wrap:wrap;gap:14px;justify-content:center;margin-top:36px}
+.chip{padding:10px 22px;border-radius:999px;border:1px solid var(--border);background:var(--surface);font-size:16px;color:var(--text-2);box-shadow:var(--shadow)}
+.chip b{color:var(--text-1)}
+</style>
+</head>
+<body data-themes="tokyo-night,catppuccin-mocha,indigo-code,blueprint" data-theme-base="./_shared/themes/">
+<deck-stage width="1920" height="1080">
+
+  <!-- 1. Cover -->
+  <section class="slide" data-deck-label="封面" style="padding:0">
+    <div class="cover-bg"><img src="assets/cover-bg.jpg" alt="封面背景"></div>
+    <div class="cover-scrim"></div>
+    <div class="cover-content">
+      <div class="deck-header"><span class="eyebrow">项目分享会 · 2026</span><span class="eyebrow">Project Sharing</span></div>
+      <div class="anim-stagger-list" style="margin-top:auto;margin-bottom:auto">
+        <h1 class="h1 anim-fade-up" data-anim="fade-up">从 LLM 到 <span class="gradient-text">Harness</span><br>企业级智能问答平台实践</h1>
+        <p class="lede">当一个「聪明的大脑」走进企业：我们如何用配置中心 + 后端运行时 + 前端组件，把它变成能干活的平台。</p>
+      </div>
+      <div class="deck-footer"><span class="dim2" style="color:rgba(255,255,255,.6)">智能问答平台项目组 · 2026-11</span><span class="slide-number" data-current="1" data-total="21"></span></div>
+    </div>
+    <div class="notes">开场：今天这场分享不讲代码细节，讲整体思路。三个部分：为什么需要 LLM 之后的 Agent 和 Harness；我们项目的架构与创新点；最后看一眼新一代的 DeepSeek Harness，对照我们的方向。</div>
+  </section>
+
+  <!-- 2. TOC -->
+  <section class="slide" data-deck-label="目录">
+    <p class="eyebrow">Contents · 目录</p>
+    <h2 class="h2">今天讲四件事</h2>
+    <div class="grid g2 mt-l anim-stagger-list" data-anim-target>
+      <div class="card"><div class="row"><div class="h3 dim2" style="width:56px">01</div><div><h4>技术演进：LLM → Agent → Harness</h4><p class="dim">为什么单个 LLM 和 Agent 不足以支撑复杂任务。</p></div></div></div>
+      <div class="card"><div class="row"><div class="h3 dim2" style="width:56px">02</div><div><h4>项目架构：配置中心 · 后端 · 前端</h4><p class="dim">三层如何分工，把能力做成可运营的资产。</p></div></div></div>
+      <div class="card"><div class="row"><div class="h3 dim2" style="width:56px">03</div><div><h4>创新点与实现思路</h4><p class="dim">配置驱动编排 · 卡片反馈同轮恢复 · 沙箱技能工作区。</p></div></div></div>
+      <div class="card"><div class="row"><div class="h3 dim2" style="width:56px">04</div><div><h4>新一代 Harness：DeepSeek Harness</h4><p class="dim">「一切皆插件」的 Agent 运行时，与对我们的启示。</p></div></div></div>
+    </div>
+    <div class="deck-footer"><span class="dim2">从 LLM 到 Harness</span><span>目录</span></div>
+    <div class="notes">先交代技术背景，再进入项目本身，最后用 DeepSeek Harness 收尾并展望。整场约 25 分钟，欢迎随时打断提问。</div>
+  </section>
+
+  <!-- 3. Section 01 -->
+  <section class="slide tc center deco-ambient-purple" data-deck-label="Part 01 技术演进">
+    <div style="max-width:900px;margin:0 auto">
+      <p class="kicker anim-fade-down" data-anim="fade-down">Section · 01</p>
+      <h1 class="h1 anim-rise-in" data-anim="rise-in" style="font-size:96px">技术演进：<br>LLM → Agent → <span class="gradient-text">Harness</span></h1>
+      <div class="divider-accent" style="margin:26px auto"></div>
+      <p class="lede" style="margin:0 auto">模型越来越聪明，但「聪明的模型」不等于「能干活的系统」。</p>
+    </div>
+    <div class="notes">第一部分回答一个问题：为什么行业从单模型，走到 Agent，又走到 Harness。这是理解我们项目设计的前提。</div>
+  </section>
+
+  <!-- 4. 单个 LLM 的边界 -->
+  <section class="slide deco-grid" data-deck-label="单个 LLM 的能力边界">
+    <p class="kicker">Limit · 单模型的边界</p>
+    <h2 class="h2">单个 LLM：聪明的大脑，<span class="dim2">无力的手脚</span></h2>
+    <div class="grid g3 mt-l anim-stagger-list" data-anim-target>
+      <div class="card"><div style="font-size:40px">🧊</div><h4 class="mt-s">知识是冻结的</h4><p class="dim">训练数据有截止日期。今日新闻、实时行情、公司内部制度——模型一概不知道，也查不到。</p></div>
+      <div class="card"><div style="font-size:40px">🤐</div><h4 class="mt-s">只会说，不会做</h4><p class="dim">输出只能是文本。不能联网搜索、不能查知识库、不能渲染图表、更不能执行有副作用的操作。</p></div>
+      <div class="card"><div style="font-size:40px">🌀</div><h4 class="mt-s">没有状态与规划</h4><p class="dim">上下文窗口有限，长链条任务容易跑偏、遗忘中间结论；没有权限边界，企业场景无法直接上。</p></div>
+    </div>
+    <p class="lede mt-l anim-fade-up" data-anim="fade-up">复杂任务需要的不止「会思考」，还要「能行动、有记忆、守规矩」。</p>
+    <div class="deck-footer"><span class="dim2">Part 01 · 技术演进</span><span>单个 LLM 的能力边界</span></div>
+    <div class="notes">企业里的真实任务：查实时数据、查内部制度、画图、让用户确认再执行——单模型一个都做不了。于是有了 Agent。</div>
+  </section>
+
+  <!-- 5. Agent -->
+  <section class="slide" data-deck-label="Agent 的进步与不足">
+    <p class="kicker">Evolution · Agent 时代</p>
+    <h2 class="h2">Agent：给模型装上工具，<span class="dim2">但工程设施各自为政</span></h2>
+    <div class="grid g2 mt-l">
+      <div class="card anim-fade-left" data-anim="fade-left">
+        <h3>Agent = LLM + 工具 + ReAct 循环</h3>
+        <p class="dim">模型在「思考 → 调用工具 → 观察结果 → 再思考」的循环里完成任务，能力大幅扩展。</p>
+        <ul class="mt-m">
+          <li>— 接搜索：解决实时信息</li>
+          <li>— 接知识库：解决私域知识</li>
+          <li>— 接渲染工具：把答案变成图表、卡片</li>
+          <li>— 我们的问答平台，核心也是一组 Agent</li>
+        </ul>
+      </div>
+      <div class="card anim-fade-right" data-anim="fade-right">
+        <h3>但复杂任务下，痛点浮现</h3>
+        <ul class="mt-m">
+          <li>— 模型接入、会话管理、沙箱、持久化、UI……每个项目重复造轮子</li>
+          <li>— 能力与运行时耦合：换模型、加工具都要动代码</li>
+          <li>— 缺统一权限、隔离与可观测性，企业级落地难</li>
+          <li>— 单 Agent 单循环，难以支撑多意图、多智能体协作</li>
+        </ul>
+      </div>
+    </div>
+    <div class="deck-footer"><span class="dim2">Part 01 · 技术演进</span><span>Agent 的进步与不足</span></div>
+    <div class="notes">Agent 解决了「会用工具」，但把这些能力组装成一个可靠系统的工程层——谁来管会话、管沙箱、管权限、管渲染？——仍然各写各的。这一层就叫 Harness。</div>
+  </section>
+
+  <!-- 6. Harness -->
+  <section class="slide center tc deco-ambient-purple" data-deck-label="Harness 运行时">
+    <div style="max-width:1100px">
+      <p class="kicker anim-fade-down" data-anim="fade-down">The Answer · 运行时层</p>
+      <blockquote class="anim-fade-up" data-anim="fade-up" style="font-size:72px;line-height:1.2;margin:18px 0 10px;font-weight:900">
+        Model + <span class="gradient-text">Harness</span> = Agent
+      </blockquote>
+      <p class="lede" style="margin:0 auto 8px">模型负责「思考」，Harness 负责「执行」——把模型之上的工程设施标准化。</p>
+      <div class="chips anim-stagger-list" data-anim-target>
+        <div class="chip"><b>模型接入</b>·可替换</div>
+        <div class="chip"><b>工具调度</b>·技能化</div>
+        <div class="chip"><b>会话状态</b>·可恢复</div>
+        <div class="chip"><b>沙箱隔离</b>·安全执行</div>
+        <div class="chip"><b>权限管控</b>·企业级</div>
+        <div class="chip"><b>组件渲染</b>·富交互</div>
+        <div class="chip"><b>可观测</b>·全链路</div>
+      </div>
+    </div>
+    <div class="notes">一句话给 Harness 下定义：模型之上、应用之下的那层运行时。接下来介绍的我们这个项目，本质上就是在企业场景里自建了一层 Harness。</div>
+  </section>
+
+  <!-- 7. Section 02 -->
+  <section class="slide tc center deco-ambient-purple" data-deck-label="Part 02 项目架构">
+    <div style="max-width:900px;margin:0 auto">
+      <p class="kicker anim-fade-down" data-anim="fade-down">Section · 02</p>
+      <h1 class="h1 anim-rise-in" data-anim="rise-in" style="font-size:96px">项目架构：<br>配置中心 · <span class="gradient-text">后端</span> · 前端</h1>
+      <div class="divider-accent" style="margin:26px auto"></div>
+      <p class="lede" style="margin:0 auto">能力放在配置里，执行放在运行时里，体验放在终端里。</p>
+    </div>
+    <div class="notes">项目是一个企业级智能问答平台：多智能体、可配置、带交互卡片。整体分三块：管理侧的配置中心、FastAPI 后端运行时、前端对话终端。</div>
+  </section>
+
+  <!-- 8. 总体架构 -->
+  <section class="slide deco-grid" data-deck-label="总体架构">
+    <p class="kicker">Architecture · 系统总览</p>
+    <h2 class="h2">三层架构：能力配置 → 编排执行 → 交互呈现</h2>
+    <div class="arch anim-stagger-list" data-anim-target>
+      <div class="tier"><div class="tname">前端<br>对话终端</div>
+        <div class="cells">
+          <div class="cell"><div class="ic">💬</div><h4>流式对话</h4><p>SSE 逐字输出</p></div>
+          <div class="cell"><div class="ic">📊</div><h4>组件渲染</h4><p>图表 / 指标卡 / 交互卡片</p></div>
+          <div class="cell"><div class="ic">👆</div><h4>反馈回传</h4><p>卡片点击 → /chat/feedback</p></div>
+          <div class="cell"><div class="ic">🗂️</div><h4>会话管理</h4><p>历史 / 收藏 / 文件上传</p></div>
+        </div>
+      </div>
+      <div class="tier hl"><div class="tname">后端<br>编排运行时</div>
+        <div class="cells">
+          <div class="cell"><div class="ic">🧭</div><h4>意图编排</h4><p>意图识别 → 智能体路由</p></div>
+          <div class="cell"><div class="ic">🤖</div><h4>多智能体</h4><p>注册表按技能组装工具箱</p></div>
+          <div class="cell"><div class="ic">📦</div><h4>沙箱工作区</h4><p>OpenSandbox 隔离执行</p></div>
+          <div class="cell"><div class="ic">🛠️</div><h4>工具体系</h4><p>搜索 / 知识库 / 渲染 / 反馈</p></div>
+        </div>
+      </div>
+      <div class="tier"><div class="tname">配置中心<br>管理端 (mng)</div>
+        <div class="cells">
+          <div class="cell"><div class="ic">🎯</div><h4>意图 / 智能体</h4><p>路由关系可运营</p></div>
+          <div class="cell"><div class="ic">🧩</div><h4>技能注册</h4><p>技能目录声明式接入</p></div>
+          <div class="cell"><div class="ic">🃏</div><h4>卡片模板</h4><p>cardType + schemaFields</p></div>
+          <div class="cell"><div class="ic">🔐</div><h4>用户权限</h4><p>智能体白名单 / 技能黑名单</p></div>
+        </div>
+      </div>
+    </div>
+    <div class="deck-footer"><span class="dim2">Part 02 · 项目架构</span><span>总体架构</span></div>
+    <div class="notes">从下往上看：配置中心定义「有哪些能力、谁能用」；后端负责「怎么组合与执行」；前端负责「怎么呈现与交互」。虚线下发、运行时消费。</div>
+  </section>
+
+  <!-- 9. 配置中心 -->
+  <section class="slide" data-deck-label="配置中心">
+    <p class="kicker">Config · 配置中心</p>
+    <h2 class="h2">配置中心：一切能力皆可配置</h2>
+    <div class="glass-grid anim-stagger-list" data-anim-target>
+      <div class="glass-card blue">
+        <span class="icon">🎯</span>
+        <h3>意图配置</h3>
+        <p>声明意图 → 智能体的映射；多意图时按关联关系选择并行、流水线或 ReAct 编排。</p>
+        <span class="cfg">intent_config.yml</span>
+      </div>
+      <div class="glass-card green">
+        <span class="icon">🤖</span>
+        <h3>智能体配置</h3>
+        <p>每个智能体绑定自己的技能子集与系统提示词，职责隔离、按需可见。</p>
+        <span class="cfg">agent_config.yml</span>
+      </div>
+      <div class="glass-card warm">
+        <span class="icon">🧩</span>
+        <h3>技能配置</h3>
+        <p>技能 = 使用文档 + 工具集。注册目录后，首次对话时自动注入沙箱。</p>
+        <span class="cfg">skill_config.yml</span>
+      </div>
+      <div class="glass-card">
+        <span class="icon">🃏</span>
+        <h3>组件配置</h3>
+        <p>卡片类型、schema 字段、渲染模板均在管理端配置，前端按模板渲染。</p>
+        <span class="cfg">cardType + schemaFields</span>
+      </div>
+    </div>
+    <p class="lede mt-l anim-fade-up" data-anim="fade-up">配置之外还有一层用户权限：登录时与管理端融合，决定每个用户能见哪些智能体、哪些技能。</p>
+    <div class="deck-footer"><span class="dim2">Part 02 · 项目架构</span><span>配置中心</span></div>
+    <div class="notes">关键理念：能力不是写死在代码里的，是登记在配置里的。新增一个「制度问答智能体」？加一段 YAML 即可，下一页的创新点会展开。</div>
+  </section>
+
+  <!-- 10. 后端 -->
+  <section class="slide" data-deck-label="后端">
+    <p class="kicker">Runtime · 后端</p>
+    <h2 class="h2">后端：编排引擎 + 沙箱工作区</h2>
+    <div class="grid g2 mt-l">
+      <div class="card anim-fade-left" data-anim="fade-left">
+        <h3>🧭 编排链路</h3>
+        <ul class="mt-m">
+          <li>— 登录时融合本地配置与管理端权限，缓存 Redis</li>
+          <li>— 每轮对话：改写 → 意图识别 → 路由到智能体</li>
+          <li>— 单意图直接执行；多意图按关系并行 / 流水线 / ReAct</li>
+          <li>— 意图识别与工作区装配<b>并行</b>进行，压低首字延迟</li>
+        </ul>
+      </div>
+      <div class="card anim-fade-right" data-anim="fade-right">
+        <h3>📦 沙箱与工具</h3>
+        <ul class="mt-m">
+          <li>— OpenSandbox：按用户分配沙箱，按会话隔离目录</li>
+          <li>— 技能文件在首次对话时注入沙箱，随取随用</li>
+          <li>— 工具工厂闭包注入会话/用户上下文（搜索、知识库、卡片、反馈）</li>
+          <li>— 每个智能体只拿到自己技能子集对应的工具箱</li>
+        </ul>
+      </div>
+    </div>
+    <div class="deck-footer"><span class="dim2">Part 02 · 项目架构</span><span>后端</span></div>
+    <div class="notes">后端就是我们的「迷你 Harness」：模型之上，把编排、隔离、工具、状态管理全部收口。技术栈 FastAPI + AgentScope + OpenSandbox。</div>
+  </section>
+
+  <!-- 11. 前端 -->
+  <section class="slide" data-deck-label="前端">
+    <p class="kicker">Terminal · 前端</p>
+    <h2 class="h2">前端：流式对话 + 组件化卡片</h2>
+    <ul class="grid g1 anim-stagger-list" style="list-style:none;padding:0;margin:26px 0 0;gap:16px" data-anim-target>
+      <li class="card card-accent"><h4>① 流式体验</h4><p class="dim">回答逐字流出，工具调用过程实时可见——用户等得住，因为看得见它在干活。</p></li>
+      <li class="card card-accent"><h4>② 组件化渲染</h4><p class="dim">后端产出统一组件协议：折线图、指标卡、自定义卡片（cardType + schema）。前端按配置中心的模板渲染，新增卡片类型前端零改动。</p></li>
+      <li class="card card-accent"><h4>③ 闭环交互</h4><p class="dim">确认卡片上用户点一下 → 回传 feedback → 唤醒挂起中的智能体，同一轮对话继续往下走。</p></li>
+    </ul>
+    <div class="deck-footer"><span class="dim2">Part 02 · 项目架构</span><span>前端</span></div>
+    <div class="notes">前端的重点不是页面，是协议：文本流 + 组件流 + 反馈通道，三件事撑起「能看、能点、能续」的对话体验。</div>
+  </section>
+
+  <!-- 12. Section 03 -->
+  <section class="slide tc center deco-ambient-purple" data-deck-label="Part 03 创新点与实现思路">
+    <div style="max-width:900px;margin:0 auto">
+      <p class="kicker anim-fade-down" data-anim="fade-down">Section · 03</p>
+      <h1 class="h1 anim-rise-in" data-anim="rise-in" style="font-size:96px">创新点<br>与<span class="gradient-text">实现思路</span></h1>
+      <div class="divider-accent" style="margin:26px auto"></div>
+      <p class="lede" style="margin:0 auto">三个创新点，一条主链路。</p>
+    </div>
+    <div class="notes">三个创新点按「静态 → 动态 → 隔离」展开，最后用一次对话的完整链路把它们串起来。</div>
+  </section>
+
+  <!-- 13. 创新点1 -->
+  <section class="slide" data-deck-label="创新点一 配置驱动编排">
+    <p class="kicker">Innovation · 01</p>
+    <h2 class="h2">配置驱动的多智能体编排</h2>
+    <div class="vs">
+      <div class="card bad-side side anim-fade-left" data-anim="fade-left">
+        <h3>📉 传统做法</h3>
+        <ul>
+          <li>新增智能体 = 写代码、改路由、重新发版</li>
+          <li>工具对所有智能体全局暴露，职责不清</li>
+          <li>提示词散落在代码里，运营无法触碰</li>
+        </ul>
+      </div>
+      <div class="mid">→</div>
+      <div class="card good-side side anim-fade-right" data-anim="fade-right">
+        <h3>📈 本项目</h3>
+        <ul>
+          <li>YAML 声明式注册：新增智能体<b>零代码</b>、免发版</li>
+          <li>每个智能体只见自己绑定的技能子集，天然隔离</li>
+          <li>意图 / 提示词 / 技能全部配置化，管理端可运营</li>
+        </ul>
+      </div>
+    </div>
+    <p class="lede mt-l anim-fade-up" data-anim="fade-up">上线「制度问答」「深度调研」等新智能体，从排期开发变成<b>改配置 + 发卡片</b>。</p>
+    <div class="deck-footer"><span class="dim2">Part 03 · 创新点</span><span>配置驱动编排</span></div>
+    <div class="notes">举例：上个月新增 feedback_confirm 技能并绑定到通用问答智能体，只加了两个文件和两行 YAML。注册表机制在运行时按技能名筛选装配工具箱。</div>
+  </section>
+
+  <!-- 14. 创新点2 -->
+  <section class="slide" data-deck-label="创新点二 卡片反馈同轮恢复">
+    <p class="kicker">Innovation · 02</p>
+    <h2 class="h2">卡片反馈：同轮暂停-恢复</h2>
+    <div class="flow anim-stagger-list" data-anim-target>
+      <div class="node"><div class="ic">🤖</div><h4>调用发卡工具</h4><p>render_feedback_card</p></div>
+      <div class="arr">→</div>
+      <div class="node hl"><div class="ic">⏸️</div><h4>卡片下发 · 工具挂起</h4><p>feedbackId 对账防错配</p></div>
+      <div class="arr">→</div>
+      <div class="node"><div class="ic">👆</div><h4>用户点击选项</h4><p>前端回传 /chat/feedback</p></div>
+      <div class="arr">→</div>
+      <div class="node hl"><div class="ic">⚡</div><h4>唤醒挂起工具</h4><p>结果交还模型</p></div>
+      <div class="arr">→</div>
+      <div class="node"><div class="ic">💬</div><h4>同轮继续推理</h4><p>直接给出后续回答</p></div>
+    </div>
+    <ul class="grid g1 anim-stagger-list" style="list-style:none;padding:0;margin:34px 0 0;gap:14px" data-anim-target>
+      <li class="card"><p class="dim" style="margin:0">🚫 对比传统「文字追问 → 下一轮再答」：<b>体验从两轮对话压缩为一轮</b>；超时 / 取消 / 会话中断均有优雅降级路径，单会话单挂起槽防止反馈错配。</p></li>
+    </ul>
+    <div class="deck-footer"><span class="dim2">Part 03 · 创新点</span><span>卡片反馈同轮恢复</span></div>
+    <div class="notes">这是项目里最有「运行时」味道的设计：工具执行中途可以挂起等待人类输入，恢复后仍在同一个 ReAct 循环里。人机协同的最小闭环。</div>
+  </section>
+
+  <!-- 15. 创新点3 -->
+  <section class="slide" data-deck-label="创新点三 沙箱技能工作区">
+    <p class="kicker">Innovation · 03</p>
+    <h2 class="h2">沙箱隔离的技能工作区</h2>
+    <div class="grid g3 mt-l anim-stagger-list" data-anim-target>
+      <div class="card"><div style="font-size:40px">👤</div><h4 class="mt-s">按用户分配沙箱</h4><p class="dim">用户之间完全隔离；沙箱可复用，TTL 淘汰 + 崩溃自动重建，高可用有兜底。</p></div>
+      <div class="card"><div style="font-size:40px">📁</div><h4 class="mt-s">按会话隔离目录</h4><p class="dim">同一用户的多会话互不干扰；文件产出、上传解析各归各的目录。</p></div>
+      <div class="card"><div style="font-size:40px">🧬</div><h4 class="mt-s">技能按需注入</h4><p class="dim">技能文件在首次对话时写入沙箱；智能体只能在自己工作区内读写，越界即拒绝。</p></div>
+    </div>
+    <p class="lede mt-l anim-fade-up" data-anim="fade-up">安全模型很朴素：模型生成的任何内容都<b>先当不可信代码对待</b>，跑在隔离边界内。</p>
+    <div class="deck-footer"><span class="dim2">Part 03 · 创新点</span><span>沙箱技能工作区</span></div>
+    <div class="notes">技能注入是懒加载的：登录只做配置融合，第一次问答才真正建沙箱、注入技能文件。沙箱存活期内技能不变，TTL 过期后下次对话自动刷新到最新版。</div>
+  </section>
+
+  <!-- 16. 实现思路 -->
+  <section class="slide" data-deck-label="一次对话的完整链路">
+    <p class="kicker">Walkthrough · 实现思路</p>
+    <h2 class="h2">一次对话的完整链路</h2>
+    <div class="steps anim-stagger-list" data-anim-target>
+      <div class="step"><div class="num">1</div><h4>登录融合</h4><p>本地 YAML 配置与管理端权限融合，缓存进 Redis，整轮会话直接消费。</p><span class="tag">配置就绪</span></div>
+      <div class="step"><div class="num">2</div><h4>意图识别</h4><p>LLM 改写query + 识别意图；输出单意图或多意图及其关联关系。</p><span class="tag">LLM 判断</span></div>
+      <div class="step"><div class="num">3</div><h4>工作区装配</h4><p>与意图识别<b>并行</b>：取/建沙箱、注入技能、按智能体技能子集组装工具箱。</p><span class="tag">并行提速</span></div>
+      <div class="step"><div class="num">4</div><h4>ReAct 执行</h4><p>智能体思考 → 调用工具 → 观察循环；回答与工具过程全流式输出。</p><span class="tag">核心循环</span></div>
+      <div class="step"><div class="num">5</div><h4>组件下发</h4><p>图表/卡片按统一协议拦截转发前端渲染；反馈卡片可挂起等待、同轮恢复。</p><span class="tag">交互闭环</span></div>
+    </div>
+    <div class="deck-footer"><span class="dim2">Part 03 · 实现思路</span><span>一次对话的完整链路</span></div>
+    <div class="notes">串起来讲：配置决定能力边界，意图决定谁来干活，沙箱决定在哪干活，ReAct 决定怎么干活，组件协议决定怎么呈现。五个环节里 2 和 3 是并行的。</div>
+  </section>
+
+  <!-- 17. Section 04 -->
+  <section class="slide tc center deco-ambient-purple" data-deck-label="Part 04 DeepSeek Harness">
+    <div style="max-width:900px;margin:0 auto">
+      <p class="kicker anim-fade-down" data-anim="fade-down">Section · 04</p>
+      <h1 class="h1 anim-rise-in" data-anim="rise-in" style="font-size:88px">新一代 Harness：<br><span class="gradient-text">DeepSeek Harness</span></h1>
+      <div class="divider-accent" style="margin:26px auto"></div>
+      <p class="lede" style="margin:0 auto">「一切皆插件」的开源 Agent 运行时（2026.08 · MIT）。</p>
+    </div>
+    <div class="notes">最后把视野拉出去：我们自建的这层 Harness，业界已经出现了标准化的开源实现。看看 DeepSeek Harness 交出的答卷。</div>
+  </section>
+
+  <!-- 18. DeepSeek Harness 是什么 -->
+  <section class="slide" data-deck-label="DeepSeek Harness 是什么">
+    <p class="kicker">Landscape · 定位</p>
+    <h2 class="h2">DeepSeek Harness：模型之上的开源运行时</h2>
+    <div class="grid g2 mt-l">
+      <div class="card anim-fade-left" data-anim="fade-left">
+        <h3>它是什么</h3>
+        <ul class="mt-m">
+          <li>— 不是又一个大模型，是 <b>Model + Harness = Agent</b> 的官方实践</li>
+          <li>— 底座 Cordis：一个只管「插件加载 / 卸载 / 依赖管理」的元框架</li>
+          <li>— 源自 Koishi 作者，经跨平台、海量插件生产验证后整体并入</li>
+          <li>— 全链路可追溯：模型看到的每个 token 都有记录</li>
+        </ul>
+      </div>
+      <div class="card anim-fade-right" data-anim="fade-right">
+        <h3>「一切皆插件」</h3>
+        <ul class="mt-m">
+          <li>— 模型、工具、技能、会话、沙箱、存储、循环、调度、<b>连 UI</b> 都是插件</li>
+          <li>— 配置即架构：改配置即热替换，不改源码、无需重启</li>
+          <li>— 四种运行模式：标准 / PTC 编程式工具调用 / 极简 / 创意</li>
+        </ul>
+      </div>
+    </div>
+    <div class="deck-footer"><span class="dim2">Part 04 · DeepSeek Harness</span><span>定位与主张</span></div>
+    <div class="notes">和我们自建的思路同源，但更彻底：我们配置化的是「能力」，它把「运行时本身」也插件化了。PTC 模式值得一提——让模型写代码来编排多轮工具调用，降低长链路往返成本。</div>
+  </section>
+
+  <!-- 19. 三大核心机制 -->
+  <section class="slide" data-deck-label="DeepSeek Harness 核心机制">
+    <p class="kicker">Mechanisms · 核心机制</p>
+    <h2 class="h2">撑起「一切皆插件」的三大机制</h2>
+    <div class="grid g3 mt-l anim-stagger-list" data-anim-target>
+      <div class="card"><div style="font-size:40px">♻️</div><h4 class="mt-s">可逆副作用</h4><p class="dim">任何注册动作都必须登记撤销函数，卸载时 LIFO 逆序清理。失败原子性、级联清理、运行时热插拔由此成立。</p></div>
+      <div class="card"><div style="font-size:40px">🔌</div><h4 class="mt-s">服务与事件</h4><p class="dim">能力消费走服务、状态广播走事件，双通道松耦合；作用域链天然隔离——子层可见父层，反之不可见。</p></div>
+      <div class="card"><div style="font-size:40px">📦</div><h4 class="mt-s">预设与作用域</h4><p class="dim">全局—预设—会话的作用域链；一份插件树多会话复用，工具可见性按作用域运行时遮蔽，不再全局二元。</p></div>
+    </div>
+    <p class="lede mt-l anim-fade-up" data-anim="fade-up">设计哲学一句话：<b>把「卸载」和「加载」放到同等地位</b>，热插拔才不是口号。</p>
+    <div class="deck-footer"><span class="dim2">Part 04 · DeepSeek Harness</span><span>核心机制</span></div>
+    <div class="notes">重点讲可逆副作用：传统 DI 容器只管绑定不管解绑，插件一多就幽灵回调、连接泄漏。Cordis 把清理变成框架的结构性保证。安全上 Code Mode 用 worker_threads 而非 vm 沙箱，隔离边界内不信任任何模型输入——和我们沙箱思路一致。</div>
+  </section>
+
+  <!-- 20. 对我们的启示 -->
+  <section class="slide" data-deck-label="对我们的启示">
+    <p class="kicker">Takeaway · 启示</p>
+    <h2 class="h2">对照 Harness：我们做对了什么，接下来做什么</h2>
+    <div class="vs">
+      <div class="card good-side side anim-fade-left" data-anim="fade-left">
+        <h3>✅ 已经做对的</h3>
+        <ul>
+          <li>配置驱动：意图 / 智能体 / 技能全部声明式</li>
+          <li>能力分装：技能 = 文档 + 工具，卡片 = 模板 + schema</li>
+          <li>隔离与安全：沙箱工作区、权限白名单、单槽反馈对账</li>
+        </ul>
+      </div>
+      <div class="mid">→</div>
+      <div class="card bad-side side anim-fade-right" data-anim="fade-right">
+        <h3>🧭 可以借鉴的</h3>
+        <ul>
+          <li>插件化运行时：工具 / 技能从「配置注册」走向「热插拔」</li>
+          <li>可逆性设计：注册即登记撤销，组件可回滚可替换</li>
+          <li>统一模型服务接口：面向接口编程，模型随装随换</li>
+        </ul>
+      </div>
+    </div>
+    <p class="lede mt-l anim-fade-up" data-anim="fade-up">Agent 的竞争，正在从「模型效果」延伸到「<b>运行时质量</b>」。</p>
+    <div class="deck-footer"><span class="dim2">Part 04 · 启示</span><span>对我们的启示</span></div>
+    <div class="notes">收束观点：我们项目在企业场景里自建了一层实用主义 Harness，方向和 DeepSeek Harness 互相印证。后续演进可以考虑向插件化、可逆性靠拢。</div>
+  </section>
+
+  <!-- 21. Thanks -->
+  <section class="slide center tc" data-deck-label="谢谢">
+    <div>
+      <div class="anim-confetti-burst" style="display:inline-block;padding:40px"></div>
+      <h1 class="h1 anim-fade-up" data-anim="fade-up" style="font-size:150px;line-height:1"><span class="gradient-text">谢谢</span></h1>
+      <p class="lede" style="margin:18px auto 0">Model + Harness = Agent —— 愿我们既造好大脑，也造好手脚。</p>
+      <div class="row mt-l" style="justify-content:center;gap:32px">
+        <div class="dim">智能问答平台项目组</div>
+        <div class="dim">Q &amp; A</div>
+        <div class="dim">2026 · 11</div>
+      </div>
+    </div>
+    <div class="notes">结束语：留 5 分钟问答。感谢大家。</div>
+  </section>
+
+</deck-stage>
+<script src="./_shared/runtime.js"></script>
+<script src="./_shared/echarts-theme-sync.js"></script>
+</body></html>
