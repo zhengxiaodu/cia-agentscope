@@ -1,41 +1,9 @@
-import uuid
-import os
-from pathlib import Path
-from agentscope.message import DataBlock, URLSource
-from pydantic import AnyUrl
-
-
 class FileService:
-    def __init__(self, workdir: str):
-        self.workdir = workdir
+    """上传文件校验工具（静态方法）。
 
-    async def save_upload(
-        self,
-        session_id: str | None,
-        filename: str,
-        content: bytes,
-        media_type: str,
-    ) -> DataBlock:
-        if session_id:
-            data_dir = Path(self.workdir) / "data" / session_id
-        else:
-            data_dir = Path(self.workdir) / "data"
-
-        data_dir.mkdir(parents=True, exist_ok=True)
-
-        unique_name = f"{uuid.uuid4().hex}_{filename}"
-        file_path = data_dir / unique_name
-
-        file_path.write_bytes(content)
-
-        return DataBlock(
-            id=uuid.uuid4().hex,
-            name=filename,
-            source=URLSource(
-                url=AnyUrl(Path(file_path).resolve().as_uri()),
-                media_type=media_type,
-            ),
-        )
+    历史上的 save_upload 落盘逻辑已随"上传即解析"改造移除：
+    上传文件不再写入沙箱/宿主机，解析内容经 upload_files 表注入提示词。
+    """
 
     @staticmethod
     def validate_file_size(content: bytes, max_size_mb: int = 10) -> bool:
