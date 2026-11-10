@@ -94,15 +94,15 @@ def _make_service(workspace_manager=None) -> OrchestratorService:
 def _patch_config_paths(monkeypatch):
     """把相对 config 路径指到仓库内绝对路径，供 base-only 兜底读取。"""
     monkeypatch.setattr(
-        "app.services.orchestrator_service.AGENT_CONFIG_PATH",
+        "app.services.user_config_service.AGENT_CONFIG_PATH",
         os.path.join(_REPO_CONFIG, "agent_config.yml"),
     )
     monkeypatch.setattr(
-        "app.services.orchestrator_service.INTENT_CONFIG_PATH",
+        "app.services.user_config_service.INTENT_CONFIG_PATH",
         os.path.join(_REPO_CONFIG, "intent_config.yml"),
     )
     monkeypatch.setattr(
-        "app.services.orchestrator_service.SKILL_CONFIG_PATH",
+        "app.services.user_config_service.SKILL_CONFIG_PATH",
         os.path.join(_REPO_CONFIG, "skill_config.yml"),
     )
 

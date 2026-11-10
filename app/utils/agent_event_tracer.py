@@ -17,6 +17,7 @@ from agentscope.event import (
     TextBlockDeltaEvent,
     ToolCallStartEvent,
     ToolResultEndEvent,
+    ToolCallDeltaEvent
 )
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,16 @@ class AgentEventTracer:
                 metadata={"agentId": self._agent_id, "toolCallId": event.tool_call_id},
             )
             self.tool_calls += 1
+        elif isinstance(event, ToolCallDeltaEvent) and "\"skill\":" in event.delta:
+            prefix = '"skill":'
+            skill_name = event.delta.replace(prefix, "").replace("\"","")
+            skobs = self._lf.start_observation(
+                name=f"skill-{skill_name}", as_type="tool",
+                metadata={"agentId": self._agent_id, "toolCallId": event.tool_call_id},
+            )
+            self._lf.end_observation(
+                skobs, output=None
+            )
         elif isinstance(event, ToolResultEndEvent):
             state = getattr(event.state, "value", str(event.state))
             if state == "error":

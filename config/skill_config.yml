@@ -11,3 +11,6 @@ skills:
   - name: policy_qa
     directory: ./skills/policy_qa
     description: "根据公司内部制度文件知识库回答问题"
+  - name: feedback_confirm
+    directory: ./skills/feedback_confirm
+    description: "二选一确认卡片技能：渲染 feedback_confirm 交互卡片并暂停等待用户选择，收到反馈后同轮继续处理。"

@@ -43,6 +43,11 @@ GET_CARD_CONFIG = "get_card_config"
 # 查询 mng 个性化组件配置工具
 GET_CUSTOM_COMPONENT_CONFIG = "get_custom_component_config"
 
+# ===================== 卡片反馈工具 =====================
+
+# 卡片反馈渲染工具（发卡 + 挂起等待用户反馈，同轮恢复）
+RENDER_FEEDBACK_CARD = "render_feedback_card"
+
 
 # ===================== Skill 管理工具 =====================
 

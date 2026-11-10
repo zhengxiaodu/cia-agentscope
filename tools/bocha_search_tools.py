@@ -90,12 +90,12 @@ def create_bocha_search_tool() -> FunctionTool:
         if not BOCHA_API_KEY:
             return _build_result("搜索服务未配置，请联系管理员。")
 
-        url = f"{BOCHA_API_BASE.rstrip('/')}/v1/web-search"
+        url = f"{BOCHA_API_BASE.rstrip('/')}"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {BOCHA_API_KEY}",
         }
-        payload = {"query": query.strip()}
+        payload = {"query": query.strip(), "summary": True, "count": 10}
 
         try:
             async with httpx.AsyncClient(timeout=_BOCHA_TIMEOUT) as client:

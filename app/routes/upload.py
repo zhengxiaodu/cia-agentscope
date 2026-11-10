@@ -1,6 +1,7 @@
 import uuid
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form, Request
 
 from app.dependencies import current_user
 from app.services.file_service import FileService
@@ -83,8 +84,8 @@ async def list_user_uploads(
 ):
     """按 user_id 查询该用户上传过的全部文件（最新在前）。
 
-    每条记录返回 session_id / message_id / filename / media_type / file_size；
-    message_id 为 null 表示该文件尚未被对话消费。
+    每条记录返回 upload_file_id / session_id / message_id / filename /
+    media_type / file_size；message_id 为 null 表示该文件尚未被对话消费。
     """
     dao = getattr(request.app.state, "upload_file_dao", None)
     user_id = user.get("user_id")
@@ -93,3 +94,32 @@ async def list_user_uploads(
 
     files = await dao.list_files_by_user(user_id)
     return {"code": 200, "msg": "success", "data": {"files": files}}
+
+
+@router.delete("/uploads")
+async def delete_user_uploads(
+    request: Request,
+    upload_file_id: Optional[int] = Query(
+        None, description="要删除的上传文件 id；不传则删除该用户全部上传记录"
+    ),
+    user: dict = Depends(current_user),
+):
+    """删除上传文件记录。
+
+    传 upload_file_id 时删除对应单条记录（不存在或不属于该用户返回 404）；
+    不传时删除该用户的全部上传记录。仅删 DB 行（现架构上传文件不落盘，
+    解析内容在库内，无物理文件需清理）。
+    """
+    dao = getattr(request.app.state, "upload_file_dao", None)
+    user_id = user.get("user_id")
+    if dao is None:
+        raise HTTPException(status_code=500, detail="upload_file_dao 未初始化")
+
+    if upload_file_id is not None:
+        ok = await dao.delete_by_id(user_id, upload_file_id)
+        if not ok:
+            return {"code": 404, "msg": "文件不存在", "data": {}}
+        return {"code": 200, "msg": "success", "data": {"deleted": 1}}
+
+    deleted = await dao.delete_all_by_user(user_id)
+    return {"code": 200, "msg": "success", "data": {"deleted": deleted}}

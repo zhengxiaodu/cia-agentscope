@@ -14,7 +14,7 @@ import asyncio
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional, Tuple
 
 import yaml
@@ -32,6 +32,9 @@ from app.services.sensitive_service import (
 from app.intent.llm_client import chat_complete, extract_json
 
 logger = logging.getLogger(__name__)
+
+# 东八区（Asia/Shanghai）：消息时间戳统一按北京时间生成
+_BEIJING_TZ = timezone(timedelta(hours=8))
 
 
 @contextmanager
@@ -227,7 +230,7 @@ async def _persist_conversation_history(
 
     persist_result: Optional[dict] = None
     try:
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        now_str = datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         user_input = _extract_user_input(messages)
 
         new_messages = []
@@ -255,12 +258,23 @@ async def _persist_conversation_history(
                     last_success = orchestrator_service.last_success
                 except Exception:
                     last_success = False
+            # 真实 token 消耗：MODEL_CALL_END 事件累积的 input+output 之和；
+            # 为 0（如自有 LLM 链路未发事件、异常降级）时回退文本估算
+            real_tokens = 0
+            if orchestrator_service is not None:
+                try:
+                    real_tokens = (
+                        int(orchestrator_service.last_input_tokens or 0)
+                        + int(orchestrator_service.last_output_tokens or 0)
+                    )
+                except Exception:
+                    real_tokens = 0
             new_messages.append({
                 "role": "assistant", "content": final_output, "timestamp": now_str,
                 "agent_ids": involved_agent_ids,
                 "user_id": user_id,
                 "success": last_success,
-                "tokens": _estimate_tokens(final_output),
+                "tokens": real_tokens if real_tokens > 0 else _estimate_tokens(final_output),
                 "message_pair_id": message_pair_id,
                 "citations": citations if citations else None,
                 "bocha_sum": bocha_sum if bocha_sum else None,
@@ -363,7 +377,7 @@ async def _detect_and_emit_files(
                 })
     except Exception:
         logger.warning("[chat_service] 检测新文件失败", exc_info=True)
-    yield f"data: {json.dumps({'type': 'files_generated', 'files': files_payload}, ensure_ascii=False)}\n\n"
+    yield f"data: {json.dumps({'type': 'files_generated', 'files': files_payload, 'message_pair_id':message_pair_id}, ensure_ascii=False)}\n\n"
 
     # 持久化本轮生成的文件元信息（供 /sessions/{session_id} 回看）
     if files_payload and session_service and session_id:
@@ -412,10 +426,13 @@ def load_model_config(config_path: str = MODEL_CONFIG_PATH) -> dict:
         return yaml.safe_load(f)
 
 
-def create_model_from_config(model_config: dict):
+def create_model_from_config(model_config: dict, message_pair_id: str = ""):
     """根据配置创建模型实例（业务智能体流式对话用）。
 
     被 AgentRegistry 的 create_model_fn 调用，每次返回新实例。
+    message_pair_id 非空时通过 client_kwargs 注入请求头
+    app_serial_number: OIA-AGENTSCOPE-{message_pair_id}（意图识别/改写/编排
+    走独立 AsyncOpenAI 客户端，不经此路径，天然不带该头）。
     """
     provider = model_config.get("provider", "openai")
     base_url = model_config.get("base_url", "https://api.deepseek.com/v1")
@@ -428,9 +445,15 @@ def create_model_from_config(model_config: dict):
 
     if provider == "openai":
         credential = OpenAICredential(api_key=api_key, base_url=base_url)
-        # context_size 按 max_tokens * 0.8 赋值，为输出预留余量
         max_tokens = parameters.get("max_tokens", 0)
-        context_size = int(max_tokens * 0.8) if max_tokens else None
+        context_size = int(max_tokens) if max_tokens else None
+        # 每轮对话附加请求头：app_serial_number = OIA-AGENTSCOPE-{message_pair_id}
+        client_kwargs = (
+            {"default_headers": {
+                "app_serial_number": f"OIA-AGENTSCOPE-{message_pair_id}"
+            }}
+            if message_pair_id else None
+        )
         model = OpenAIChatModel(
             credential=credential,
             model=model_name,
@@ -439,7 +462,8 @@ def create_model_from_config(model_config: dict):
             context_size=context_size,
             # vLLM 部署的 Qwen3 等模型默认开启 thinking，显式关闭，
             # 通过 extra_body 透传 chat_template_kwargs 到请求体
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            extra_body={"chat_template_kwargs": {"enable_thinking": True,"reasoning_effort":"low"}},
+            **({"client_kwargs": client_kwargs} if client_kwargs else {}),
         )
     else:
         raise ValueError(f"不支持的 provider: {provider}")
@@ -448,7 +472,7 @@ def create_model_from_config(model_config: dict):
 
 
 # 需要拦截并转发为 CUSTOM_COMPONENT 事件的组件类型
-_COMPONENT_TYPES = {"chart", "volume_chart", "selectable_list", "confirm_action"}
+_COMPONENT_TYPES = {"chart", "volume_chart", "selectable_list", "confirm_action","feedback_chart"}
 
 
 def _extract_components_from_delta(delta: str):
@@ -473,7 +497,12 @@ def _extract_components_from_delta(delta: str):
             if depth == 0:
                 try:
                     data = json.loads(delta[i:j])
-                    if isinstance(data, dict) and data.get("type") in _COMPONENT_TYPES:
+                    if isinstance(data, dict) and data.get("type") == "feedback_chart":
+                        yield {
+                            "type": "FEEDBACK_COMPONENT",
+                            "component": data,
+                        }
+                    elif isinstance(data, dict) and data.get("type") in _COMPONENT_TYPES:
                         yield {
                             "type": "CUSTOM_COMPONENT",
                             "component": data,
@@ -603,6 +632,7 @@ async def generate_response(
                 search_enabled=search_enabled,
                 skills=skills or [],
                 langfuse_service=langfuse_service,
+                message_pair_id=message_pair_id,
             ):
                 # 取消检查点：每个事件之间检测一次（LLM chunk 之间会回到本循环）
                 if _cancelled():

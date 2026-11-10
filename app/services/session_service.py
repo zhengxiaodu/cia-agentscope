@@ -1,6 +1,6 @@
 import logging
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 from agentscope.state import AgentState
 
@@ -81,12 +81,49 @@ class SessionService:
         """取消置顶会话。"""
         await self.dao.unpin_session(user_id, session_id)
 
+    async def rename_session(
+        self, user_id: str, session_id: str, name: str
+    ) -> bool:
+        """修改会话名称。返回 False 表示会话不存在。"""
+        return await self.dao.rename_session(user_id, session_id, name)
+
     async def delete_session(self, user_id: str, session_id: str) -> bool:
         """删除会话。返回 False 表示会话不存在。"""
         if not await self.dao.session_exists(session_id):
             return False
         await self.dao.delete_session(session_id, user_id)
         return True
+
+    async def delete_message(
+        self, user_id: str, session_id: str, message_pair_ids: List[str]
+    ) -> Optional[dict]:
+        """删除会话中多轮消息（按 message_pair_id 列表）；删空则整删会话。
+
+        Returns:
+            None: 会话不存在
+            {"deleted": 0, "session_deleted": False}: 消息不存在
+            {"deleted": n>0, "session_deleted": bool}: 删除成功
+            （deleted 为删除的消息行数，一轮 user+assistant 通常 2 行）
+        Raises:
+            PermissionError: 会话不属于当前用户（对齐 get_session_detail）。
+        """
+        meta = await self.dao.get_session_meta(session_id)
+        if meta is None:
+            return None
+        if meta.get("user_id") != user_id:
+            raise PermissionError("会话不属于当前用户")
+
+        deleted = await self.dao.delete_messages_by_pair(
+            session_id, message_pair_ids
+        )
+        if deleted == 0:
+            return {"deleted": 0, "session_deleted": False}
+
+        # 删空（会话中已无剩余消息）→ 整删会话（CASCADE 清理关联表）
+        if await self.dao.count_messages(session_id) == 0:
+            await self.dao.delete_session(session_id, user_id)
+            return {"deleted": deleted, "session_deleted": True}
+        return {"deleted": deleted, "session_deleted": False}
 
     async def list_user_sessions(
         self, user_id: str, page: int = 1, page_size: int = 15

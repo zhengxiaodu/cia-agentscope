@@ -157,19 +157,58 @@ class UploadFileDAO:
     async def list_files_by_user(self, user_id: str) -> List[dict]:
         """查询某用户上传过的全部文件（最新在前）。
 
-        返回每条记录的 session_id / message_id / filename / media_type /
-        file_size；message_id 未绑定（对话尚未消费）时为 None。
+        返回每条记录的 upload_file_id / session_id / message_id / filename /
+        media_type / file_size；message_id 未绑定（对话尚未消费）时为 None。
         """
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
-                    "SELECT session_id, message_id, filename, media_type, file_size "
-                    "FROM upload_files WHERE user_id = %s ORDER BY id DESC",
+                    "SELECT id, session_id, message_id, filename, media_type, "
+                    "file_size FROM upload_files "
+                    "WHERE user_id = %s ORDER BY id DESC",
                     (user_id,),
                 )
                 rows = await cur.fetchall()
                 await conn.commit()
-                return [dict(r) for r in rows]
+                return [
+                    {
+                        "upload_file_id": r["id"],
+                        "session_id": r["session_id"],
+                        "message_id": r["message_id"],
+                        "filename": r["filename"],
+                        "media_type": r["media_type"],
+                        "file_size": r["file_size"],
+                    }
+                    for r in rows
+                ]
+
+    async def delete_by_id(self, user_id: str, file_id: int) -> bool:
+        """按 upload_file_id 删除该用户的一条上传记录。
+
+        WHERE 带 user_id 保证只能删自己的记录；返回 False 表示记录不存在。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "DELETE FROM upload_files "
+                    "WHERE id = %s AND user_id = %s",
+                    (file_id, user_id),
+                )
+                deleted = cur.rowcount
+                await conn.commit()
+                return deleted > 0
+
+    async def delete_all_by_user(self, user_id: str) -> int:
+        """删除该用户的全部上传记录，返回删除行数。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "DELETE FROM upload_files WHERE user_id = %s",
+                    (user_id,),
+                )
+                deleted = cur.rowcount
+                await conn.commit()
+                return deleted
 
     async def list_files_by_session(self, session_id: str) -> List[dict]:
         """查询某会话的全部上传文件（按上传顺序，含未被对话消费的记录）。
