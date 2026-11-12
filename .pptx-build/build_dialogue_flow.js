@@ -121,19 +121,12 @@ function tblock(s,mx,x,y,w,rows,o={}){
   });
   arrow(s,mx,880,550,880,574);
 
-  /* ── ④ Agent 执行 + 交互分支 ── */
-  box(s,mx,64,578,1060,96,{fill:"1F2335",lineColor:ACCENT2,lw:1.3});
-  tblock(s,mx,82,590,1024,[
+  /* ── ④ Agent 执行 ── */
+  box(s,mx,64,578,1656,96,{fill:"1F2335",lineColor:ACCENT2,lw:1.3});
+  tblock(s,mx,82,590,1620,[
     [{text:"④ Agent 执行 · ReAct 循环",options:{fontSize:11,bold:true,color:T1,breakLine:true}}],
-    [{text:"思考 → 调用工具 → 观察结果 → 再思考 …… 循环直至产出最终回答 · react_max_steps=8 · 单次工具调用 900s 超时",options:{fontSize:8.5,color:T2}}]
-  ],{h:72});
-  box(s,mx,1180,578,540,96,{fill:SURFACE,lineColor:WARM,lw:1.1,dash:true});
-  tblock(s,mx,1196,590,508,[
-    [{text:"交互分支 · 卡片确认",options:{fontSize:10,bold:true,color:WARM,breakLine:true}}],
-    [{text:"工具挂起（单槽 · 300s 超时）→ 用户点击 → 同轮恢复执行",options:{fontSize:8.5,color:T2}}]
-  ],{h:68});
-  arrow(s,mx,1124,602,1180,602,{color:WARM,width:1.2});
-  arrow(s,mx,1180,650,1124,650,{color:WARM,width:1.2});
+    [{text:"思考 → 调用工具 → 观察结果 → 再思考 …… 循环直至产出最终回答",options:{fontSize:8.5,color:T2}}]
+  ],{h:72,align:"center"});
   arrow(s,mx,880,674,880,700);
 
   /* ── ⑤ 流式回答 ── */
