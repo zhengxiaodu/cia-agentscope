@@ -105,6 +105,9 @@ async def test_stop_persists_only_completed_stable_artifacts(tmp_path, monkeypat
     assert files[0]["message_id"] == 102 and files[0]["message_pair_id"]
     assert (tmp_path / "s/reports/done.pptx").read_bytes() == data
     assert events[-1]["type"] == "user_abort"
+    # 用户主动停止（本地 event 置位）→ 归因 user，文案保持“用户已停止”
+    assert events[-1]["reason"] == "user"
+    assert events[-1]["message"] == "用户已停止"
     session.append_session_files.assert_awaited_once_with("s", files)
     session.append_messages.assert_awaited_once()
     assert session.append_messages.await_args.args[2][-1]["success"] is False
@@ -185,5 +188,8 @@ async def test_second_stop_during_history_commit_archives_once(monkeypatch, tmp_
     events = await asyncio.wait_for(pump, timeout=10)
     assert [e["type"] for e in events].count("files_generated") == 1
     assert events[-1]["type"] == "user_abort"
+    # 无 cancel_event 的外部取消（客户端断连/请求被取消）→ 归因 client_disconnect
+    assert events[-1]["reason"] == "client_disconnect"
+    assert events[-1]["message"] == "会话异常中断，请重试"
     session.append_messages.assert_awaited_once()
     session.append_session_files.assert_awaited_once()

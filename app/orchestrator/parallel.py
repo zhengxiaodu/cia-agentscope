@@ -7,6 +7,7 @@
 设计原则（来自文档）：能并行就并行，减少用户等待时间。
 """
 import asyncio
+from contextlib import aclosing
 import json
 import logging
 import traceback
@@ -109,11 +110,12 @@ class ParallelOrchestrator(BaseOrchestrator):
             agent_state = (agent_states or {}).get(agent_id)
             try:
                 async with asyncio.timeout(self._timeout):
-                    async for item in self._run_single_agent(
+                    async with aclosing(self._run_single_agent(
                         intent, session_id=session_id, agent_state=agent_state,
                         langfuse_service=langfuse_service,
-                    ):
-                        await queue.put(item)
+                    )) as stream:
+                        async for item in stream:
+                            await queue.put(item)
             except asyncio.TimeoutError:
                 await queue.put(TaskResult(
                     intent_id=intent.id,
@@ -148,28 +150,32 @@ class ParallelOrchestrator(BaseOrchestrator):
         finished = 0
         total = len(intents)
         summary_parts = []
-        while finished < total:
-            item = await queue.get()
-            if item is SENTINEL:
-                finished += 1
-                continue
-            if isinstance(item, TaskResult):
-                self._last_results.append(item)
-                # 发送任务完成事件
-                yield self._event({
-                    "type": "task_end",
-                    "intent_id": item.intent_id,
-                    "agent_id": item.agent_id,
-                    "success": item.success,
-                })
-                if item.output:
-                    summary_parts.append(item.output)
-            else:
-                # 实时透传 SSE 事件
-                yield item
-
-        # 等待所有 runner task 结束（消费可能的异常，避免未检索警告）
-        await asyncio.gather(*runner_tasks, return_exceptions=True)
+        try:
+            while finished < total:
+                item = await queue.get()
+                if item is SENTINEL:
+                    finished += 1
+                    continue
+                if isinstance(item, TaskResult):
+                    self._last_results.append(item)
+                    # 发送任务完成事件
+                    yield self._event({
+                        "type": "task_end",
+                        "intent_id": item.intent_id,
+                        "agent_id": item.agent_id,
+                        "success": item.success,
+                    })
+                    if item.output:
+                        summary_parts.append(item.output)
+                else:
+                    # 实时透传 SSE 事件
+                    yield item
+        finally:
+            # 租约丢失/停止/超时时不能遗留仍在执行工具的并行智能体。
+            for task in runner_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*runner_tasks, return_exceptions=True)
 
         # ③ 汇总事件（多结果一律 LLM 汇总，异常兜底回退拼接）
         if len(summary_parts) > 1:

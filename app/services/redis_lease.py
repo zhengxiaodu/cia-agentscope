@@ -1,6 +1,8 @@
 """Renewable Redis lease. Configured Redis failures never grant ownership."""
 import asyncio
+import hashlib
 import logging
+import os
 import time
 import uuid
 
@@ -13,10 +15,14 @@ end
 return 0
 """
 COMPARE_EXPIRE = """-- lease_renew
-if redis.call('get', KEYS[1]) == ARGV[1] then
-  return redis.call('pexpire', KEYS[1], ARGV[2])
+local owner = redis.call('get', KEYS[1])
+if not owner then
+  return -1
 end
-return 0
+if owner ~= ARGV[1] then
+  return -2
+end
+return redis.call('pexpire', KEYS[1], ARGV[2])
 """
 
 
@@ -43,7 +49,7 @@ def transient_io_error(exc):
 
 
 class RedisLease:
-    def __init__(self, redis, key, *, ttl=30, wait_timeout=0,
+    def __init__(self, redis, key, *, ttl=120, wait_timeout=0,
                  poll_interval=0.25, on_lost=None, token=None):
         self.redis, self.key = redis, key
         self.ttl, self.wait_timeout = ttl, wait_timeout
@@ -53,9 +59,13 @@ class RedisLease:
         self.lost = asyncio.Event()
         self._renew_task = None
         self._release_task = None
+        self._releasing = False
         self._owned = False
         self._valid_until = 0.0
         self._renew_at = 0.0
+        self._acquired_at = 0.0
+        self._owner_tag = hashlib.sha256(self.token.encode()).hexdigest()[:12]
+        self._instance = os.getenv("HOSTNAME", "unknown")
         self._safety_margin = min(1.0, ttl / 10)
 
     async def acquire(self):
@@ -71,6 +81,7 @@ class RedisLease:
                 raise CoordinationUnavailable("Redis 协调服务不可用") from exc
             if acquired:
                 self._owned = True
+                self._acquired_at = sent_at
                 # The server could execute SET immediately and its reply arrive late.
                 self._valid_until = sent_at + self.ttl - self._safety_margin
                 self._renew_at = sent_at + self.ttl / 3
@@ -79,6 +90,11 @@ class RedisLease:
                     await self.release()
                     raise LeaseLost("获取租约的响应已超出有效期，请重试")
                 self._renew_task = asyncio.create_task(self._renew())
+                if self.key.startswith("chat_run:"):
+                    logger.info(
+                        "Redis chat lease acquired key=%s instance=%s owner_tag=%s ttl_s=%s",
+                        self.key, self._instance, self._owner_tag, self.ttl,
+                    )
                 return True
             if time.monotonic() >= deadline:
                 return False
@@ -92,13 +108,23 @@ class RedisLease:
         if self.on_lost:
             self.on_lost()
 
+    def locally_valid(self):
+        """Validity backed by the last confirmed SET/renewal, never by retries."""
+        return self._owned and not self.lost.is_set() and time.monotonic() < self._valid_until
+
     async def _renew(self):
         try:
-            while True:
+            while not self._releasing:
                 await asyncio.sleep(max(0, self._renew_at - time.monotonic()))
+                if self._releasing:
+                    return
                 sent_at = time.monotonic()
                 remaining = self._valid_until - sent_at
                 if remaining <= 0:
+                    logger.warning(
+                        "Redis lease renew skipped: validity window expired "
+                        "(event loop likely blocked), key=%s", self.key,
+                    )
                     self._mark_lost()
                     return
                 try:
@@ -108,18 +134,37 @@ class RedisLease:
                     )
                 except Exception as exc:
                     if not transient_io_error(exc) or time.monotonic() >= self._valid_until:
+                        logger.warning(
+                            "Redis lease renew failed (non-transient or past "
+                            "validity), key=%s exc=%s", self.key, exc,
+                        )
                         self._mark_lost()
                         return
                     # Retry promptly inside the OLD confirmed validity window.
                     # An ambiguous timeout never extends that window.
                     self._renew_at = min(self._valid_until, time.monotonic() + min(0.05, self.ttl / 100))
                     continue
-                if not renewed:
+                if renewed <= 0:
+                    # 在同一个 Lua 操作内区分缺失与换主；0 保留为未知拒绝。
+                    # NX 不会覆盖活跃锁，不能仅凭拒绝就认定另一副本抢锁。
+                    reason = {-1: "key_missing", -2: "owner_mismatch"}.get(
+                        renewed, "renew_rejected"
+                    )
+                    logger.warning(
+                        "Redis lease renew rejected reason=%s key=%s instance=%s "
+                        "owner_tag=%s lease_age_s=%.3f local_remaining_s=%.3f ttl_s=%s",
+                        reason, self.key, self._instance, self._owner_tag,
+                        sent_at - self._acquired_at, remaining, self.ttl,
+                    )
                     self._mark_lost()
                     return
                 self._valid_until = sent_at + self.ttl - self._safety_margin
                 self._renew_at = sent_at + self.ttl / 3
                 if time.monotonic() >= self._valid_until:
+                    logger.warning(
+                        "Redis lease expired right after renew "
+                        "(event loop blocked during eval), key=%s", self.key,
+                    )
                     self._mark_lost()
                     return
         except asyncio.CancelledError:
@@ -143,6 +188,7 @@ class RedisLease:
 
     async def release(self):
         if self._release_task is None:
+            self._releasing = True
             self._release_task = asyncio.create_task(self._release())
         await asyncio.shield(self._release_task)
 

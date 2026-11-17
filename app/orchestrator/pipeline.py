@@ -6,6 +6,7 @@
 设计原则（来自文档）：能写死就写死，保证确定性，避免智能体自由发挥带来风险。
 """
 import asyncio
+from contextlib import aclosing
 import logging
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
@@ -99,18 +100,19 @@ class PipelineOrchestrator(BaseOrchestrator):
                 result = None
                 try:
                     async with asyncio.timeout(self._step_timeout):
-                        async for item in self._run_single_agent(
+                        async with aclosing(self._run_single_agent(
                             intent,
                             prior_context=prior_context,
                             session_id=session_id,
                             agent_state=agent_state,
                             langfuse_service=langfuse_service,
-                        ):
-                            if isinstance(item, TaskResult):
-                                result = item
-                            else:
-                                # 实时透传 SSE 事件
-                                yield item
+                        )) as stream:
+                            async for item in stream:
+                                if isinstance(item, TaskResult):
+                                    result = item
+                                else:
+                                    # 实时透传 SSE 事件
+                                    yield item
                 except asyncio.TimeoutError:
                     result = self._make_timeout_result(intent)
 

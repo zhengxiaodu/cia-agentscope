@@ -140,17 +140,17 @@ class LangfuseService:
             logger.warning("Langfuse start_span failed: %s", e)
             yield None
             return
-        # 手动驱动 __exit__：含 yield 的异步生成器被外部 aclose()（客户端
-        # 断连/用户停止）时，OTel detach 的 ContextVar token 可能跨
-        # contextvars.Context 失效，抛 ValueError("was created in a
-        # different Context")。span 的 end 先于 detach 完成、数据不丢，
-        # 此处仅吞掉上下文还原失败，保证生成器正常关闭
+        # 正常关闭必须由创建 span 的消费任务完成。OTel 通常在 detach
+        # 内部捕获并记录错误，外层 except 无法拦截该日志；这里仅兼容
+        # 会向外抛出跨 Context ValueError 的实现，不保证观测已经落库。
         try:
             yield obs
         finally:
             try:
                 cm.__exit__(*sys.exc_info())
-            except ValueError:
+            except ValueError as exc:
+                if "was created in a different Context" not in str(exc):
+                    raise
                 logger.warning(
                     "[langfuse_service] span 退出时上下文还原失败"
                     f"（跨 Context detach，已忽略）name={name}"

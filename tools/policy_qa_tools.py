@@ -117,6 +117,23 @@ def resolve_user_kb_names(permissions: Optional[dict]) -> list[str]:
     return [name for name, _ in _resolve_kb_entries(permissions)]
 
 
+def _normalize_citation_markers(answer: str, resource_count: int) -> str:
+    """把 answer 中的 [n] 引用标记统一转换为 {n}（n 在 1..resource_count 范围内）。
+
+    兼容模型输出方括号编号的情况，确保前端能按 {n} 渲染引用角标。
+    不影响已有的 {n} 标记，也不转换越界编号。
+    """
+    if not answer or resource_count <= 0:
+        return answer
+    import re
+
+    def _repl(m: re.Match) -> str:
+        n = int(m.group(1))
+        return f"{{{n}}}" if 1 <= n <= resource_count else m.group(0)
+
+    return re.sub(r"\[(\d+)\]", _repl, answer)
+
+
 def _format_citations(citations: list) -> str:
     """格式化引用文档列表为可读文本。"""
     if not citations:
@@ -236,11 +253,21 @@ def create_policy_qa_tool(
             if not answer:
                 return _build_result("未检索到相关内容，无法回答。")
 
-            # 4. 格式化输出：回答正文 + 引用来源
-            content = answer
+            # 保险：把 answer 里的 [n]（n 在 1..引用数范围内）统一转成 {n}，
+            # 兼容模型输出方括号编号的情况，确保前端能渲染引用角标
+            answer = _normalize_citation_markers(answer, len(citations))
+
+            # 4. 格式化输出：用明确标记包裹 answer，告诉 agent 直接使用、
+            #    不要改写（避免 agent 重新组织语言时丢失 {n} 引用标记）
+            content = "【制度问答回答】\n" + answer
             citations_text = _format_citations(citations)
             if citations_text:
-                content += "\n\n--- 引用来源 ---\n" + citations_text
+                content += (
+                    "\n\n--- 引用来源 ---\n" + citations_text
+                    + "\n\n请直接输出【制度问答回答】部分的内容作为最终回答，"
+                    "不要改写、不要重新组织语言。回答中的 {n} 是引用标记，"
+                    "必须原样保留，对应上述引用来源的 [n] 编号。"
+                )
 
             # citations 写入 ToolChunk.metadata，由框架透传到事件层
             return _build_result(content, citations=citations)

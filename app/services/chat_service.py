@@ -16,7 +16,7 @@ import asyncio
 import re
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, aclosing, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional, Tuple
 
@@ -361,6 +361,23 @@ async def _persist_conversation_history(
         file_only_round = bool(
             round_state and round_state.consumed_upload_ids
         ) and not user_input
+        # 纯文件轮的 user 消息落空文本（前端按消息对挂文件展示），
+        # 会话名回退用本轮消费的文件名，避免出现空名"未命名会话"
+        name_hint = ""
+        if file_only_round and upload_file_dao:
+            try:
+                names = await upload_file_dao.get_filenames_by_ids(
+                    session_id, list(round_state.consumed_upload_ids)
+                )
+                if names:
+                    shown = "、".join(names[:2])
+                    if len(names) > 2:
+                        shown += f" 等{len(names)}个文件"
+                    name_hint = sanitize_text(shown)[:50]
+            except Exception:
+                logger.warning(
+                    "[chat_service] 获取上传文件名构建会话名失败，跳过命名提示"
+                )
         # 落库前全链路清洗：孤立代理（流式 emoji 被 chunk 切断）会导致
         # pymysql UTF-8 编码失败；控制字符（bash 输出的 null/ANSI/二进制片段）
         # 同样会破坏 MySQL/Redis 序列化。升级为 sanitize_text_recursive，
@@ -410,7 +427,10 @@ async def _persist_conversation_history(
             })
         if new_messages:
             persist_result = await session_service.append_messages(
-                session_id, user_id, new_messages
+                session_id,
+                user_id,
+                new_messages,
+                **({"name_hint": name_hint} if name_hint else {}),
             )
     except Exception:
         logger.exception("[chat_service] 持久化对话历史失败")
@@ -486,6 +506,18 @@ def _persist_file_bytes(persist_dir: str, session_id: str, rel_path: str, conten
                 os.unlink(temporary)
             except OSError:
                 logger.warning("[chat_service] 清理持久化临时文件失败", exc_info=True)
+
+
+async def _persist_file_bytes_async(persist_dir: str, session_id: str, rel_path: str, content: bytes) -> bool:
+    """Finish an atomic write before a cancelled round releases its lease."""
+    writer = asyncio.create_task(asyncio.to_thread(
+        _persist_file_bytes, persist_dir, session_id, rel_path, content,
+    ))
+    try:
+        return await asyncio.shield(writer)
+    except asyncio.CancelledError:
+        await writer
+        raise
 
 
 def _finished_artifact(path: str, data: bytes) -> bool:
@@ -570,7 +602,7 @@ async def _detect_and_emit_files(
                         verified = await workspace_manager.list_session_files(user_id, session_id)
                         if verified.get(rel_path) != signature:
                             continue
-                    if content is not None and _persist_file_bytes(
+                    if content is not None and await _persist_file_bytes_async(
                         SESSION_FILES_PERSIST_DIR, session_id, rel_path, content
                     ):
                         url = f"/persist-files/{session_id}/{rel_path}"
@@ -798,6 +830,21 @@ def _extract_components_from_delta(delta: str):
             i += 1
 
 
+def _abort_reason_of(cancel_event: Any, redis_stopped: bool = False) -> str:
+    """判定本轮中断来源，避免把所有取消都记成“用户中断”。
+
+    - 取消信号已置位：取其归因（user / lease_lost / redis_failure）；
+      老版本或测试传入的普通 Event 无归因，按用户停止兜底。
+    - Redis 停止标志命中（跨 Pod /chat/stop）：也是用户主动停止。
+    - 其余（取消信号未置位仍被取消）：客户端断连/外部取消，非用户主动点击。
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        return getattr(cancel_event, "reason", None) or "user"
+    if redis_stopped:
+        return "user"
+    return "client_disconnect"
+
+
 async def generate_response(
     orchestrator_service,
     messages: List[Dict[str, Any]],
@@ -850,6 +897,10 @@ async def generate_response(
         _last_redis_check = now
         try:
             _last_redis_stopped = bool(await redis_client.exists(stop_key))
+            if _last_redis_stopped and cancel_event is not None and not cancel_event.is_set():
+                # 通过 Redis 停止标志判定为用户主动停止：同步给本地信号打上
+                # 归因，保证收尾时不会把它误记成系统中断
+                cancel_event.set("user")
             return _last_redis_stopped
         except Exception:
             if not _redis_warned:
@@ -887,6 +938,9 @@ async def generate_response(
     final_fallback_parts: List[str] = []
     final_output = ""
     aborted = False
+    # 中断归因（user / lease_lost / redis_failure / client_disconnect）：
+    # 用于区分“用户主动停止”与系统原因导致的中断，避免文案与日志误判
+    abort_reason: Optional[str] = None
     t0 = time.perf_counter()
     ttft_ms = None
     aborted_at_ms = None
@@ -971,7 +1025,9 @@ async def generate_response(
     root_obs = None
     trace_emitted = False
     try:
-        with root_span_ctx as root_obs:
+        async with AsyncExitStack() as stream_stack:
+            # 注册顺序保证嵌套流先关闭、根 span 最后退出，且都在消费任务中执行。
+            root_obs = stream_stack.enter_context(root_span_ctx)
             # P0-3: 流首即下发 trace_id（确定性派生，span 活跃即必然存在），
             # 前端可立即关联反馈
             if lang_trace_id and root_obs is not None:
@@ -1029,7 +1085,7 @@ async def generate_response(
             )
 
             # ④ 执行编排主流程，实时透传 SSE 事件
-            async for event_str in orchestrator_service.run(
+            orchestration_stream = await stream_stack.enter_async_context(aclosing(orchestrator_service.run(
                 full_messages,
                 session_id=session_id,
                 user_id=user_id,
@@ -1043,7 +1099,8 @@ async def generate_response(
                 message_pair_id=message_pair_id,
                 round_state=round_state,
                 input_probe_task=probe_task,
-            ):
+            )))
+            async for event_str in orchestration_stream:
                 # 取消检查点：每个事件之间检测一次（LLM chunk 之间会回到本循环）
                 if await _cancelled():
                     aborted = True
@@ -1282,9 +1339,17 @@ async def generate_response(
     except asyncio.CancelledError:
         # 中断时吞掉 CancelledError，进入 finally 做清理（不重新 raise，让流优雅结束）
         aborted = True
+        abort_reason = _abort_reason_of(cancel_event, _last_redis_stopped)
         if aborted_at_ms is None:
             aborted_at_ms = int((time.perf_counter() - t0) * 1000)
-        logger.info(f"[chat_service] 会话被用户中断 session={session_id}")
+        # 仅“用户主动停止”记为用户中断；租约丢失/Redis 抖动/客户端断连属系统原因，
+        # 单独告警，避免事后被误读成用户点了停止
+        if abort_reason == "user":
+            logger.info(f"[chat_service] 会话被用户中断 session={session_id}")
+        else:
+            logger.warning(
+                f"[chat_service] 会话异常中断 session={session_id} reason={abort_reason}"
+            )
     finally:
         round_state.final_states.clear()
         # 输入围栏预检任务收尾：编排层已消费的会先完成；未完成的取消，
@@ -1300,10 +1365,36 @@ async def generate_response(
         if aborted:
             async def finalize_stopped_round():
                 nonlocal history_task, final_output
+                # 中断兜底：优先落用户已经在界面上看到的内容，保证本轮一定
+                # 写出非空 assistant 正文。final_output 为空时
+                # _persist_conversation_history 会跳过 assistant 行，导致该轮
+                # message_pair_id 在库中只有 user 行、没有 assistant 行，
+                # 前端点赞点踩命中 0 行直接 404（对不上"用户已停止"那轮）。
+                # 优先级：已有输出 → summary 片段 → 失败终止事件文本 →
+                #        已流式产出的正文片段 → 兜底文案
+                if not final_output:
+                    final_output = "\n".join(final_output_parts).strip()
                 if not final_output:
                     final_output = "\n".join(p for p in final_fallback_parts if p).strip()
-                if not final_output and round_state.completed_files:
+                if not final_output:
+                    final_output = "\n".join(
+                        p.get("content", "")
+                        for p in collected_content_parts
+                        if p.get("type") == "text"
+                    ).strip()
+                if not final_output:
                     final_output = "已停止生成。"
+                # content_parts 兜底：中断轮若一条正文 text part 都没有（只收到
+                # 组件或什么都没有），用 final_output 补一条，保证前端回放该轮
+                # 正文不缺失（与正常轮 1257-1263 行兜底同构）
+                if not any(
+                    p.get("type") == "text" and p.get("content")
+                    for p in collected_content_parts
+                ):
+                    collected_content_parts.append({
+                        "type": "text",
+                        "content": final_output,
+                    })
                 round_state.success = False
                 if history_task is None:
                     history_task = asyncio.create_task(persist_history())
@@ -1329,10 +1420,15 @@ async def generate_response(
                     return []
                 if archive_task is not None:
                     return await archive_task
-                if not (ids or {}).get("assistant_message_id") or not round_state.completed_files:
-                    return []
-
-                return await archive_files(ids, round_state.completed_files.copy())
+                if (ids or {}).get("assistant_message_id") and round_state.completed_files:
+                    return await archive_files(ids, round_state.completed_files.copy())
+                # 中断轮没生成任何文件时，正常轮由 archive_files 下发的
+                # files_generated 事件会被跳过；这里补发一个空 files 的同名事件，
+                # 前端凭其中的 message_pair_id 才能立即为本轮绑定点赞点踩
+                # （否则刚中断时点不了，只能刷新会话详情后从库里取）。
+                return [
+                    f"data: {json.dumps({'type': 'files_generated', 'files': [], 'message_pair_id': message_pair_id}, ensure_ascii=False)}\n\n"
+                ]
 
             # 本地检查点和路由 watcher 可能先后收到同一次停止。等待同一个收尾任务，
             # 避免第二次取消把“已保存消息”与“归档文件”截断在两步之间。
@@ -1352,7 +1448,16 @@ async def generate_response(
         ):
             yield ev
 
-        # 中断时给前端发送 user_abort 事件
+        # 中断时给前端发送 user_abort 事件：仅用户主动停止显示“用户已停止”，
+        # 租约丢失/Redis 抖动/客户端断连等系统原因用统一异常文案，并带上归因
         if aborted:
-            abort_event = {"type": "user_abort", "session_id": session_id, "message": "用户已停止"}
+            abort_event = {
+                "type": "user_abort",
+                "session_id": session_id,
+                "reason": abort_reason or "user",
+                "message": (
+                    "用户已停止" if (abort_reason or "user") == "user"
+                    else "会话异常中断，请重试"
+                ),
+            }
             yield f"data: {json.dumps(abort_event, ensure_ascii=False)}\n\n"

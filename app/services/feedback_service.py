@@ -81,8 +81,16 @@ def _key(session_id: str) -> str:
 
 
 async def _redis_call(client: Any, method: str, *args: Any, **kwargs: Any) -> Any:
+    task = asyncio.current_task()
+    cancellations = task.cancelling()
     try:
-        return await asyncio.wait_for(getattr(client, method)(*args, **kwargs), timeout=5)
+        result = await asyncio.wait_for(getattr(client, method)(*args, **kwargs), timeout=5)
+        # wait_for can race with an already completed Redis call and swallow
+        # external cancellation on Python 3.11. Preserve it, but allow cleanup
+        # calls entered after cancellation to consume their own registration.
+        if task.cancelling() > cancellations:
+            raise asyncio.CancelledError()
+        return result
     except Exception as exc:
         raise FeedbackBackendError("共享反馈存储暂不可用，请稍后重试") from exc
 

@@ -4,6 +4,8 @@
 断言往返次数与命令内容。
 """
 import asyncio
+from datetime import datetime, timedelta, timezone
+import types
 
 import pytest
 
@@ -60,6 +62,7 @@ def _make_manager() -> OpenSandboxWorkspaceManager:
     mgr = OpenSandboxWorkspaceManager.__new__(OpenSandboxWorkspaceManager)
     mgr._basedir = BASEDIR
     mgr._ttl = 3600.0
+    mgr._redis = None
     mgr._cache = {}
     mgr._locks = {}
     mgr._struct_lock = asyncio.Lock()
@@ -96,6 +99,48 @@ def test_get_workspace_sets_session_dir_on_sandbox():
     assert sbx.workdir == f"{BASEDIR}/s1"
     assert entry.workdir == f"{BASEDIR}/s1"
     assert "s1" in entry.session_ids
+
+
+class _RenewableSandbox(_FakeSandbox):
+    """记录 renew 调用的沙箱，模拟 OpenSandbox SDK 的滑动续期接口。"""
+
+    def __init__(self, exit_code: int = 0, stdout_map: dict | None = None):
+        super().__init__(exit_code=exit_code, stdout_map=stdout_map)
+        self.renew_calls: list[timedelta] = []
+
+    async def renew(self, timeout: timedelta):
+        self.renew_calls.append(timeout)
+        return types.SimpleNamespace(
+            expires_at=datetime.now(timezone.utc) + timeout
+        )
+
+
+def test_get_workspace_renews_sandbox_lease():
+    """复用活跃沙箱时滑动续期：长任务（如 PPTX 生成）不被创建时的固定 TTL 回收。"""
+    sbx = _RenewableSandbox()
+    mgr = _make_manager()
+    _seed(mgr, sbx)
+
+    asyncio.run(mgr.get_workspace("u1", "s1"))
+
+    assert len(sbx.renew_calls) == 1
+    assert sbx.renew_calls[0].total_seconds() == 3600
+
+
+def test_renew_failure_does_not_break_workspace_reuse():
+    """续期失败（如服务端禁用 renew）必须降级为告警，不得影响本轮复用。"""
+
+    class _BoomRenew(_RenewableSandbox):
+        async def renew(self, timeout: timedelta):
+            raise RuntimeError("renew rejected")
+
+    sbx = _BoomRenew()
+    mgr = _make_manager()
+    _seed(mgr, sbx)
+
+    ws = asyncio.run(mgr.get_workspace("u1", "s1"))
+
+    assert ws is sbx
 
 
 def test_get_workspace_evicts_when_command_fails():

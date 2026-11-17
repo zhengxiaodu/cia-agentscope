@@ -48,7 +48,7 @@ _DEGRADE_THRESHOLD = 5           # 连续失败 N 次后进入降级状态
 _DEGRADE_RECOVERY_TIME = 60.0    # 降级后恢复探测间隔（秒）
 
 # ---- 多副本分布式锁配置（Redis） ----
-_DIST_LOCK_TTL = 30              # 新建沙箱分布式锁 TTL（秒）
+_DIST_LOCK_TTL = 120             # 新建沙箱分布式锁 TTL（秒）
 _DIST_LOCK_WAIT_TIMEOUT = 30.0   # 等待分布式锁总超时（秒）
 _DIST_LOCK_POLL_INTERVAL = 0.5   # 等锁轮询间隔（秒）
 _PREPARE_RETRY_TIMES = 2
@@ -68,6 +68,13 @@ _RETIRE_MAP = """-- workspace_retire
 if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end
 if redis.call('get', KEYS[2]) ~= ARGV[2] then return 0 end
 return redis.call('del', KEYS[2])
+"""
+
+# Extend the map TTL only while it still points at the sandbox we just renewed,
+# so a stale entry for another Pod's newer sandbox is never prolonged.
+_RENEW_MAP = """-- workspace_renew_map
+if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end
+return redis.call('expire', KEYS[1], ARGV[2])
 """
 
 
@@ -134,7 +141,7 @@ class OpenSandboxWorkspaceManager:
         self._struct_lock = asyncio.Lock()
         self._sweeper_task: Optional[asyncio.Task] = None
         self._sweeper_stop = asyncio.Event()
-        self._sweeper_interval = max(30.0, min(self._ttl / 2, 300.0))
+        self._sweeper_interval = max(1.0, min(self._ttl / 3, 300.0))
 
         # ---- 高可用状态 ----
         self._consecutive_failures = 0
@@ -203,6 +210,45 @@ class OpenSandboxWorkspaceManager:
             ), timeout=5))
         except Exception as e:
             raise CoordinationUnavailable("Redis 沙箱映射清理失败") from e
+
+    async def _renew_expiration(self, sbx: Sandbox, wid: str) -> None:
+        """滑动续期：把沙箱到期时间推到"当前时间 + TTL"。
+
+        沙箱创建时带的是绝对 TTL（Sandbox.create(timeout=...)），长任务
+        （如 PPTX 生成，工具调用多、耗时长）可能在中途被服务端回收，
+        导致后续所有命令 404 SANDBOX_NOT_FOUND。活跃会话每轮续期后，
+        只有真正空闲满 TTL 的沙箱才会被回收，与"淘汰空闲沙箱"的意图一致
+        （SDK 明确 renew 不受创建时上限约束）。
+
+        Redis 已配置时同步刷新映射 TTL：映射 TTL 原按创建时剩余有效期设定，
+        若只续期服务端而不刷新映射，映射会先过期，其他 Pod 会误判沙箱消失
+        而另建新沙箱。
+
+        全部失败均降级为告警，不影响本轮对话（沙箱可能仍存活，仅未延长）。
+        """
+        try:
+            resp = await asyncio.wait_for(
+                sbx.renew(timedelta(seconds=int(self._ttl))), timeout=5
+            )
+        except Exception:
+            logger.warning(
+                f"[opensandbox_ws] 沙箱续期失败 wid={wid} sandbox_id={sbx.id}",
+                exc_info=True,
+            )
+            return
+        if self._redis is None:
+            return
+        try:
+            map_ttl = self._remaining_map_ttl(getattr(resp, "expires_at", None))
+            await asyncio.wait_for(self._redis.eval(
+                _RENEW_MAP, 1, f"sandbox_map:{wid}", sbx.id, map_ttl,
+            ), timeout=5)
+        except Exception:
+            logger.warning(
+                f"[opensandbox_ws] 沙箱映射 TTL 刷新失败 wid={wid} "
+                f"sandbox_id={sbx.id}",
+                exc_info=True,
+            )
 
     # ---- 高可用：降级检查 ----
     def _check_degraded(self) -> bool:
@@ -608,6 +654,9 @@ class OpenSandboxWorkspaceManager:
         entry.workdir = session_dir
         # 在 Sandbox 对象上设置 workdir，兼容 AgentRegistry 的 system_prompt 构建
         entry.sandbox.workdir = session_dir
+        # 滑动续期：本轮已确认沙箱存活，延长到期时间，避免长任务进行中
+        # （如 PPTX 生成）沙箱被创建时的固定 TTL 回收
+        await self._renew_expiration(entry.sandbox, wid)
         logger.info(f"[opensandbox_ws] 复用沙箱 wid={wid} session={session_id}")
         return entry.sandbox
 
@@ -641,6 +690,8 @@ class OpenSandboxWorkspaceManager:
         new_entry.workdir = session_dir
         # 在 Sandbox 对象上设置 workdir，兼容 AgentRegistry 的 system_prompt 构建
         sbx.workdir = session_dir
+        # 滑动续期：跨 Pod 复用前已确认沙箱存活，延长到期时间
+        await self._renew_expiration(sbx, wid)
         self._cache[wid] = new_entry
         logger.info(
             f"[opensandbox_ws] 跨 Pod 复用沙箱 wid={wid} sandbox_id={sandbox_id} "
@@ -701,6 +752,8 @@ class OpenSandboxWorkspaceManager:
                     reused = await self._connect_from_redis(wid, user_id, session_id, lease=lease)
                     if reused is not None:
                         return reused
+                    if await asyncio.wait_for(self._other_active_runs(wid, session_id), timeout=5):
+                        raise CoordinationUnavailable("工作区映射缺失，但其他会话仍在运行，请稍后重试")
 
                 # 创建新沙箱（带重试）
                 if langfuse_service:
@@ -773,8 +826,9 @@ class OpenSandboxWorkspaceManager:
                 if lease is not None:
                     await lease.release()
 
-    async def _inject_skills(self, sbx: Sandbox, skill_dirs: list[str]) -> None:
-        """将宿主技能目录内容写入沙箱 /workspace/skills/ 目录。"""
+    @staticmethod
+    def _collect_skill_entries(skill_dirs: list[str]) -> list[WriteEntry]:
+        """读取宿主文件，在工作线程中执行以免阻塞租约续期和 SSE。"""
         entries: list[WriteEntry] = []
         for d in skill_dirs:
             if not d or not os.path.isdir(d):
@@ -791,6 +845,11 @@ class OpenSandboxWorkspaceManager:
                             data=f.read(),
                             mode=644,
                         ))
+        return entries
+
+    async def _inject_skills(self, sbx: Sandbox, skill_dirs: list[str]) -> None:
+        """将宿主技能目录内容写入沙箱 /workspace/skills/ 目录。"""
+        entries = await asyncio.to_thread(self._collect_skill_entries, skill_dirs)
         if not entries:
             return
         try:
@@ -1127,6 +1186,7 @@ class OpenSandboxWorkspaceManager:
                 pass
             if self._sweeper_stop.is_set():
                 break
+            await self._renew_active_workspaces()
             now = time.monotonic()
             expired = [
                 wid for wid, e in self._cache.items() if (now - e.last_access) > self._ttl
@@ -1139,3 +1199,28 @@ class OpenSandboxWorkspaceManager:
                     f"[opensandbox_ws] sweeper 淘汰 {len(expired)} 个过期沙箱 "
                     f"active={len(self._cache)}"
                 )
+
+    async def _renew_active_workspaces(self) -> None:
+        """长轮次中持续续期共享沙箱；空闲用户不续期。"""
+        if self._redis is None:
+            return
+
+        async def renew(wid):
+            lock = await self._get_lock(wid)
+            async with lock:
+                try:
+                    if not await asyncio.wait_for(self._other_active_runs(wid, ""), timeout=5):
+                        return
+                    mapped_id = await self._redis_get_map(wid)
+                    entry = self._cache.get(wid)
+                    if entry is not None and mapped_id in (None, entry.sandbox.id):
+                        await self._renew_expiration(entry.sandbox, wid)
+                        entry.last_access = time.monotonic()
+                    for deferred_wid, sbx in list(self._deferred_clients):
+                        if deferred_wid == wid and mapped_id in (None, sbx.id):
+                            await self._renew_expiration(sbx, wid)
+                except Exception:
+                    logger.warning("[opensandbox_ws] 活跃沙箱后台续期失败 wid=%s", wid, exc_info=True)
+
+        workspaces = set(self._cache) | {wid for wid, _ in self._deferred_clients}
+        await asyncio.gather(*(renew(wid) for wid in workspaces))

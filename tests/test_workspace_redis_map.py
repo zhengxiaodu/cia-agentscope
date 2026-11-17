@@ -123,6 +123,19 @@ class FakeSandbox:
         self.closed = True
 
 
+class RenewableSandbox(FakeSandbox):
+    """记录 renew 调用并回写新的到期时间，模拟 SDK 的滑动续期接口。"""
+
+    def __init__(self, sandbox_id, error=None):
+        super().__init__(sandbox_id, error=error)
+        self.renew_calls = []
+
+    async def renew(self, timeout):
+        self.renew_calls.append(timeout)
+        self.expires_at = datetime.now(timezone.utc) + timeout
+        return types.SimpleNamespace(expires_at=self.expires_at)
+
+
 def manager(redis=None):
     return ws.OpenSandboxWorkspaceManager(object(), "image", "/data/workspaces", 3600, redis_client=redis)
 
@@ -201,6 +214,26 @@ class SharedWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stale.closed)
         self.assertIs(result, remote)
         self.assertEqual(redis.data[MAP_KEY], "shared")
+
+    async def test_reuse_renews_shared_sandbox_and_extends_map_ttl(self):
+        """复用活跃共享沙箱时同时续期服务端到期时间与 Redis 映射 TTL。
+
+        只续服务端不刷映射，映射会先过期，其他 Pod 会误判沙箱消失而另建。
+        """
+        redis = MemoryRedis()
+        await redis.set(MAP_KEY, "shared", ex=120)
+        sandbox = RenewableSandbox("shared")
+        mgr = manager(redis)
+        mgr._cache[WID] = ws._Entry(sandbox, "u1")
+
+        before = redis.expires[MAP_KEY] - time.monotonic()
+        await mgr.get_workspace("u1", "s2")
+        after = redis.expires[MAP_KEY] - time.monotonic()
+
+        self.assertEqual(len(sandbox.renew_calls), 1)
+        self.assertEqual(sandbox.renew_calls[0].total_seconds(), 3600)
+        self.assertGreater(after, before)
+        self.assertAlmostEqual(after, 3600 - 60, delta=5)
 
     async def test_stale_cached_id_cannot_overwrite_new_mapping(self):
         redis = MemoryRedis()

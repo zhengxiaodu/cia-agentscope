@@ -298,10 +298,10 @@ async def update_department_via_mng(jwt_token: str, department: str) -> dict:
         return {"success": False, "message": "修改部门服务异常"}
 
 
-async def update_password_via_mng(jwt_token: str, old_password: str, new_password: str) -> dict:
+async def update_password_via_mng(jwt_token: str, old_password: str, new_password: str,repeat_new_password: str) -> dict:
     """调用 mng 修改密码。
 
-    请求 PUT {MNG_AUTH_URL}/api/auth/me/password，body: {"old_password","new_password"}，需带 Authorization（本系统 JWT）。
+    请求 PUT {MNG_AUTH_URL}/api/auth/me/password，body: {"old_password","new_password","repeat_new_password"}，需带 Authorization（本系统 JWT）。
     成功返回 {"success": True}，失败返回 {"success": False, "message": ...}。
     """
     if not MNG_AUTH_URL:
@@ -313,7 +313,7 @@ async def update_password_via_mng(jwt_token: str, old_password: str, new_passwor
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.put(
                 url,
-                json={"old_password": old_password, "new_password": new_password},
+                json={"old_password": old_password, "new_password": new_password,"repeat_new_password":repeat_new_password},
                 headers={"Authorization": f"Bearer {jwt_token}"},
             )
             if resp.status_code != 200:

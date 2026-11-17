@@ -12,7 +12,7 @@ ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
     # 演示
     "ppt", "pptx",
     # 图片
-    "png", "jpg", "jpeg",
+    "png", "jpg", "jpeg","vue","sql",
     # 网页与代码
     "html", "css", "js", "py","json","yml","yaml","sh",
 })

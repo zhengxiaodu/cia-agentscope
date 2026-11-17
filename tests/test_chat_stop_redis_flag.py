@@ -82,12 +82,12 @@ def _make_request(redis=None):
     return request
 
 
+def _parse_payloads(events):
+    return [json.loads(e[6:].strip()) for e in events if e.startswith("data: ")]
+
+
 def _parse_types(events):
-    return [
-        json.loads(e[6:].strip())["type"]
-        for e in events
-        if e.startswith("data: ")
-    ]
+    return [p["type"] for p in _parse_payloads(events)]
 
 
 def _drive(orch, redis, cancel_event=None, session_service=None):
@@ -133,6 +133,8 @@ async def test_cancelled_throttled_redis_poll(monkeypatch):
     types = _parse_types(events)
     assert "user_abort" not in types        # 未中断
     assert types.count("summary") == 2      # 两个事件均正常透传
+    # 正常轮由 archive_files 下发恰好一次绑定事件（不能被中断兜底再补一条）
+    assert types.count("files_generated") == 1
 
 
 @pytest.mark.asyncio
@@ -157,6 +159,10 @@ async def test_cancelled_redis_flag_aborts_stream(monkeypatch):
     types = _parse_types(events)
     assert "user_abort" in types
     assert types.count("summary") == 0  # 命中检查点后事件不再透传
+    # Redis 停止标志来自 /chat/stop → 归因为用户主动停止，文案保持“用户已停止”
+    abort = [p for p in _parse_payloads(events) if p["type"] == "user_abort"][-1]
+    assert abort["reason"] == "user"
+    assert abort["message"] == "用户已停止"
     # 中断轮收尾：仍落库 + 强制标记最新 assistant 消息失败
     session_service.append_messages.assert_awaited_once()
     session_service.mark_last_assistant_failed.assert_awaited_once_with("sess-1", "u1")
@@ -182,3 +188,151 @@ async def test_cancelled_local_event_skips_redis(monkeypatch):
     types = _parse_types(events)
     assert "user_abort" in types
     session_service.mark_last_assistant_failed.assert_awaited_once_with("sess-1", "u1")
+
+
+# ---- 中断轮兜底落库：保证 assistant 行存在（前端可点赞点踩） ----
+
+@pytest.mark.asyncio
+async def test_aborted_round_persists_assistant_fallback_when_no_output(monkeypatch):
+    """用户在编排层产出任何内容前中断：仍要落一条非空 assistant 消息。
+
+    否则该轮 message_pair_id 在库中只有 user 行、没有 assistant 行，
+    /feedback 按 (session_id, message_pair_id, role='assistant') 命中 0 行 → 404。
+    """
+    _patch_sensitive(monkeypatch)
+    cancel_event = asyncio.Event()
+    cancel_event.set()
+    orch = _make_orch([])  # 编排层零输出
+    session_service = _make_session_service()
+    events = [ev async for ev in _drive(orch, None, cancel_event=cancel_event,
+                                        session_service=session_service)]
+
+    assert _parse_types(events)[-1] == "user_abort"
+    session_service.append_messages.assert_awaited_once()
+    persisted = session_service.append_messages.await_args.args[2]
+    assistant = [m for m in persisted if m["role"] == "assistant"]
+    assert len(assistant) == 1
+    assert assistant[0]["content"].strip()   # 正文非空（兜底文案）
+    assert assistant[0]["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_aborted_round_persists_streamed_text(monkeypatch):
+    """用户在一段正文流式产出后中断：落库正文保留已产出的内容（不被兜底覆盖）。"""
+    _patch_sensitive(monkeypatch)
+    cancel_event = asyncio.Event()
+    orch = _make_orch([])
+
+    async def run(*args, **kwargs):
+        yield 'data: {"type": "TEXT_BLOCK_DELTA", "delta": "已产出的正文"}\n\n'
+        cancel_event.set()
+
+    orch.run = run
+    session_service = _make_session_service()
+    events = [ev async for ev in _drive(orch, None, cancel_event=cancel_event,
+                                        session_service=session_service)]
+
+    assert _parse_types(events)[-1] == "user_abort"
+    persisted = session_service.append_messages.await_args.args[2]
+    assistant = [m for m in persisted if m["role"] == "assistant"]
+    assert len(assistant) == 1
+    assert "已产出的正文" in assistant[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_aborted_round_emits_message_pair_binding(monkeypatch):
+    """中断轮必须补发一次带 message_pair_id 的 files_generated（空 files）。
+
+    正常轮靠 archive_files 下发的该事件让前端绑定本轮；中断轮若跳过它，
+    刚中断时前端拿不到 message_pair_id，点赞点踩要刷新会话详情才能用。
+    """
+    _patch_sensitive(monkeypatch)
+    cancel_event = asyncio.Event()
+    cancel_event.set()
+    orch = _make_orch([])
+    session_service = _make_session_service()
+    events = [ev async for ev in _drive(orch, None, cancel_event=cancel_event,
+                                        session_service=session_service)]
+
+    payloads = _parse_payloads(events)
+    bindings = [p for p in payloads if p["type"] == "files_generated"]
+    assert len(bindings) == 1
+    assert bindings[0]["files"] == []
+    assert bindings[0]["message_pair_id"]           # 非空，可绑定本轮
+    # 绑定事件需早于 user_abort 下发
+    assert payloads.index(bindings[0]) < payloads.index(
+        next(p for p in payloads if p["type"] == "user_abort")
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_through_heartbeat_emits_binding_to_client(monkeypatch):
+    """忠实复现路由层链路：/chat 的 source() 包装 + _with_heartbeat 心跳泵，
+    再经 /chat/stop（request_stop）置位本轮取消信号。
+
+    验证：流式过程中用户点击 stop、且本轮未生成文件时，收尾补发的
+    files_generated（files=[] + message_pair_id）确实下发到客户端，且早于
+    user_abort。用户可见的"点击 stop 后没有绑定事件"若发生，则不在此链路。
+    """
+    from app.routes.chat import _with_heartbeat
+    from app.services.chat_runtime import ChatRun, request_stop
+
+    _patch_sensitive(monkeypatch)
+    run = ChatRun(None, "sess-1", "u1")
+    await run.open()
+    orch = _make_orch([])
+
+    async def run_upstream(*args, **kwargs):
+        yield 'data: {"type": "summary", "content": "部分内容"}\n\n'
+        await asyncio.Event().wait()   # 静默挂起：模拟 LLM 不再产出
+        yield ""
+
+    orch.run = run_upstream
+    session_service = _make_session_service()
+
+    async def source():
+        # 与 /chat 路由同构：先发 session_ready，再转发 generate_response
+        yield f"data: {json.dumps({'type': 'session_ready', 'session_id': 'sess-1'})}\n\n"
+        async for ev in generate_response(
+            orchestrator_service=orch,
+            messages=[{"role": "user", "content": "你好"}],
+            session_id="sess-1", user_id="u1",
+            session_service=session_service,
+            langfuse_service=None,
+            request=_make_request(None),
+            cancel_event=run.cancel_event,
+            workspace_manager=None,
+            run_id=run.run_id,
+        ):
+            yield ev
+
+    events = []
+
+    async def collect():
+        async for ev in _with_heartbeat(source(), cancel_event=run.cancel_event):
+            events.append(ev)
+
+    # 客户端保持连接；正文流式产出一段后用户点击停止（模拟 /chat/stop）
+    task = asyncio.create_task(collect())
+    await asyncio.sleep(0.3)
+    assert await request_stop(None, "sess-1", "u1", run) is True
+    assert run.cancel_event.is_set()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+    except asyncio.TimeoutError:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise AssertionError("用户停止后 SSE 流未结束（收尾事件未下发）")
+
+    payloads = _parse_payloads(events)
+    types = [p["type"] for p in payloads]
+    assert "summary" in types        # 已产出的正文先下发
+    assert "user_abort" in types
+    bindings = [p for p in payloads if p["type"] == "files_generated"]
+    assert len(bindings) == 1
+    assert bindings[0]["files"] == []
+    assert bindings[0]["message_pair_id"]           # 非空，可绑定本轮
+    # 绑定事件需早于 user_abort 下发
+    assert payloads.index(bindings[0]) < payloads.index(
+        next(p for p in payloads if p["type"] == "user_abort")
+    )

@@ -1,12 +1,14 @@
 """Cross-instance chat regressions; runnable with unittest without app SDKs."""
 import ast
 import asyncio
+from contextlib import aclosing
 import json
 import logging
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 
 class MemoryRedis:
@@ -61,9 +63,9 @@ def load_routes():
             node.args.defaults = []
             body.append(node)
     body.insert(0, ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0))
-    env = dict(asyncio=asyncio, json=json, logging=logging, logger=logging.getLogger(__name__),
+    env = dict(asyncio=asyncio, aclosing=aclosing, json=json, logging=logging, logger=logging.getLogger(__name__),
                HTTPException=HttpError, SSE_HEARTBEAT_INTERVAL=0.01, _DONE=object(),
-               _SSE_HEARTBEAT=": ping\n\n")
+               _SSE_HEARTBEAT=": ping\n\n", _DETACHED_TASKS=set())
     # Coordination module has no SDK dependencies; route import boundaries alone are replaced.
     try:
         from app.services import chat_runtime
@@ -77,6 +79,82 @@ def load_routes():
 
 
 class ChatRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def _disconnect_then_cancel(self, reason):
+        from app.services import chat_runtime
+        routes, redis = load_routes(), MemoryRedis()
+        started, finalized = asyncio.Event(), asyncio.Event()
+
+        async def generate(**kwargs):
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                yield 'data: {"type":"user_abort"}\n\n'
+            finally:
+                finalized.set()
+
+        routes.update(
+            generate_response=generate,
+            cancel_feedback_shared=AsyncMock(),
+            StreamingResponse=lambda content, **kwargs: SimpleNamespace(content=content, **kwargs),
+            BackgroundTask=lambda func, **kwargs: lambda: func(**kwargs),
+        )
+        state = SimpleNamespace(
+            redis_client=redis, chat_tasks={},
+            session_service=SimpleNamespace(get_or_create_session=AsyncMock(return_value="s")),
+            orchestrator_service=None, langfuse_service=None,
+        )
+        body = SimpleNamespace(session_id="s", messages=[], agent_id=None,
+                               search_enabled=False, skills=[], knowledge_bases=[])
+        request = SimpleNamespace(headers={}, app=SimpleNamespace(state=state))
+        with patch.object(chat_runtime, "_STOP_POLL_INTERVAL", 0.001):
+            response = await routes["chat"](request, body, {"user_id": "u"})
+            run = state.chat_tasks["s"]
+            consumer = asyncio.create_task(self._collect(response.content))
+            await asyncio.wait_for(started.wait(), 1)
+            consumer.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await consumer
+            await response.background()
+            self.assertIn("s", state.chat_tasks)
+            await run.lease.assert_owned()
+            if reason == "user":
+                self.assertTrue(await chat_runtime.request_stop(redis, "s", "u"))
+            else:
+                run.lease._mark_lost()
+            await asyncio.wait_for(finalized.wait(), 1)
+            pending = list(routes["_DETACHED_TASKS"])
+            await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 1)
+            await asyncio.sleep(0)
+            self.assertEqual(state.chat_tasks, {})
+            self.assertIsNone(await redis.get(run.key))
+            self.assertIsNone(run.lease._renew_task)
+            self.assertEqual(run.cancel_event.reason, reason)
+            await response.background()
+            routes["cancel_feedback_shared"].assert_awaited_once_with("s")
+            self.assertEqual(routes["_DETACHED_TASKS"], set())
+
+    @staticmethod
+    async def _collect(source):
+        return [chunk async for chunk in source]
+
+    async def test_detached_silent_generation_still_obeys_cross_pod_stop(self):
+        await self._disconnect_then_cancel("user")
+
+    async def test_detached_silent_generation_stops_on_lease_loss(self):
+        await self._disconnect_then_cancel("lease_lost")
+
+    async def test_cancel_before_pump_starts_still_finishes_once(self):
+        routes, event = load_routes(), asyncio.Event()
+        event.set()
+        cleanup = AsyncMock()
+        async def source():
+            await asyncio.Event().wait()
+            yield "unused"
+        await asyncio.wait_for(self._collect(
+            routes["_with_heartbeat"](source(), event, cleanup, None)), 1)
+        cleanup.assert_awaited_once()
+
     async def test_disconnect_cannot_strand_renewing_chat_lease(self):
         from app.services.chat_runtime import ChatRun
         redis = MemoryRedis()
@@ -192,12 +270,50 @@ class ChatRouteTests(unittest.IsolatedAsyncioTestCase):
             except asyncio.CancelledError:
                 yield 'data: {"type":"user_abort"}\n\n'
         async def collect():
-            return [chunk async for chunk in load_routes()["_with_heartbeat"](source(), event)]
+            # load_routes 会清空函数默认值，调用需显式传入 on_finish/on_detach。
+            return [chunk async for chunk in load_routes()["_with_heartbeat"](source(), event, None, None)]
         task = asyncio.create_task(collect())
         await started.wait()
         event.set()
         output = await asyncio.wait_for(task, 1)
         self.assertTrue(any("user_abort" in chunk for chunk in output))
+
+    async def test_client_disconnect_defers_teardown_until_generation_ends(self):
+        """客户端断连：生成转后台跑完，收尾必须在生成结束后执行。
+
+        若收尾（释放租约 + 移出运行表）在断连瞬间提前执行，同一会话就能被
+        并发开启新一轮（single-flight 失效），也会提前取消正在等待的用户反馈。
+        """
+        routes = load_routes()
+        finished, teardown, detached = asyncio.Event(), [], {}
+
+        async def source():
+            try:
+                for i in range(3):
+                    await asyncio.sleep(0.02)
+                    yield f"data: {i}\n\n"
+            finally:
+                finished.set()
+
+        async def on_finish():
+            teardown.append("cleanup")
+
+        async def collect():
+            return [chunk async for chunk in routes["_with_heartbeat"](
+                source(), None, on_finish, lambda task: detached.setdefault("task", task))]
+
+        task = asyncio.create_task(collect())
+        await asyncio.sleep(0.03)  # 生成进行中，模拟客户端断连
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertFalse(finished.is_set())
+        self.assertEqual(teardown, [])  # 断连瞬间不得收尾
+        pump = detached["task"]
+        await asyncio.wait_for(pump, 2)  # 后台生成跑完
+        self.assertFalse(pump.cancelled())
+        self.assertTrue(finished.is_set())
+        self.assertEqual(teardown, ["cleanup"])  # 生成结束才收尾一次
 
 
 if __name__ == "__main__":

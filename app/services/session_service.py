@@ -86,15 +86,21 @@ class SessionService:
         return await self.dao.load_messages(session_id)
 
     async def append_messages(
-        self, session_id: str, user_id: str, messages: list[dict]
+        self, session_id: str, user_id: str, messages: list[dict],
+        name_hint: str = "",
     ) -> Optional[dict]:
         """向会话历史追加消息（用户输入 + 智能体输出）。
+
+        name_hint：纯文件轮（用户只上传文件、无文本）的会话名回退提示，
+        由上层用本轮消费的文件名构建；非纯文件轮为空串。
 
         Returns:
             {"user_message_id": int|None, "assistant_message_id": int|None}
             （MySQL DAO 返回；供上传文件回填 message_id 与生成文件关联 assistant 消息）。
         """
-        return await self.dao.append_messages(session_id, user_id, messages)
+        return await self.dao.append_messages(
+            session_id, user_id, messages, name_hint=name_hint
+        )
 
     async def append_session_files(self, session_id: str, files: list[dict]) -> None:
         """持久化本轮生成的文件元信息（按 (session_id, path) UPSERT 去重）。"""

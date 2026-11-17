@@ -20,6 +20,7 @@ from agentscope.tool import Toolkit
 
 from app.agents.base import AgentDefinition
 from app.intent.rewriter import _get_current_date_str
+from app.utils.task_completion_guard import TASK_COMPLETION_GUIDANCE, TaskCompletionGuard
 
 logger = logging.getLogger(__name__)
 
@@ -317,14 +318,19 @@ class AgentRegistry:
             + "\n当用户要求修改文件时，必须生成新文件名（如添加版本号、时间戳或_modified后缀），严禁直接覆盖原文件，以防止数据丢失。"
             + external_info_guidance
             + skill_dir_guidance
-            + history_guidance,
+            + history_guidance
+            + TASK_COMPLETION_GUIDANCE,
             model=model,
             toolkit=toolkit,
+            middlewares=[TaskCompletionGuard()],
             state=agent_state,
             context_config=ContextConfig(
                 trigger_ratio=0.7,
                 reserve_ratio=0.4,
                 tool_result_limit=3000,
+                # 压缩（总结）失败时回退到直接截断旧上下文，而不是抛错
+                # 中断对话（agentscope 默认即为 True，这里显式声明）
+                compression_fallback_to_truncation=True,
             ),
             react_config=react_config
         )

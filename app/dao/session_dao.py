@@ -48,7 +48,8 @@ class SessionDAO:
         return json.loads(raw)
 
     async def append_messages(
-        self, session_id: str, user_id: str, new_messages: list[dict]
+        self, session_id: str, user_id: str, new_messages: list[dict],
+        name_hint: str = "",
     ) -> None:
         """向会话历史追加消息并更新元信息/有序集合。
 
@@ -56,6 +57,8 @@ class SessionDAO:
             session_id: 会话 id
             user_id: 用户 id
             new_messages: 要追加的消息列表 [{role, content, timestamp}]
+            name_hint: 纯文件轮（用户只上传文件、无文本）的会话名回退提示，
+                由上层用本轮消费的文件名构建；非纯文件轮为空串。
         """
         now = datetime.now(timezone.utc)
         now_ts = int(now.timestamp())
@@ -76,21 +79,30 @@ class SessionDAO:
 
         # 更新元信息
         existed = await self.redis.get(self._meta_key(session_id))
+
+        def _first_user_name() -> str:
+            """从本轮 user 消息取会话名（首条非空文本前 50 字）；
+            纯文件轮 user 文本为空时回退 name_hint。"""
+            for msg in new_messages:
+                if msg.get("role") == "user":
+                    raw_text = msg.get("content", "")
+                    if raw_text:
+                        return raw_text[:50] if len(raw_text) > 50 else raw_text
+            return name_hint[:50] if name_hint else ""
+
         if existed:
             existed_meta = json.loads(existed)
             created_at = existed_meta.get("created_at", now_str)
             name = existed_meta.get("name", "")
             latest_trace_id = existed_meta.get("latest_trace_id", "")
+            # 已存在但 name 为空：用本轮 user 消息/name_hint 补写
+            # （避免会话名永远停留在空，前端显示"未命名会话"）
+            if not (name or "").strip():
+                name = _first_user_name()
         else:
             created_at = now_str
             latest_trace_id = ""
-            # 从首条用户消息提取会话名称
-            name = ""
-            for msg in existing:
-                if msg.get("role") == "user":
-                    raw_text = msg.get("content", "")
-                    name = raw_text[:50] if len(raw_text) > 50 else raw_text
-                    break
+            name = _first_user_name()
 
         meta = {
             "user_id": user_id,

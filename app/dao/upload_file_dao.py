@@ -102,6 +102,25 @@ class UploadFileDAO:
                 await conn.commit()
                 return [dict(r) for r in rows]
 
+    async def get_filenames_by_ids(
+        self, session_id: str, file_ids: List[int]
+    ) -> List[str]:
+        """按 id 查询本轮消费文件的文件名（供纯文件轮的会话命名提示）。"""
+        if not file_ids:
+            return []
+        placeholders = ",".join(["%s"] * len(file_ids))
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT filename FROM upload_files "
+                    "WHERE session_id = %s " + _OWNER_SCOPE +
+                    f"AND id IN ({placeholders}) ORDER BY id",
+                    (session_id, *file_ids),
+                )
+                rows = await cur.fetchall()
+                await conn.commit()
+                return [r["filename"] for r in rows]
+
     async def load_session_file_index(self, session_id: str) -> List[dict]:
         """查询该会话全部上传文件的名录（轻量：仅状态与绑定信息，不含解析全文）。
 

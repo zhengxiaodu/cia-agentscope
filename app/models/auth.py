@@ -25,6 +25,7 @@ class UpdateDepartmentRequest(BaseModel):
 class UpdatePasswordRequest(BaseModel):
     old_password: str
     new_password: str
+    repeat_new_password: str
 
 
 class RefreshRequest(BaseModel):

@@ -11,6 +11,8 @@ from typing import Any, AsyncGenerator, Optional
 
 from agentscope.event import ToolCallStartEvent, ToolCallEndEvent
 
+from app.config import UPLOAD_PARSE_TIMEOUT
+
 logger = logging.getLogger(__name__)
 
 # 上传文件解析内容注入提示词的头部标记与单文件截断上限（防超上下文）
@@ -18,16 +20,30 @@ _UPLOAD_CTX_HEADER = "【用户本轮上传文件解析内容】"
 _UPLOAD_CTX_MAX_CHARS = 30000
 
 # 提问时若上传文件仍在解析：轮询等待的总超时与间隔（秒）。
-# 超时后不再等待，改为在提示词中注入解析失败提示。
-_UPLOAD_WAIT_TIMEOUT = 15.0
+# 等待窗口与解析侧统一超时（UPLOAD_PARSE_TIMEOUT）保持一致——若等待窗口
+# 早于解析真正结束，会把"仍在解析"误报为"解析超时"（图片走 MinerU OCR
+# 常超过 15s）。超时后不再等待，改为在提示词中注入未完成提示。
+_UPLOAD_WAIT_TIMEOUT = float(UPLOAD_PARSE_TIMEOUT)
 _UPLOAD_WAIT_POLL_INTERVAL = 1.0
 
-# 等待超时后仍在解析中的文件，按 parse_type 注入的失败提示文案
-_UPLOAD_PARSE_TIMEOUT_HINTS = {
-    "mineru": "解析超时，MinerU服务暂时无法解析该文件",
-    "asr": "解析超时，音频解析服务暂时无法解析该文件",
+# 等待窗口结束后 status 仍为 pending/parsing 的文件：注入"仍在解析中"提示，
+# 而非"解析超时/解析失败"。二者的区别很关键——真正失败的文件，其解析服务会在
+# 统一超时（UPLOAD_PARSE_TIMEOUT）内把失败文案写进 parsed_content，走 rows 分支；
+# 仍出现在这里的是排队未开始或后台任务尚未收尾的文件，尚未失败。
+# 若此处误报"解析超时"，模型会把"其实解析成功、只是慢"的文件说成失败。
+_UPLOAD_STILL_PARSING_HINTS = {
+    "mineru": "该文件仍在解析中（MinerU 解析尚未完成），请告知用户稍后重试，不要声称该文件解析失败或超时。",
+    "asr": "该文件仍在解析中（音频转写尚未完成），请告知用户稍后重试，不要声称该文件解析失败或超时。",
 }
-_UPLOAD_PARSE_TIMEOUT_HINT_DEFAULT = "解析超时，暂时无法解析该文件"
+_UPLOAD_STILL_PARSING_HINT_DEFAULT = (
+    "该文件仍在解析中，请告知用户稍后重试，不要声称该文件解析失败或超时。"
+)
+
+# 解析失败文案约定：真正解析失败的文件，其正文即以「解析失败」/「解析超时」开头。
+_UPLOAD_FAILURE_NOTICE = (
+    "说明：若某文件正文以「解析失败」或「解析超时」开头，表示该文件确实未能解析"
+    "成功，请如实告知用户，不要编造其内容；其余文件为正常解析结果。"
+)
 
 # 文件状态 → 展示标记（档案/提示共用）
 _STATUS_MARKS = {
@@ -123,7 +139,7 @@ async def load_upload_context(
     except Exception:
         logger.warning("[OrchestratorService] 检索上传文件解析内容失败", exc_info=True)
         return ""
-    # 等待超时后仍在解析中的文件：注入解析失败提示（agent 诚实告知用户）
+    # 等待窗口结束后仍未完成解析的文件：注入"仍在解析中"提示（agent 如实告知用户稍后重试）
     try:
         parsing_rows = await dao.load_unbound_parsing(session_id)
     except Exception:
@@ -133,6 +149,13 @@ async def load_upload_context(
         # 本轮无新文件：仍返回会话历史文件档案（若有），供历史文件指代寻址
         return await _build_session_archive(dao, session_id)
     parts = [_UPLOAD_CTX_HEADER]
+    # 历史文件档案前置并降级：此前档案拼在整个块末尾，是离模型生成最近的强
+    # 信号，会压过"以本轮文件为主"的声明，使模型优先去读沙箱里的历史文件
+    # （多轮上传串答的根因之一）。前置 + 降级为"仅点名才用"后，
+    # 离模型最近的强信号变成本轮文件声明与末尾锚点。
+    archive = await _build_session_archive(dao, session_id, has_new_files=True)
+    if archive:
+        parts.append(archive)
     # 就近约束：写在任务现场（用户问题尾部）的指令约束力远高于系统提示词/技能里
     # 的远处声明——直接决定模型是否会去沙箱文件系统找文件。
     # 同时做指代消歧：沙箱 uploads/ 与对话历史里可能残留此前轮次的旧文件，
@@ -140,7 +163,9 @@ async def load_upload_context(
     if sandbox_files:
         parts.append(
             "以下是用户本轮新上传、此前未处理过的文件（解析文本已同步保存到"
-            "沙箱工作目录 uploads/ 下同名 .md 文件，可直接读取处理；"
+            "沙箱工作目录 uploads/ 下，文件名为「原文件名.md」（保留原扩展名，"
+            "如 报告.pdf → uploads/报告.pdf.md）；上传的原件（图片/PDF 等本体）"
+            "不会出现在沙箱，沙箱里只有该 .md 文本，可直接读取处理；"
             "请基于以下文本或沙箱中对应 .md 文件回答，不要向用户表示找不到文件）。"
             "沙箱 uploads/ 目录中还可能留有此前轮次的历史文件，对话历史里也可能"
             "出现过旧文件内容；除非用户明确点名，回答应基于本轮新上传的文件——"
@@ -148,26 +173,28 @@ async def load_upload_context(
         )
     else:
         parts.append(
-            "注意：以下为用户本轮新上传、此前未处理过的文件，实体文件不在沙箱"
-            "文件系统中，请直接基于以下文本回答，不要尝试在沙箱中查找本轮新"
-            "上传的文件（历史文件的沙箱副本见下方档案）。"
-            "用户提问指代不明确（如\"这个文件\"）时，默认指本轮新上传的文件，"
-            "不要回答成对话历史中出现过的旧文件内容。"
+            "注意：以下为用户本轮新上传、此前未处理过的文件。这些文件的原件"
+            "（图片/PDF 等本体）与解析文本均不在沙箱文件系统中（沙箱 uploads/ "
+            "里可能只有此前轮次的旧文件副本，见上方档案），请直接基于以下文本"
+            "回答，不要尝试在沙箱中查找本轮新上传的文件，也不要向用户表示"
+            "找不到文件。用户提问指代不明确（如\"这个文件\"）时，默认指本轮新"
+            "上传的文件，不要回答成对话历史中出现过的旧文件内容。"
         )
+    # 失败文案约定：无论文件是否落盘沙箱，都提示模型正确解读失败文案
+    parts.append(_UPLOAD_FAILURE_NOTICE)
     for row in rows:
         content = (row.get("parsed_content") or "")[:_UPLOAD_CTX_MAX_CHARS]
         parts.append(f"=== 文件名: {row.get('filename', '')} ===")
         parts.append(content)
     for row in parsing_rows:
-        hint = _UPLOAD_PARSE_TIMEOUT_HINTS.get(
-            row.get("parse_type"), _UPLOAD_PARSE_TIMEOUT_HINT_DEFAULT
+        hint = _UPLOAD_STILL_PARSING_HINTS.get(
+            row.get("parse_type"), _UPLOAD_STILL_PARSING_HINT_DEFAULT
         )
         parts.append(f"=== 文件名: {row.get('filename', '')} ===")
         parts.append(hint)
-    # 历史文件档案：点名历史文件时 agent 可按档案寻址沙箱副本
-    archive = await _build_session_archive(dao, session_id)
-    if archive:
-        parts.append(archive)
+    # 末尾锚点：让"围绕本轮文件回答"成为离模型生成最近的指令，
+    # 避免模型被档案/历史里的旧文件内容带偏（多轮上传串答）
+    parts.append("本轮请围绕上述本轮上传的文件回答。")
     return "\n".join(parts)
 
 
@@ -317,13 +344,19 @@ async def has_unbound_uploads(request: Any, session_id: Optional[str]) -> bool:
         return False
 
 
-async def _build_session_archive(dao: Any, session_id: str) -> str:
+async def _build_session_archive(
+    dao: Any, session_id: str, *, has_new_files: bool = False
+) -> str:
     """构建"本会话历史已处理文件"档案片段（仅已绑定 message_id 的文件）。
 
     只列文件名与沙箱副本路径、不注入全文，避免上下文膨胀。作用：
     后续轮次（含跨 agent 路由）点名/指代历史文件时，agent 可按档案
     直接读取沙箱 uploads/ 副本，弥补"注入只进当轮 agent 私有记忆"
     的跨轮断链。检索失败静默返回空串。
+
+    has_new_files：本轮是否已注入新上传文件。为 True 时档案降级为
+    "仅用户点名才用"，避免历史文件压过本轮文件、使模型去找旧材料
+    回答本轮问题（多轮上传串答）。
     """
     try:
         rows = await dao.load_session_file_index(session_id)
@@ -341,10 +374,19 @@ async def _build_session_archive(dao: Any, session_id: str) -> str:
         fn = r.get("filename", "")
         mark = _STATUS_MARKS.get(r.get("status"), r.get("status") or "未知状态")
         lines.append(f"- {fn}（{mark}，沙箱副本: uploads/{_sandbox_safe_name(fn)}.md）")
-    lines.append(
-        "用户点名或指代上述历史文件（如\"刚才那个文件\"）时，请先读取对应"
-        "沙箱副本获取内容再处理；本轮未点名历史文件时无需读取。"
-    )
+    if has_new_files:
+        # 本轮已注入新文件：档案降级为"仅点名才用"，避免历史文件
+        # 压过本轮文件、使模型去找旧材料回答本轮问题
+        lines.append(
+            "本轮已在上方提供新上传的文件，请以本轮文件为准回答；除非用户"
+            "明确点名上述历史文件（如\"刚才那个文件\"），否则不要读取历史"
+            "文件副本，也不要基于历史文件内容回答本轮问题。"
+        )
+    else:
+        lines.append(
+            "用户点名或指代上述历史文件（如\"刚才那个文件\"）时，请先读取对应"
+            "沙箱副本获取内容再处理；本轮未点名历史文件时无需读取。"
+        )
     return "\n".join(lines)
 
 

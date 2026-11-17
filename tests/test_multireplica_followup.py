@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from app.services import chat_runtime
 from app.services.redis_lease import CoordinationUnavailable, RedisLease
-from tests.test_workspace_redis_map import ws, MemoryRedis, FakeSandbox, manager, MAP_KEY, LOCK_KEY, WID
+from tests.test_workspace_redis_map import ws, MemoryRedis, FakeSandbox, RenewableSandbox, manager, MAP_KEY, LOCK_KEY, WID
 
 
 class Redis(MemoryRedis):
@@ -47,7 +47,52 @@ class ExpiringSandbox(FakeSandbox):
 
 
 class LeaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_watch_stops_on_third_failure_but_not_on_first(self):
+    async def test_stop_poll_errors_do_not_abort_confirmed_live_lease(self):
+        redis, run = Redis(), None
+        calls = 0
+        async def flaky(key):
+            nonlocal calls
+            calls += 1
+            if calls <= 7:
+                raise TimeoutError("stop polling only")
+            return True
+        redis.exists = flaky
+        run = chat_runtime.ChatRun(redis, "s", "u")
+        await run.open()
+        try:
+            with patch.object(chat_runtime, "_STOP_POLL_INTERVAL", 0.001), \
+                 patch.object(chat_runtime, "_STOP_BACKOFF_CAP", 0.002):
+                await asyncio.wait_for(run.watch_stop(), 1)
+            self.assertEqual(calls, 8)
+            self.assertEqual(run.cancel_event.reason, "user")
+            await run.lease.assert_owned()
+        finally:
+            await run.close()
+
+    async def test_stop_poll_errors_cannot_continue_past_lease_validity(self):
+        redis = Redis()
+        run = chat_runtime.ChatRun(redis, "s", "u")
+        run.lease.ttl = 0.12
+        run.lease._safety_margin = 0.01
+        await run.open()
+        original = redis.eval
+        async def broken_renew(script, count, *args):
+            if "lease_renew" in script:
+                raise TimeoutError()
+            return await original(script, count, *args)
+        redis.eval = broken_renew
+        redis.exists = AsyncMock(side_effect=TimeoutError())
+        try:
+            with patch.object(chat_runtime, "_STOP_POLL_INTERVAL", 0.001), \
+                 patch.object(chat_runtime, "_STOP_BACKOFF_CAP", 0.002):
+                await asyncio.wait_for(run.watch_stop(), 0.4)
+            self.assertTrue(run.cancel_event.is_set())
+            self.assertFalse(run.lease.locally_valid())
+        finally:
+            await run.close()
+
+    async def test_watch_tolerates_transient_failures_until_threshold(self):
+        """Redis 瞬时故障：连续失败达到阈值前不中断本轮（退避重试）。"""
         redis, calls = Redis(), []
         async def exists(key):
             calls.append(key)
@@ -55,8 +100,18 @@ class LeaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
         redis.exists = exists
         run = chat_runtime.ChatRun(redis, "s", "u")
         with patch.object(chat_runtime, "_STOP_POLL_INTERVAL", 0.001):
-            await asyncio.wait_for(run.watch_stop(), 1)
-        self.assertEqual(len(calls), 3)
+            await asyncio.wait_for(run.watch_stop(), 2)
+        self.assertEqual(len(calls), chat_runtime._STOP_MAX_FAILURES)
+        self.assertEqual(run.cancel_event.reason, "redis_failure")
+
+    async def test_watch_stop_redis_flag_is_attributed_to_user(self):
+        redis = Redis()
+        await redis.set("chat_stop:s:run", "1")
+        run = chat_runtime.ChatRun(redis, "s", "u")
+        run.stop_key = "chat_stop:s:run"
+        with patch.object(chat_runtime, "_STOP_POLL_INTERVAL", 0.001):
+            await asyncio.wait_for(run.watch_stop(), 2)
+        self.assertEqual(run.cancel_event.reason, "user")
 
     async def test_confirmed_owner_loss_is_not_retried(self):
         redis, attempts = Redis(), []
@@ -155,6 +210,43 @@ class LeaseRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkspaceRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_background_renewal_does_not_extend_stale_sandbox(self):
+        redis, sandbox = Redis(), RenewableSandbox("old")
+        mgr = manager(redis)
+        mgr._cache[WID] = ws._Entry(sandbox, "u1")
+        await redis.set(MAP_KEY, "new", ex=100)
+        await redis.set("chat_run:s", json.dumps({"user_id": "u1", "run_id": "r"}), ex=30)
+        await mgr._renew_active_workspaces()
+        self.assertEqual(sandbox.renew_calls, [])
+        self.assertEqual(await redis.get(MAP_KEY), "new")
+
+    async def test_active_long_round_renews_sandbox_but_idle_user_does_not(self):
+        redis, sandbox, idle = Redis(), RenewableSandbox("active"), RenewableSandbox("idle")
+        mgr = manager(redis)
+        mgr._cache[WID] = ws._Entry(sandbox, "u1")
+        mgr._cache["user-idle"] = ws._Entry(idle, "idle")
+        mgr._cache[WID].last_access = time.monotonic() - mgr._ttl - 1
+        await redis.set(MAP_KEY, sandbox.id, ex=100)
+        await redis.set("chat_run:s", json.dumps({"user_id": "u1", "run_id": "r"}), ex=30)
+        await mgr._renew_active_workspaces()
+        self.assertEqual(len(sandbox.renew_calls), 1)
+        self.assertEqual(idle.renew_calls, [])
+        self.assertLess(time.monotonic() - mgr._cache[WID].last_access, 1)
+        self.assertGreater(redis.expires[MAP_KEY] - time.monotonic(), 3000)
+        await redis.delete("chat_run:s")
+        await mgr._renew_active_workspaces()
+        self.assertEqual(len(sandbox.renew_calls), 1)
+
+    async def test_missing_map_cannot_create_second_sandbox_under_live_run(self):
+        redis, mgr, create = Redis(), None, AsyncMock()
+        mgr = manager(redis)
+        await redis.set("chat_run:other", json.dumps({"user_id": "u1", "run_id": "r"}), ex=30)
+        with patch.object(ws.Sandbox, "create", create, create=True):
+            with self.assertRaises(CoordinationUnavailable):
+                await mgr.create_workspace("u1", "s1")
+        create.assert_not_awaited()
+        self.assertIsNone(await redis.get(LOCK_KEY))
+
     async def test_retirement_reuses_existing_creation_lease(self):
         redis, bad = Redis(), ExpiringSandbox("bad", broken=True)
         await redis.set(MAP_KEY, "bad", ex=3600)
@@ -187,6 +279,7 @@ class WorkspaceRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_short_ttl_never_gets_a_sixty_second_floor(self):
         redis, sbx = Redis(), ExpiringSandbox("short", remaining=20)
         mgr = ws.OpenSandboxWorkspaceManager(object(), "image", "/data/workspaces", 30, redis_client=redis)
+        self.assertLess(mgr._sweeper_interval, 20)
         with patch.object(ws.Sandbox, "create", AsyncMock(return_value=sbx), create=True):
             await mgr.create_workspace("u1", "s1")
         self.assertLess(redis.expires[MAP_KEY] - time.monotonic(), 20)

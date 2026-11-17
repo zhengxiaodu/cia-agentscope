@@ -167,11 +167,13 @@ async def test_tool_with_permission_calls_local_service(monkeypatch):
         user_id="u1", user_department="",
     )
 
-    # 返回文本：正文 + 引用来源拼接
+    # 返回文本：【制度问答回答】标记包裹正文 + 引用来源 + 直接输出指令
     text = _text(chunk)
-    assert text.startswith("报销标准如下")
+    assert text.startswith("【制度问答回答】")
+    assert "报销标准如下" in text
     assert "--- 引用来源 ---" in text
     assert "[1] 差旅报销办法 p1-2 [金科制度库]" in text
+    assert "请直接输出【制度问答回答】部分的内容作为最终回答" in text
 
     # citations 写入 metadata（由事件层透传）
     assert chunk.is_last is True
@@ -187,7 +189,8 @@ async def test_tool_without_citation_no_source_section(monkeypatch):
     chunk = await _call_tool(
         monkeypatch, perms=_permissions_json(["金科制度问答"]), service=service,
     )
-    assert _text(chunk) == "报销标准如下"
+    # 无引用时仍包裹【制度问答回答】标记，但不拼接引用来源段落
+    assert _text(chunk) == "【制度问答回答】\n报销标准如下"
     assert chunk.metadata == {}
 
 
@@ -299,7 +302,7 @@ async def test_tool_kb_selection_filters_kb_ids(monkeypatch):
         question="差旅报销标准是什么？", kb_ids=["456"],
         user_id="u1", user_department="",
     )
-    assert _text(chunk).startswith("报销标准如下")
+    assert _text(chunk).startswith("【制度问答回答】")
 
 
 @pytest.mark.asyncio

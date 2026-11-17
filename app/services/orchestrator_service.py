@@ -15,7 +15,7 @@
 import asyncio
 import json
 import logging
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, aclosing, contextmanager
 from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional
 
 from fastapi import Request
@@ -65,6 +65,29 @@ logger = logging.getLogger(__name__)
 def _noop_ctx() -> Iterator[None]:
     """空 context manager，langfuse 未启用时作为 start_span 的占位，yield None。"""
     yield None
+
+
+def _is_context_length_error(exc: Exception) -> bool:
+    """判断异常是否为模型上下文超长类错误（400）。
+
+    匹配多种引擎/SDK 的错误文本：OpenAI BadRequestError、私有引擎
+    "maximum context length" / "context_length_exceeded" / "token limit" 等。
+    命中时可清空历史上下文后重试一次，避免整轮对话直接中断。
+    """
+    msg = str(exc).lower()
+    keywords = (
+        "context_length_exceeded",
+        "maximum context length",
+        "context window",
+        "token limit",
+        "too many tokens",
+        "input too long",
+        "request too large",
+        "exceeds maximum",          # 私有引擎：exceeds maximum allowed limit
+        "input length",             # 私有引擎：Input length (X) exceeds ...
+        "error code: 400",          # OpenAI BadRequestError 通用兜底
+    )
+    return any(k in msg for k in keywords)
 
 
 def _safe_update_span(span: Any, output_dict: dict) -> None:
@@ -223,22 +246,23 @@ class OrchestratorService:
         子串快速判断（避免每条事件都 json.loads），命中后解析并校验 type，
         再累加 input_tokens / output_tokens。解析失败静默容错，不影响转发。
         """
-        async for ev in source:
-            try:
-                if "MODEL_CALL_END" in ev:
-                    payload = json.loads(ev.removeprefix("data: ").strip())
-                    if payload.get("type") == "MODEL_CALL_END":
-                        round_state.input_tokens += int(
-                            payload.get("input_tokens") or 0
-                        )
-                        round_state.output_tokens += int(
-                            payload.get("output_tokens") or 0
-                        )
-            except Exception:
-                logger.debug(
-                    "[OrchestratorService] token 拦截解析失败", exc_info=True
-                )
-            yield ev
+        async with aclosing(source):
+            async for ev in source:
+                try:
+                    if "MODEL_CALL_END" in ev:
+                        payload = json.loads(ev.removeprefix("data: ").strip())
+                        if payload.get("type") == "MODEL_CALL_END":
+                            round_state.input_tokens += int(
+                                payload.get("input_tokens") or 0
+                            )
+                            round_state.output_tokens += int(
+                                payload.get("output_tokens") or 0
+                            )
+                except Exception:
+                    logger.debug(
+                        "[OrchestratorService] token 拦截解析失败", exc_info=True
+                    )
+                yield ev
 
     @staticmethod
     def _event(data: dict) -> str:
@@ -497,12 +521,13 @@ class OrchestratorService:
         apply = None
         final_output_parts: List[str] = []
 
-        with self._span(
-            langfuse_service,
-            f"agent-{agent_id}",
-            # 信息精简：query 注入的文件全文在 upload_files.parsed_content 留底
-            {"intent": intent.id, "query": user_input[:2000]},
-        ) as agent_span:
+        async with AsyncExitStack() as stream_stack:
+            agent_span = stream_stack.enter_context(self._span(
+                langfuse_service,
+                f"agent-{agent_id}",
+                # 信息精简：query 注入的文件全文在 upload_files.parsed_content 留底
+                {"intent": intent.id, "query": user_input[:2000]},
+            ))
             from app.utils.agent_event_tracer import AgentEventTracer
             from app.utils.agent_event_stream import iter_agent_events
             from app.utils.event_serialization import serialize_agent_event
@@ -512,98 +537,123 @@ class OrchestratorService:
             # 已下发 bocha_sum 累积：按 citation_id 幂等合并、升序，
             # 每次事件发"全量快照"而非增量，多次搜索时前端覆盖式渲染仍得到完整来源列表
             bocha_emitted: list = []
-            try:
-                def _on_reply_start(ev):
-                    nonlocal apply
-                    apply = AssistantMsg(
-                        name=ev.name, content=[], id=ev.reply_id
-                    )
+            # 上下文超长降级重试：最多重试 1 次，重试前清空历史对话上下文
+            # （保留压缩摘要 summary），避免 400 直接中断整轮对话
+            max_retries = 1
+            for attempt in range(max_retries + 1):
+                try:
+                    def _on_reply_start(ev):
+                        nonlocal apply
+                        apply = AssistantMsg(
+                            name=ev.name, content=[], id=ev.reply_id
+                        )
 
-                async for event in iter_agent_events(agent, user_msg, tracer, _on_reply_start):
-                    if apply:
-                        apply.append_event(event)
-                    yield f"data: {serialize_agent_event(event)}\n\n"
-                    # 工具一结束立即下发 bocha_sum：正文 {n} 标注依赖来源列表，
-                    # 先于正文 delta 到达前端，便于边渲染正文边映射引用
-                    if isinstance(event, _ToolResultEnd):
-                        early_bocha = tracer.consume_bocha_sum()
-                        if early_bocha:
-                            bocha_emitted = merge_bocha_snapshots(bocha_emitted, early_bocha)
-                            yield (
-                                "data: "
-                                + json.dumps(
-                                    {
-                                        "type": "bocha_sum",
-                                        "bocha_sum": bocha_emitted,
-                                    },
-                                    ensure_ascii=False,
+                    events = await stream_stack.enter_async_context(aclosing(
+                        iter_agent_events(agent, user_msg, tracer, _on_reply_start)
+                    ))
+                    async for event in events:
+                        if apply:
+                            apply.append_event(event)
+                        yield f"data: {serialize_agent_event(event)}\n\n"
+                        # 工具一结束立即下发 bocha_sum：正文 {n} 标注依赖来源列表，
+                        # 先于正文 delta 到达前端，便于边渲染正文边映射引用
+                        if isinstance(event, _ToolResultEnd):
+                            early_bocha = tracer.consume_bocha_sum()
+                            if early_bocha:
+                                bocha_emitted = merge_bocha_snapshots(bocha_emitted, early_bocha)
+                                yield (
+                                    "data: "
+                                    + json.dumps(
+                                        {
+                                            "type": "bocha_sum",
+                                            "bocha_sum": bocha_emitted,
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                    + "\n\n"
                                 )
-                                + "\n\n"
+
+                    if apply:
+                        text_parts = []
+                        for block in apply.content:
+                            if hasattr(block, "type") and block.type == "text":
+                                text_parts.append(getattr(block, "text", str(block)))
+                        final_output_parts.append("\n".join(text_parts).strip())
+
+                    # 检测结果出来前仅暂存，落库由 chat_service 统一处理。
+                    round_state.final_states[agent_id] = agent.state.model_dump(mode="json")
+
+                    # emit 工具执行期间捕获的 citations（从 ToolResultEndEvent.metadata 累积）
+                    citations = tracer.consume_citations()
+                    if citations:
+                        yield (
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "type": "policy_qa_citations",
+                                    "citations": citations,
+                                },
+                                ensure_ascii=False,
                             )
-
-                if apply:
-                    text_parts = []
-                    for block in apply.content:
-                        if hasattr(block, "type") and block.type == "text":
-                            text_parts.append(getattr(block, "text", str(block)))
-                    final_output_parts.append("\n".join(text_parts).strip())
-
-                # 检测结果出来前仅暂存，落库由 chat_service 统一处理。
-                round_state.final_states[agent_id] = agent.state.model_dump(mode="json")
-
-                # emit 工具执行期间捕获的 citations（从 ToolResultEndEvent.metadata 累积）
-                citations = tracer.consume_citations()
-                if citations:
-                    yield (
-                        "data: "
-                        + json.dumps(
-                            {
-                                "type": "policy_qa_citations",
-                                "citations": citations,
-                            },
-                            ensure_ascii=False,
+                            + "\n\n"
                         )
-                        + "\n\n"
-                    )
 
-                # emit 流末残余的 bocha_sum：残余快照按 citation_id 合并，无新编号时内容不变；
-                # 已发过且无残余时不再重复发（最后一个事件已含全量）
-                residual_bocha = tracer.consume_bocha_sum()
-                if residual_bocha:
-                    bocha_emitted = merge_bocha_snapshots(bocha_emitted, residual_bocha)
-                    yield (
-                        "data: "
-                        + json.dumps(
-                            {
-                                "type": "bocha_sum",
-                                "bocha_sum": bocha_emitted,
-                            },
-                            ensure_ascii=False,
+                    # emit 流末残余的 bocha_sum：残余快照按 citation_id 合并，无新编号时内容不变；
+                    # 已发过且无残余时不再重复发（最后一个事件已含全量）
+                    residual_bocha = tracer.consume_bocha_sum()
+                    if residual_bocha:
+                        bocha_emitted = merge_bocha_snapshots(bocha_emitted, residual_bocha)
+                        yield (
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "type": "bocha_sum",
+                                    "bocha_sum": bocha_emitted,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
                         )
-                        + "\n\n"
+
+                    # 记录本轮参与的 agent_id + 成功标志（写入请求级状态）
+                    round_state.agent_ids = [agent_id]
+                    round_state.success = True
+
+                    _safe_update_span(agent_span, {
+                        "output": final_output_parts[0] if final_output_parts else "",
+                        "success": True,
+                        **tracer.summary(),
+                    })
+                    break  # 成功，跳出重试循环
+                except Exception as e:
+                    # 上下文超长（400）：清空历史对话上下文（保留 summary）后重试一次
+                    if _is_context_length_error(e) and attempt < max_retries:
+                        logger.warning(
+                            "[OrchestratorService] 智能体 %s 上下文超长，"
+                            "清空历史上下文后重试（第 %d 次）: %s",
+                            agent_id, attempt + 1, e,
+                        )
+                        try:
+                            agent.state.context.clear()
+                        except Exception:
+                            logger.warning(
+                                "[OrchestratorService] 清空 agent.state.context 失败",
+                                exc_info=True,
+                            )
+                        # 重置 apply，避免上次失败的部分结果污染
+                        apply = None
+                        continue
+                    logger.exception(
+                        f"[OrchestratorService] 单智能体 {agent_id} 执行异常"
                     )
-
-                # 记录本轮参与的 agent_id + 成功标志（写入请求级状态）
-                round_state.agent_ids = [agent_id]
-                round_state.success = True
-
-                _safe_update_span(agent_span, {
-                    "output": final_output_parts[0] if final_output_parts else "",
-                    "success": True,
-                    **tracer.summary(),
-                })
-            except Exception as e:
-                logger.exception(
-                    f"[OrchestratorService] 单智能体 {agent_id} 执行异常"
-                )
-                round_state.success = False
-                yield self._event({
-                    "type": "error",
-                    "message": f"执行出错: {str(e)}",
-                })
-                return
-            finally:
-                tracer.close()
+                    round_state.success = False
+                    yield self._event({
+                        "type": "error",
+                        "message": f"执行出错: {str(e)}",
+                    })
+                    return
+                finally:
+                    tracer.close()
 
         # yield summary 事件
         if final_output_parts:
@@ -730,7 +780,7 @@ class OrchestratorService:
             name="workspace-prepare",
         )
         try:
-            async for event_str in self._run_with_workspace_task(
+            async with aclosing(self._run_with_workspace_task(
                 ws_task=ws_task,
                 rewriter=rewriter,
                 recognizer=recognizer,
@@ -745,8 +795,9 @@ class OrchestratorService:
                 request=request,
                 round_state=rs,
                 input_probe_task=input_probe_task,
-            ):
-                yield event_str
+            )) as stream:
+                async for event_str in stream:
+                    yield event_str
         finally:
             # 客户端断连会让本生成器被提前关闭：未完成则取消，已完成则消费异常，
             # 否则事件循环会报 "Task exception was never retrieved"
@@ -801,15 +852,16 @@ class OrchestratorService:
                 request, session_id, persisted["sandbox_files"]
             )
             user_input = append_upload_context(user_input, upload_ctx)
-            async for ev in self._capture_tokens_from_stream(
+            async with aclosing(self._capture_tokens_from_stream(
                 self._run_single_agent_path(
                     registry, agent_factory, agent_id, user_input,
                     session_id, user_id, session_service, langfuse_service,
                     round_state,
                 ),
                 round_state,
-            ):
-                yield ev
+            )) as stream:
+                async for ev in stream:
+                    yield ev
             return
 
         # ③ 查询改写（联系上下文，失败降级为原始输入）。
@@ -952,7 +1004,7 @@ class OrchestratorService:
             )
 
         # ⑥ 执行编排（内部实时 yield SSE 事件）
-        async for event_str in self._capture_tokens_from_stream(
+        async with aclosing(self._capture_tokens_from_stream(
             orchestrator.run(
                 intent_result,
                 session_id=session_id,
@@ -960,8 +1012,9 @@ class OrchestratorService:
                 langfuse_service=langfuse_service,
             ),
             round_state,
-        ):
-            yield event_str
+        )) as stream:
+            async for event_str in stream:
+                yield event_str
 
         # ⑦ 汇总编排结果并暂存各 agent 的待检状态
         # agent_id 列表（去重保序）；成功标志从编排结果派生

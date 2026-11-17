@@ -198,6 +198,7 @@ class SessionDAO:
         session_id: str,
         user_id: str,
         new_messages: list[dict],
+        name_hint: str = "",
     ) -> Optional[dict]:
         """向 messages 表插入消息 + 更新 sessions 元信息。
 
@@ -243,15 +244,19 @@ class SessionDAO:
                         )
                         return None
 
-                    # 从本轮 user 消息提取会话名（首条 user 文本前 50 字符）
+                    # 从本轮 user 消息提取会话名（首条非空 user 文本前 50
+                    # 字符）；纯文件轮 user 文本为空，回退 name_hint
+                    # （由 chat_service 用本轮消费的文件名构建）
                     def _first_user_name() -> str:
                         for msg in new_messages:
                             if msg.get("role") == "user":
                                 raw_text = msg.get("content", "")
-                                return (
-                                    raw_text[:50] if len(raw_text) > 50 else raw_text
-                                )
-                        return ""
+                                if raw_text:
+                                    return (
+                                        raw_text[:50] if len(raw_text) > 50
+                                        else raw_text
+                                    )
+                        return name_hint[:50] if name_hint else ""
 
                     if not row:
                         name = _first_user_name()

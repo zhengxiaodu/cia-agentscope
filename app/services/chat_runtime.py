@@ -8,6 +8,10 @@ from app.services.redis_lease import CoordinationUnavailable, LeaseLost, RedisLe
 
 _STOP_POLL_INTERVAL = 0.5
 _WORKSPACE_GATE_WAIT = 5
+# 停止标志探测失败时指数退避；达到阈值且无已确认有效租约才中止，
+# 已确认租约的有效期仍由独立续期任务约束。
+_STOP_MAX_FAILURES = 5
+_STOP_BACKOFF_CAP = 5.0
 # Inherited by the SSE pump and workspace-preparation tasks, never global run state.
 current_chat_run = ContextVar("current_chat_run", default=None)
 
@@ -20,6 +24,23 @@ return 0
 """
 
 
+class CancellationEvent(asyncio.Event):
+    """取消信号：携带取消来源，避免把所有中断都当成用户主动停止。
+
+    asyncio.Event.set() 本身不接收参数；这里重写以记录首次置位的原因，
+    供 chat 流在收尾时给出准确归因（user / lease_lost / redis_failure）。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reason: str | None = None
+
+    def set(self, reason: str | None = None) -> None:  # type: ignore[override]
+        if self.reason is None:
+            self.reason = reason or "unknown"
+        super().set()
+
+
 class RunBusy(RuntimeError):
     pass
 
@@ -28,11 +49,15 @@ class ChatRun:
     def __init__(self, redis, session_id, user_id):
         self.redis, self.session_id, self.user_id = redis, session_id, str(user_id)
         self.run_id = uuid.uuid4().hex
-        self.cancel_event = asyncio.Event()
+        self.cancel_event = CancellationEvent()
         self.key = f"chat_run:{session_id}"
         self.stop_key = f"chat_stop:{session_id}:{self.run_id}"
         self.token = json.dumps({"run_id": self.run_id, "user_id": self.user_id}, sort_keys=True)
-        self.lease = RedisLease(redis, self.key, token=self.token, on_lost=self.cancel_event.set) if redis is not None else None
+        # ttl 从默认 30s 放宽到 120s：LLM 流式输出、工具执行期间事件循环可能
+        # 被同步阻塞，续期协程无法及时调度；120s 给阻塞 + Redis 抖动留足余量，
+        # 避免正常对话被误判为 lease_lost 中断。
+        self.lease = RedisLease(redis, self.key, token=self.token, ttl=120,
+                                on_lost=lambda: self.cancel_event.set("lease_lost")) if redis is not None else None
         self._closed = False
         self._close_task = None
 
@@ -62,20 +87,28 @@ class ChatRun:
         failures = 0
         while not self.cancel_event.is_set():
             if self.lease is not None and self.lease.lost.is_set():
-                self.cancel_event.set()
+                self.cancel_event.set("lease_lost")
                 return
             try:
                 if await asyncio.wait_for(self.redis.exists(self.stop_key), timeout=5):
-                    self.cancel_event.set()
+                    self.cancel_event.set("user")
                     return
                 failures = 0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 failures += 1
-                if not transient_io_error(exc) or failures >= 3:
-                    self.cancel_event.set()
+                if not transient_io_error(exc) or (
+                    failures >= _STOP_MAX_FAILURES
+                    and (self.lease is None or not self.lease.locally_valid())
+                ):
+                    self.cancel_event.set("redis_failure")
                     return
+                # 抖动容忍：指数退避后再探，避免 Redis 瞬时不可用直接中断本轮
+                await asyncio.sleep(
+                    min(_STOP_POLL_INTERVAL * (2 ** failures), _STOP_BACKOFF_CAP)
+                )
+                continue
             await asyncio.sleep(_STOP_POLL_INTERVAL)
 
     async def close(self):
@@ -136,5 +169,5 @@ async def request_stop(redis, session_id, user_id, local_run=None):
         if not stopped:
             return False
     if local_run is not None and local_run.run_id == data["run_id"]:
-        local_run.cancel_event.set()
+        local_run.cancel_event.set("user")
     return True

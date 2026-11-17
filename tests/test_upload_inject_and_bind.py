@@ -23,11 +23,13 @@ def _make_request(dao=None):
 
 
 class _FakeUploadDao:
-    def __init__(self, rows=None, exc=None, parsing_rows=None):
+    def __init__(self, rows=None, exc=None, parsing_rows=None, names=None):
         self.rows = rows or []
         self.exc = exc
         self.parsing_rows = parsing_rows or []
         self.bind_calls = []
+        self.names = names or []
+        self.name_query_calls = []
 
     async def load_unbound_parsed(self, session_id):
         if self.exc:
@@ -36,6 +38,10 @@ class _FakeUploadDao:
 
     async def load_unbound_parsing(self, session_id):
         return self.parsing_rows
+
+    async def get_filenames_by_ids(self, session_id, file_ids):
+        self.name_query_calls.append((session_id, list(file_ids)))
+        return self.names
 
     async def bind_message_id(self, session_id, message_id, message_pair_id=None, file_ids=None):
         self.bind_calls.append((session_id, message_id, message_pair_id, list(file_ids or [])))
@@ -68,7 +74,8 @@ async def test_load_upload_context_truncates_single_file():
         {"filename": "big.pdf", "parsed_content": "x" * (ucp._UPLOAD_CTX_MAX_CHARS + 100)},
     ])
     ctx = await load_upload_context(_make_request(dao), "s1")
-    body = ctx.split("=== 文件名: big.pdf ===\n", 1)[1]
+    # 仅取该文件正文（正文后可能追加"围绕本轮文件回答"的末尾锚点，需排除）
+    body = ctx.split("=== 文件名: big.pdf ===\n", 1)[1].split("\n", 1)[0]
     assert len(body) == ucp._UPLOAD_CTX_MAX_CHARS
 
 
@@ -115,12 +122,12 @@ def test_append_upload_context_empty_ctx_untouched():
 
 
 # ---------------------------------------------------------------------------
-# _load_upload_context：等待超时文件的失败提示注入
+# _load_upload_context：仍在解析中文件的提示注入
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_load_upload_context_includes_timeout_hints():
-    """parsed 与 parsing 并存：解析内容在前，超时提示在后（按 parse_type 选文案）。"""
+    """parsed 与 parsing 并存：解析内容在前，"仍在解析中"提示在后（按 parse_type 选文案）。"""
     dao = _FakeUploadDao(
         rows=[{"filename": "报告.pdf", "parsed_content": "# 报告内容"}],
         parsing_rows=[
@@ -133,23 +140,23 @@ async def test_load_upload_context_includes_timeout_hints():
     # parsed 在前
     assert "=== 文件名: 报告.pdf ===" in ctx
     assert "# 报告内容" in ctx
-    # 超时提示按 parse_type 区分文案
-    assert "=== 文件名: 大文件.pdf ===\n解析超时，MinerU服务暂时无法解析该文件" in ctx
-    assert "=== 文件名: 语音.m4a ===\n解析超时，音频解析服务暂时无法解析该文件" in ctx
+    # 仍在解析中：按 parse_type 区分文案（不得误报解析失败/超时）
+    assert f"=== 文件名: 大文件.pdf ===\n{ucp._UPLOAD_STILL_PARSING_HINTS['mineru']}" in ctx
+    assert f"=== 文件名: 语音.m4a ===\n{ucp._UPLOAD_STILL_PARSING_HINTS['asr']}" in ctx
     # 顺序：parsed 条目在 parsing 条目之前
     assert ctx.index("报告.pdf") < ctx.index("大文件.pdf")
 
 
 @pytest.mark.asyncio
 async def test_load_upload_context_only_parsing_files():
-    """仅剩解析中超时文件：也生成头部与失败提示。"""
+    """仅剩解析中文件：也生成头部与"仍在解析中"提示。"""
     dao = _FakeUploadDao(
         parsing_rows=[{"filename": "大文件.pdf", "parse_type": "mineru"}],
     )
     ctx = await load_upload_context(_make_request(dao), "s1")
     assert ctx.startswith(ucp._UPLOAD_CTX_HEADER)
     assert "=== 文件名: 大文件.pdf ===" in ctx
-    assert "解析超时，MinerU服务暂时无法解析该文件" in ctx
+    assert ucp._UPLOAD_STILL_PARSING_HINTS["mineru"] in ctx
 
 
 @pytest.mark.asyncio
@@ -159,7 +166,7 @@ async def test_load_upload_context_unknown_parse_type_default_hint():
         parsing_rows=[{"filename": "a.bin", "parse_type": "whatever"}],
     )
     ctx = await load_upload_context(_make_request(dao), "s1")
-    assert ucp._UPLOAD_PARSE_TIMEOUT_HINT_DEFAULT in ctx
+    assert ucp._UPLOAD_STILL_PARSING_HINT_DEFAULT in ctx
 
 
 @pytest.mark.asyncio
@@ -459,6 +466,83 @@ async def test_persist_swallows_bind_exception():
     )
     # 未传 message_pair_id 时第三参为 None
     dao.bind_message_id.assert_awaited_once_with("s1", 101, None, [1])
+
+
+# ---------------------------------------------------------------------------
+# _persist_conversation_history：纯文件轮的会话命名回退
+# ---------------------------------------------------------------------------
+
+_FILE_ONLY_MESSAGES = [
+    {"role": "user", "content": [{"type": "data", "data": {"file_id": 5}}]},
+]
+
+
+@pytest.mark.asyncio
+async def test_persist_file_only_round_passes_filename_name_hint():
+    """纯文件轮（user 无文本）用本轮消费的文件名作会话名提示，
+    避免会话名落空出现"未命名会话"。"""
+    dao = _FakeUploadDao(names=["报告.pdf", "语音.m4a"])
+    session_service = _make_session_service()
+    await _persist_conversation_history(
+        session_service, "s1", "u1", _FILE_ONLY_MESSAGES, "回答内容",
+        upload_file_dao=dao,
+        message_pair_id="pair-1",
+        round_state=RoundState(consumed_upload_ids=[5, 6]),
+    )
+    assert dao.name_query_calls == [("s1", [5, 6])]
+    session_service.append_messages.assert_awaited_once()
+    assert session_service.append_messages.await_args.kwargs.get(
+        "name_hint"
+    ) == "报告.pdf、语音.m4a"
+    # user 消息仍落空文本（前端按消息对挂文件）
+    user_msg = [
+        m for m in session_service.append_messages.await_args.args[2]
+        if m["role"] == "user"
+    ][0]
+    assert user_msg["content"] == ""
+
+
+@pytest.mark.asyncio
+async def test_persist_file_only_round_name_hint_three_files():
+    dao = _FakeUploadDao(names=["a.pdf", "b.pdf", "c.pdf"])
+    session_service = _make_session_service()
+    await _persist_conversation_history(
+        session_service, "s1", "u1", _FILE_ONLY_MESSAGES, "回答内容",
+        upload_file_dao=dao,
+        round_state=RoundState(consumed_upload_ids=[1, 2, 3]),
+    )
+    assert session_service.append_messages.await_args.kwargs.get(
+        "name_hint"
+    ) == "a.pdf、b.pdf 等3个文件"
+
+
+@pytest.mark.asyncio
+async def test_persist_normal_round_no_name_hint_kwarg():
+    """普通轮（user 有文本）不传 name_hint，会话名走首条 user 文本。"""
+    dao = _FakeUploadDao()
+    session_service = _make_session_service()
+    await _persist_conversation_history(
+        session_service, "s1", "u1", _MESSAGES, "回答内容",
+        upload_file_dao=dao,
+        round_state=RoundState(consumed_upload_ids=[5]),
+    )
+    assert dao.name_query_calls == []
+    assert "name_hint" not in session_service.append_messages.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_persist_file_only_round_name_query_failure_swallowed():
+    """文件名查询失败只告警，不影响持久化，也不传 name_hint。"""
+    dao = _FakeUploadDao()
+    dao.get_filenames_by_ids = AsyncMock(side_effect=RuntimeError("db down"))
+    session_service = _make_session_service()
+    await _persist_conversation_history(
+        session_service, "s1", "u1", _FILE_ONLY_MESSAGES, "回答内容",
+        upload_file_dao=dao,
+        round_state=RoundState(consumed_upload_ids=[5]),
+    )
+    session_service.append_messages.assert_awaited_once()
+    assert "name_hint" not in session_service.append_messages.await_args.kwargs
 
 
 # ---------------------------------------------------------------------------

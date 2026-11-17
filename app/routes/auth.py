@@ -351,7 +351,7 @@ async def update_department(request: Request, body: UpdateDepartmentRequest, use
 @router.put("/api/auth/me/password")
 async def update_password(request: Request, body: UpdatePasswordRequest, user: dict = Depends(current_user)):
     jwt_token = await _require_jwt_from_header(request)
-    result = await update_password_via_mng(jwt_token, body.old_password, body.new_password)
+    result = await update_password_via_mng(jwt_token, body.old_password, body.new_password,body.repeat_new_password)
     if not result.get("success"):
         return error_response(400, result.get("message", "修改密码失败"))
     return await _build_update_response(request, user, {})

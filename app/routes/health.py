@@ -13,6 +13,7 @@ LLM_PROBE_TIMEOUT = 10.0
 
 
 @router.get("/ping")
+@router.get("/health")
 async def health(request: Request):
     """健康检查：返回服务存活状态。
 

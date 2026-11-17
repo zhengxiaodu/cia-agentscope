@@ -201,8 +201,8 @@ async def test_load_context_declaration_branches():
     assert "=== 文件名: 报表.xlsx ===" in ctx_ok
     # 未写入分支：声明"不在沙箱勿查找"
     ctx_fallback = await load_upload_context(request, "sess-1")
-    assert "实体文件不在沙箱文件系统中" in ctx_fallback
-    assert "不要尝试在沙箱中查找文件" in ctx_fallback
+    assert "均不在沙箱文件系统中" in ctx_fallback
+    assert "不要尝试在沙箱中查找本轮新上传的文件" in ctx_fallback
     # 无上传文件：返回空串
     empty_request = _make_request([])
     assert await load_upload_context(empty_request, "sess-1") == ""
