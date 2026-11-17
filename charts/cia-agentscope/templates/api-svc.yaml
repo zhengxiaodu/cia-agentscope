@@ -1,0 +1,32 @@
+{{- if .Values.api.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ template "oia-agentscope.api.fullname" . }}
+  labels:
+{{ include "oia-agentscope.labels" . | indent 4 }}
+{{- if .Values.api.service.labels }}
+{{ toYaml .Values.api.service.labels | indent 4 }}
+{{- end }}
+    component: "api"
+{{- with .Values.api.service.annotations }}
+  annotations:
+{{ toYaml . | indent 4 }}
+{{- end }}
+spec:
+  type: {{ .Values.api.service.type | default "NodePort" }}
+  {{- if .Values.api.service.clusterIP }}
+  clusterIP: {{ .Values.api.service.clusterIP }}
+  {{- end }}
+  ports:
+    - name: http-api
+      port: {{ .Values.api.service.port }}
+      protocol: TCP
+      targetPort: api
+      {{- if and (eq .Values.api.service.type "NodePort") (.Values.api.service.nodePort) }}
+      nodePort: {{ .Values.api.service.nodePort }}
+      {{- end }}
+  selector:
+{{ include "oia-agentscope.selectorLabels" . | indent 4 }}
+    component: "api"
+{{- end }}

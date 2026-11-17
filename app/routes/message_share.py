@@ -6,8 +6,9 @@
   messages/files/upload_files 三列表均按被分享的 message_pair_id 过滤
 """
 from typing import Any, Dict, List
+from urllib.parse import quote, unquote, urlsplit
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.dependencies import current_user
 
@@ -118,8 +119,10 @@ async def get_message_share(shared_id: str, request: Request):
     ]
     data["files"] = [
         f for f in data["files"]
-        if f.get("message_pair_id") in pair_ids
+        if f.get("message_pair_id") in {m.get("message_pair_id") for m in data["messages"]}
     ]
+    for file in data["files"]:
+        file["url"] = f"/message_share/{quote(shared_id, safe='')}/files/{quote(file['path'], safe='/')}"
     data["upload_files"] = [
         f for f in data["upload_files"]
         if f.get("message_pair_id") in pair_ids
@@ -129,3 +132,40 @@ async def get_message_share(shared_id: str, request: Request):
         data["messages"]
     )
     return success_response(data)
+
+
+@router.get("/message_share/{shared_id}/files/{path:path}")
+async def download_shared_file(shared_id: str, path: str, request: Request):
+    """凭分享 ID 下载该分享中的生成附件；不授予整个会话的读取权限。"""
+    from app.routes.files import download_persisted_file, download_session_file
+
+    share_dao = getattr(request.app.state, "message_share_dao", None)
+    service = getattr(request.app.state, "session_service", None)
+    if share_dao is None or service is None:
+        raise HTTPException(status_code=503, detail="分享服务未初始化")
+    share = await share_dao.get_share(shared_id)
+    if share is None:
+        raise HTTPException(status_code=404, detail="分享不存在")
+    try:
+        detail = await service.get_session_detail(share["session_id"], share["user_id"])
+    except PermissionError:
+        detail = None
+    if detail is None:
+        raise HTTPException(status_code=404, detail="会话不存在或已删除")
+    data = detail.model_dump(mode="json")
+    allowed_pairs = set(share["message_pair_ids"]) & {
+        m.get("message_pair_id") for m in data["messages"] if m.get("message_pair_id")
+    }
+    record = next((f for f in data["files"] if f["path"] == path
+                   and f.get("message_pair_id") in allowed_pairs), None)
+    if record is None:
+        raise HTTPException(status_code=404, detail="文件不在分享范围内")
+    session_id = share["session_id"]
+    owner = {"user_id": share["user_id"]}
+    source = unquote(urlsplit(record.get("url") or "").path)
+    # 仅走平台已有文件通道，不请求记录中的外部 URL。分享附件强制下载。
+    if source == f"/persist-files/{session_id}/{path}":
+        return await download_persisted_file(request, session_id, path, "download", owner)
+    if source == f"/files/{session_id}/{path}":
+        return await download_session_file(request, session_id, path, "download", owner)
+    raise HTTPException(status_code=404, detail="分享文件不可用")

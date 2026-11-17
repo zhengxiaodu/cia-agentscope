@@ -1,0 +1,204 @@
+{{- if .Values.api.enabled }}
+{{/*
+ 敏感项注入：api.existingSecret 设置后，existingSecretKeys 中非空的键改由 Secret 注入，
+ 其余变量仍走 api-config ConfigMap。键留空即不注入（Secret 里没这个键时很有用）。
+*/}}
+{{- $secretMap := list
+  (dict "env" "CONFIG_DECRYPT_KEY" "field" "configDecryptKey")
+  (dict "env" "JWT_SECRET" "field" "jwtSecret")
+  (dict "env" "MYSQL_PASSWORD" "field" "mysqlPassword")
+  (dict "env" "REDIS_URL" "field" "redisUrl")
+  (dict "env" "LANGFUSE_PUBLIC_KEY" "field" "langfusePublicKey")
+  (dict "env" "LANGFUSE_SECRET_KEY" "field" "langfuseSecretKey")
+  (dict "env" "OPENSANDBOX_API_KEY" "field" "opensandboxApiKey")
+  (dict "env" "REGULATIONS_KB_INTERNAL_TOKEN" "field" "kbInternalToken")
+  (dict "env" "REGULATIONS_LANGFUSE_PUBLIC_KEY" "field" "regulationsLangfusePublicKey")
+  (dict "env" "REGULATIONS_LANGFUSE_SECRET_KEY" "field" "regulationsLangfuseSecretKey")
+  (dict "env" "MINERU_API_KEY" "field" "mineruApiKey")
+  (dict "env" "BOCHA_API_KEY" "field" "bochaApiKey")
+}}
+{{- $secretItems := list }}
+{{- if and .Values.api.existingSecret .Values.api.existingSecretKeys }}
+{{- range $item := $secretMap }}
+{{- $secretKey := index $.Values.api.existingSecretKeys $item.field }}
+{{- if $secretKey }}
+{{- $secretItems = append $secretItems (printf "- name: %s\n  valueFrom:\n    secretKeyRef:\n      name: %s\n      key: %s" $item.env $.Values.api.existingSecret $secretKey) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- $secretEnv := join "\n" $secretItems }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+{{ include "oia-agentscope.ud.annotations" . | indent 4 }}
+    descriptions: api
+  labels:
+{{- include "oia-agentscope.labels" . | nindent 4 }}
+    component: api
+{{ include "oia-agentscope.ud.labels" . | indent 4 }}
+  name: {{ template "oia-agentscope.api.fullname" . }}
+spec:
+  replicas: {{ .Values.api.replicas }}
+  revisionHistoryLimit: {{ .Values.api.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+{{- include "oia-agentscope.selectorLabels" . | nindent 6 }}
+      component: api
+  {{- if .Values.api.updateStrategy }}
+  strategy: {{- toYaml .Values.api.updateStrategy | nindent 4 }}
+  {{- end }}
+  template:
+    metadata:
+      annotations:
+        checksum/api-config: {{ include (print $.Template.BasePath "/api-config.yaml") . | sha256sum }}
+{{ include "oia-agentscope.ud.annotations" . | indent 8 }}
+      labels:
+{{- include "oia-agentscope.selectorLabels" . | nindent 8 }}
+        component: api
+{{ include "oia-agentscope.ud.labels" . | indent 8 }}
+    spec:
+      {{- if .Values.api.priorityClassName }}
+      priorityClassName: {{ .Values.api.priorityClassName | quote }}
+      {{- end }}
+      {{- if .Values.image.api.pullSecrets }}
+      imagePullSecrets:
+      {{- range .Values.image.api.pullSecrets }}
+        - name: {{ . }}
+      {{- end }}
+      {{- end }}
+      {{- if .Values.api.podSecurityContext.enabled }}
+      securityContext: {{- omit .Values.api.podSecurityContext "enabled" | toYaml | nindent 8 }}
+      {{- end }}
+      containers:
+      - image: "{{ .Values.image.api.repository }}:{{ default .Chart.AppVersion .Values.image.api.tag }}"
+        imagePullPolicy: "{{ .Values.image.api.pullPolicy }}"
+        name: api
+        {{- if .Values.api.containerSecurityContext.enabled }}
+        securityContext: {{- omit .Values.api.containerSecurityContext "enabled" | toYaml | nindent 10 }}
+        {{- end }}
+        {{- if or $secretEnv .Values.api.extraEnv }}
+        env:
+        {{- if $secretEnv }}
+          {{- $secretEnv | nindent 8 }}
+        {{- end }}
+        {{- with .Values.api.extraEnv }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- end }}
+        envFrom:
+        - configMapRef:
+            name: {{ template "oia-agentscope.api.fullname" . }}
+        ports:
+          - name: api
+            containerPort: {{ .Values.api.port }}
+            protocol: TCP
+        {{- if .Values.api.livenessProbe.enabled }}
+        livenessProbe:
+          httpGet:
+            path: {{ .Values.api.livenessProbe.path | default "/health" }}
+            port: api
+          initialDelaySeconds: {{ .Values.api.livenessProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.api.livenessProbe.periodSeconds }}
+          timeoutSeconds: {{ .Values.api.livenessProbe.timeoutSeconds }}
+          failureThreshold: {{ .Values.api.livenessProbe.failureThreshold }}
+          successThreshold: {{ .Values.api.livenessProbe.successThreshold }}
+        {{- end }}
+        {{- if .Values.api.readinessProbe.enabled }}
+        readinessProbe:
+          httpGet:
+            path: {{ .Values.api.readinessProbe.path | default "/health" }}
+            port: api
+          initialDelaySeconds: {{ .Values.api.readinessProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.api.readinessProbe.periodSeconds }}
+          timeoutSeconds: {{ .Values.api.readinessProbe.timeoutSeconds }}
+          failureThreshold: {{ .Values.api.readinessProbe.failureThreshold }}
+          successThreshold: {{ .Values.api.readinessProbe.successThreshold }}
+        {{- end }}
+        {{- if .Values.api.startupProbe.enabled }}
+        startupProbe:
+          httpGet:
+            path: {{ .Values.api.startupProbe.path | default "/health" }}
+            port: api
+          initialDelaySeconds: {{ .Values.api.startupProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.api.startupProbe.periodSeconds }}
+          timeoutSeconds: {{ .Values.api.startupProbe.timeoutSeconds }}
+          failureThreshold: {{ .Values.api.startupProbe.failureThreshold }}
+          successThreshold: {{ .Values.api.startupProbe.successThreshold }}
+        {{- end }}
+        resources:
+          {{- toYaml .Values.api.resources | nindent 12 }}
+        {{- if or .Values.api.persistence.logs.enabled .Values.api.persistence.sessionFiles.enabled .Values.api.persistence.externalSkills.enabled }}
+        volumeMounts:
+        {{- if .Values.api.persistence.logs.enabled }}
+        - name: app-logs
+          mountPath: {{ .Values.api.persistence.logs.mountPath | quote }}
+          subPath: {{ .Values.api.persistence.logs.persistentVolumeClaim.subPath | default "" | quote }}
+        {{- end }}
+        {{- if .Values.api.persistence.sessionFiles.enabled }}
+        - name: session-files
+          mountPath: {{ .Values.api.persistence.sessionFiles.mountPath | quote }}
+          subPath: {{ .Values.api.persistence.sessionFiles.persistentVolumeClaim.subPath | default "" | quote }}
+        {{- end }}
+        {{- if .Values.api.persistence.externalSkills.enabled }}
+        - name: external-skills
+          mountPath: {{ .Values.api.persistence.externalSkills.mountPath | quote }}
+          {{- if eq (.Values.api.persistence.externalSkills.type | default "hostPath") "hostPath" }}
+          subPath: {{ .Values.api.persistence.externalSkills.hostPath.subPath | default "" | quote }}
+          {{- else }}
+          subPath: {{ .Values.api.persistence.externalSkills.persistentVolumeClaim.subPath | default "" | quote }}
+          {{- end }}
+        {{- end }}
+        {{- end }}
+    {{- if and (.Values.nodeSelector) (not .Values.api.nodeSelector) }}
+      nodeSelector:
+{{ toYaml .Values.nodeSelector | indent 8 }}
+    {{- end }}
+    {{- if .Values.api.nodeSelector }}
+      nodeSelector:
+{{ toYaml .Values.api.nodeSelector | indent 8 }}
+    {{- end }}
+    {{- if and (.Values.affinity) (not .Values.api.affinity) }}
+      affinity:
+{{ toYaml .Values.affinity | indent 8 }}
+    {{- end }}
+    {{- if .Values.api.affinity }}
+      affinity:
+{{ toYaml .Values.api.affinity | indent 8 }}
+    {{- end }}
+    {{- if and (.Values.tolerations) (not .Values.api.tolerations) }}
+      tolerations:
+{{ toYaml .Values.tolerations | indent 8 }}
+    {{- end }}
+    {{- if .Values.api.tolerations }}
+      tolerations:
+{{ toYaml .Values.api.tolerations | indent 8 }}
+    {{- end }}
+      {{- if or .Values.api.persistence.logs.enabled .Values.api.persistence.sessionFiles.enabled .Values.api.persistence.externalSkills.enabled }}
+      volumes:
+      {{- if .Values.api.persistence.logs.enabled }}
+      - name: app-logs
+        persistentVolumeClaim:
+          claimName: {{ .Values.api.persistence.logs.persistentVolumeClaim.existingClaim | default (include "oia-agentscope.api.logsPvcName" .) }}
+      {{- end }}
+      {{- if .Values.api.persistence.sessionFiles.enabled }}
+      - name: session-files
+        persistentVolumeClaim:
+          claimName: {{ .Values.api.persistence.sessionFiles.persistentVolumeClaim.existingClaim | default (include "oia-agentscope.api.sessionFilesPvcName" .) }}
+      {{- end }}
+      {{- if .Values.api.persistence.externalSkills.enabled }}
+      {{- if eq (.Values.api.persistence.externalSkills.type | default "hostPath") "hostPath" }}
+      - name: external-skills
+        hostPath:
+          path: {{ .Values.api.persistence.externalSkills.hostPath.path }}
+          {{- with .Values.api.persistence.externalSkills.hostPath.type }}
+          type: {{ . }}
+          {{- end }}
+      {{- else }}
+      - name: external-skills
+        persistentVolumeClaim:
+          claimName: {{ .Values.api.persistence.externalSkills.persistentVolumeClaim.existingClaim | default (include "oia-agentscope.api.externalSkillsPvcName" .) }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+{{- end }}

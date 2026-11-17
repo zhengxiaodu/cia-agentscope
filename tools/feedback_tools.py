@@ -4,6 +4,7 @@
 产出格式与 render_generic_card 同构（type=chart + chartType），chat_service
 的 _COMPONENT_TYPES 白名单无需改动即可被拦截转发为 CUSTOM_COMPONENT。
 """
+from contextlib import aclosing
 import json
 import logging
 import uuid
@@ -12,7 +13,11 @@ from typing import Any, AsyncGenerator, Dict, Optional
 from agentscope.message import TextBlock
 from agentscope.tool import FunctionTool, ToolChunk
 
-from app.services.feedback_service import wait_feedback
+from app.services.feedback_service import (
+    FeedbackAlreadyPending,
+    feedback_registration,
+    wait_registered_feedback,
+)
 from tools.tool_constants import RENDER_FEEDBACK_CARD
 
 logger = logging.getLogger(__name__)
@@ -44,9 +49,14 @@ async def _feedback_card_stream(
         payload["title"] = title
     logger.info("[feedback_tools] 发卡并挂起 session=%s card_type=%s feedback_id=%s",
                 session_id, card_type, feedback_id)
-    yield _chunk(json.dumps(payload, ensure_ascii=False))
-
-    result = await wait_feedback(session_id, feedback_id, timeout=timeout)
+    try:
+        # Register before yielding: the browser may submit immediately after the
+        # first chunk, before the generator is advanced again to wait for it.
+        async with feedback_registration(session_id, feedback_id, timeout) as pending:
+            yield _chunk(json.dumps(payload, ensure_ascii=False))
+            result = await wait_registered_feedback(pending)
+    except FeedbackAlreadyPending as exc:
+        result = {"status": "error", "message": str(exc)}
 
     logger.info("[feedback_tools] 收到反馈 session=%s feedback_id=%s status=%s",
                 session_id, feedback_id, result.get("status", "ok"))
@@ -74,7 +84,8 @@ def create_feedback_tool(session_id: str) -> FunctionTool:
             schema: 卡片业务数据（字段结构见对应组件的 schemaFields）
             title: 卡片标题
         """
-        async for chunk in _feedback_card_stream(session_id, card_type, schema, title):
-            yield chunk
+        async with aclosing(_feedback_card_stream(session_id, card_type, schema, title)) as stream:
+            async for chunk in stream:
+                yield chunk
 
     return FunctionTool(render_feedback_card, name=RENDER_FEEDBACK_CARD)

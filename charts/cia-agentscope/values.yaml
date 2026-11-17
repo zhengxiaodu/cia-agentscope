@@ -1,0 +1,414 @@
+# Default values for oia-agentscope.
+# 结构与 OIA-CONFIG 的 oia-config-local 保持一致：
+#   api   -> 后端 FastAPI/AgentScope（容器端口 7012，健康检查 /health）
+#   proxy -> 前端 Nginx（容器端口 80，/api/ 反代到后端 Service）
+#
+# 部署约定（对齐 oia-admin-local / oia-config-local）：
+#   镜像仓库 registry.ccdc.cn:5000/oia、拉取密钥 docker-register-secret、
+#   调度节点 nodeSelector group: dify、存储类 nfs-client（RWX）、对外 NodePort。
+#
+# 环境变量来源：应用 .env（键名与 app 配置 Settings 字段一一对应，大小写敏感）。
+# 本文件把 .env 拆成结构化字段，由 templates/config.tpl 渲染成 api-config ConfigMap。
+# 敏感项（CONFIG_DECRYPT_KEY / JWT_SECRET / MYSQL_PASSWORD / LANGFUSE_* / OPENSANDBOX_API_KEY /
+# MINERU_API_KEY / BOCHA_API_KEY 等）默认明文落 ConfigMap，设置 api.existingSecret 后改走 Secret。
+
+## @section 镜像参数
+##
+image:
+  proxy:
+    registry: registry.ccdc.cn:5000
+    repository: registry.ccdc.cn:5000/oia/oia-agentscope-frontend
+    tag: 1.0.0
+    pullPolicy: IfNotPresent
+    ## 集群中已存在的 imagePullSecrets（需提前在命名空间创建）
+    ## ref: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
+    pullSecrets:
+      - docker-register-secret
+  api:
+    registry: registry.ccdc.cn:5000
+    repository: registry.ccdc.cn:5000/oia/oia-agentscope-backend
+    tag: 1.0.0
+    pullPolicy: IfNotPresent
+    pullSecrets:
+      - docker-register-secret
+
+## @section 后端（api）参数
+##
+api:
+  enabled: true
+  replicas: 2
+  revisionHistoryLimit: 3
+  resources: {}
+  nodeSelector: { group: dify }
+  affinity: {}
+  tolerations: []
+  priorityClassName: ""
+  updateStrategy: {}
+  ## 容器端口，须与镜像 CMD 实际监听端口一致；同时作为探针端口使用
+  port: 7012
+
+  ## 健康探针：后端提供 /health（无需鉴权）
+  ## ref: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
+  livenessProbe:
+    enabled: true
+    path: /health
+    initialDelaySeconds: 40
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+    successThreshold: 1
+  readinessProbe:
+    enabled: true
+    path: /health
+    initialDelaySeconds: 20
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+    successThreshold: 1
+  ## 首次启动会连库建表 / 拉镜像，慢启动场景建议开启
+  startupProbe:
+    enabled: true
+    path: /health
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 60
+    successThreshold: 1
+
+  ## Pod / Container Security Context
+  podSecurityContext:
+    enabled: true
+    fsGroup: 0
+  containerSecurityContext:
+    enabled: true
+    runAsUser: 0
+
+  ## 额外环境变量（优先级高于 ConfigMap）
+  ## - name: HTTP_PROXY
+  ##   value: "http://proxy:8080"
+  extraEnv: []
+
+  service:
+    type: NodePort
+    port: 7012
+    ## 留空由 apiserver 自动分配（30000-32767）；对外提供服务建议固定便于放通防火墙
+    ## oia-admin 用 30711、oia-config 用 30712，这里顺延使用 30713
+    nodePort: 30713
+    annotations: {}
+    labels: {}
+    clusterIP: ""
+
+  # ---------------------------------------------------------------------------
+  # 应用运行时配置（对应应用 .env）
+  # 键名与 .env 中的环境变量一一对应，项目未读取的变量一律不输出。
+  # ---------------------------------------------------------------------------
+
+  # ---- 敏感配置加密主密钥 ----
+  # CONFIG_DECRYPT_KEY：JWT_SECRET / MYSQL_PASSWORD 中 ENC(...) 值的解密主密钥
+  configDecryptKey: "deca474a22e44f31e529b0774d6984e5"
+
+  # ---- JWT 鉴权 ----
+  jwt:
+    # 必填。通过 api.existingSecret 或部署环境提供各副本共用的签名密钥。
+    secret: ""
+    # JWT_EXPIRE_HOURS
+    expireHours: 1
+
+  # ---- 第三方管理系统登录校验（true 时使用模拟数据） ----
+  auth:
+    mock: true
+    apiUrl: "https://example.com/api/auth/verify"
+
+  # ---- 会话存储 ----
+  session:
+    # REDIS_SESSION_TTL（秒）
+    redisSessionTtl: 86400
+
+  # ---- 文件上传 ----
+  upload:
+    # UPLOAD_MAX_SIZE_MB
+    maxSizeMb: 10
+    # SESSION_FILES_PERSIST_DIR：生成文件持久化目录（相对项目根 /app；留空禁用持久化，
+    # 下载地址回退沙箱）。需落在 api.persistence.sessionFiles.mountPath 才会持久化。
+    sessionFilesPersistDir: "/app/data/session_files"
+
+  # ---- 日志 ----
+  log:
+    level: "INFO"
+    # LOG_DIR，需落在 api.persistence.logs.mountPath 下才会持久化
+    dir: "/app/logs"
+    # LOG_MAX_BYTES（单文件滚动大小，64MiB）。用字符串避免 Helm 渲染成科学计数法
+    maxBytes: "67108864"
+    # LOG_BACKUP_COUNT
+    backupCount: 7
+
+  # ---- 管理中心（用户鉴权 / 意图卡片地址分离） ----
+  mng:
+    authUrl: "https://july-unwomanly-quantum.ngrok-free.dev"
+    intentUrl: "https://july-unwomanly-quantum.ngrok-free.dev"
+
+  # ---- 外部技能目录 ----
+  skills:
+    # EXTERNAL_SKILLS_DIR：mng 系统外部意图关联的 skill 存放路径
+    # .env 原值为 ./external_skills（相对项目根 /app），这里写成容器内绝对路径
+    externalDir: "/app/external_skills"
+
+  # ---- OpenSandbox 沙箱 ----
+  opensandbox:
+    domain: "120.76.54.180:30080"
+    apiKey: "b53ff4dc83efc21e4a99039186df8c059757b3857983d6772ed89e9bc6a61354"
+    protocol: "http"
+    useServerProxy: true
+    image: "python:3.13-slim"
+    resource:
+      cpu: "100m"
+      memory: "128Mi"
+    # WORKSPACE_TTL：工作区空闲 TTL（秒），供 WorkspaceManager 淘汰空闲沙箱
+    workspaceTtl: 7200
+    # OPENSANDBOX_POOL_SIZE：预热池提前创建的空闲沙箱数（0=不启用）
+    poolSize: 0
+    # OPENSANDBOX_POOL_REFILL：池中沙箱被取出后是否自动补充
+    poolRefill: true
+
+  # ---- 制度问答（regulations） ----
+  regulations:
+    # 知识库检索服务（policy-kb-api）地址与内部 token
+    # .env 原值 http://localhost:6183 仅本地可用，集群内请改写成实际 Service 地址
+    kb:
+      baseUrl: "http://policy-kb-api.default.svc.cluster.local:6183"
+      internalToken: ""
+    # 检索参数覆盖
+    topKOverride: 20
+    rerankTopKOverride: 5
+    # Query 理解与改写开关
+    query:
+      understandingEnabled: true
+      rewriteHydeEnabled: true
+      rewriteStepbackEnabled: true
+      rewriteLlmClassifyEnabled: true
+      rewriteBusinessClassifyEnabled: true
+      rewriteBusinessIntentsEnabled: false
+    # 制度问答 Langfuse（独立公钥私钥/项目；密钥留空则禁用埋点）
+    langfuse:
+      publicKey: ""
+      secretKey: ""
+      enabled: true
+      sampleRate: "1.0"
+    # 数据大盘（false=Mock，true=查真实 Langfuse/KB/缺口表）
+    dashboard:
+      useRealData: false
+      lookbackDays: 30
+    # POLICY_QA_KB_MAP：权限名→知识库ID 映射（JSON），留空用代码默认值
+    policyQaKbMap: ""
+
+  # ---- MinerU 文档解析（鉴权头为 x-api-key） ----
+  mineru:
+    apiKey: ""
+    baseUrl: ""
+
+  # ---- 安全敏感内容检测 ----
+  sensitive:
+    # false 时输入输出均不做安全审核
+    enabled: true
+    # 检测服务基础地址（IP+端口，路径由服务代码按场景拼接），留空则关闭检测
+    # 例：http://25.59.38.152:30017
+    serviceUrl: ""
+    # 语义风险阈值（0.0-1.0）
+    threshold: 0.7
+    # 调用超时（秒），超时兜底放行
+    timeout: 5
+
+  # ---- 博查网络搜索 ----
+  bocha:
+    apiBase: "https://bocha.market.alicloudapi.com/v1/web-search"
+    apiKey: "sk-b2456820150d48a68c15a0f76ded1eef"
+
+  # ---- 敏感项注入 ----
+  # 设置后下列键不再写入 ConfigMap，改为从该 Secret 注入：
+  #   CONFIG_DECRYPT_KEY / JWT_SECRET / MYSQL_PASSWORD / REDIS_URL /
+  #   LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / OPENSANDBOX_API_KEY /
+  #   REGULATIONS_KB_INTERNAL_TOKEN / REGULATIONS_LANGFUSE_* / MINERU_API_KEY / BOCHA_API_KEY
+  # Secret 需已存在于同一命名空间；对应值留空表示不注入该项（仍走 ConfigMap 明文）。
+  existingSecret: ""
+  existingSecretKeys:
+    configDecryptKey: "CONFIG_DECRYPT_KEY"
+    jwtSecret: "JWT_SECRET"
+    mysqlPassword: "MYSQL_PASSWORD"
+    redisUrl: "REDIS_URL"
+    langfusePublicKey: "LANGFUSE_PUBLIC_KEY"
+    langfuseSecretKey: "LANGFUSE_SECRET_KEY"
+    opensandboxApiKey: "OPENSANDBOX_API_KEY"
+    kbInternalToken: "REGULATIONS_KB_INTERNAL_TOKEN"
+    regulationsLangfusePublicKey: "REGULATIONS_LANGFUSE_PUBLIC_KEY"
+    regulationsLangfuseSecretKey: "REGULATIONS_LANGFUSE_SECRET_KEY"
+    mineruApiKey: "MINERU_API_KEY"
+    bochaApiKey: "BOCHA_API_KEY"
+
+  # ---- 持久化 ----
+  # 三个目录均需多副本共享，默认走 nfs-client RWX：
+  #   logs         -> LOG_DIR
+  #   sessionFiles -> SESSION_FILES_PERSIST_DIR
+  #   externalSkills -> EXTERNAL_SKILLS_DIR（默认 hostPath，跨命名空间共享）
+  persistence:
+    # 日志目录
+    logs:
+      enabled: true
+      mountPath: "/app/logs"
+      annotations:
+        helm.sh/resource-policy: keep
+      persistentVolumeClaim:
+        existingClaim: ""
+        storageClass: nfs-client
+        accessModes: ReadWriteMany
+        size: 20Gi
+        subPath: ""
+    # 生成文件持久化目录
+    sessionFiles:
+      enabled: true
+      mountPath: "/app/data/session_files"
+      annotations:
+        helm.sh/resource-policy: keep
+      persistentVolumeClaim:
+        existingClaim: ""
+        storageClass: nfs-client
+        accessModes: ReadWriteMany
+        size: 20Gi
+        subPath: ""
+    # 外部技能目录：多副本共享必须开启。
+    # 其它命名空间的服务也要读写同一份技能文件，因此默认走宿主机 SFS（hostPath）挂载，
+    # 而不是 PVC —— 一个 PV 只能被一个 PVC 绑定，PVC 方案无法跨命名空间共用同一份数据。
+    externalSkills:
+      enabled: true
+      ## 挂载方式：
+      ##   hostPath - 直接挂载宿主机上的 SFS 目录（跨命名空间共享，推荐）
+      ##   pvc      - 使用 RWX 存储类的 PVC（仅在单一命名空间内共享时使用）
+      type: hostPath
+      mountPath: "/app/external_skills"
+      hostPath:
+        ## 宿主机上已挂载好的 SFS 根目录，所有命名空间看到的是同一份数据。
+        ## 前置条件：Pod 可调度的节点上都必须存在该目录（当前 nodeSelector group: dify）。
+        path: "/app/dify/sfs"
+        ## DirectoryOrCreate（不存在则自动创建）/ Directory（必须已存在，否则 Pod 起不来）
+        ## / 留空表示不做校验
+        type: DirectoryOrCreate
+        ## SFS 根目录下再套一层子目录，避免与 oia-config 的技能目录混在一起。
+        subPath: "agentscope-external-skills"
+      ## type: pvc 时生效
+      annotations:
+        helm.sh/resource-policy: keep
+      persistentVolumeClaim:
+        existingClaim: ""
+        storageClass: nfs-client
+        accessModes: ReadWriteMany
+        size: 5Gi
+        subPath: ""
+
+## @section 前端（proxy / nginx）参数
+##
+proxy:
+  enabled: true
+  replicas: 2
+  revisionHistoryLimit: 3
+  resources: {}
+  nodeSelector: { group: dify }
+  affinity: {}
+  tolerations: []
+  priorityClassName: ""
+  updateStrategy: {}
+  ## nginx client_max_body_size，需覆盖 UPLOAD_MAX_SIZE_MB
+  clientMaxBodySize: 50m
+  ## /api/ 反代的读超时（秒）：AgentScope 会话/流式响应较慢，适当放宽
+  proxyReadTimeout: 300
+  ## 健康探针路径（由 Chart 生成的 nginx.conf 提供，不依赖后端）
+  livenessProbe:
+    enabled: true
+    path: /nginx-healthz
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+    successThreshold: 1
+  readinessProbe:
+    enabled: true
+    path: /nginx-healthz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+    successThreshold: 1
+  podSecurityContext: {}
+  containerSecurityContext: {}
+  extraEnv: []
+  log:
+    persistence:
+      ## true：日志写入 PVC；false：只输出到 stdout/stderr
+      enabled: true
+      mountPath: "/var/log/nginx"
+      annotations:
+        helm.sh/resource-policy: keep
+      persistentVolumeClaim:
+        existingClaim: ""
+        storageClass: nfs-client
+        accessModes: ReadWriteMany
+        size: 5Gi
+        subPath: ""
+  ## Proxy ServiceAccount 配置
+  serviceAccount:
+    create: false
+    name: ""
+    automountServiceAccountToken: false
+    annotations: {}
+
+## @section 前端 Service（对外入口）
+##
+service:
+  type: NodePort
+  port: 80
+  # oia-admin-local 占用 30100、oia-config-local 占用 30101，这里顺延使用 30102
+  nodePort: 30102
+
+###################################
+# External MySQL
+# - 与 oia-config-local 使用同一套实例；database 为本项目的库名 agentscope
+# - 渲染成 MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE
+###################################
+externalMysql:
+  enabled: true
+  ## .env 原值为 localhost:3307 / root，仅本地可用；
+  ## 这里换成集群可达的实例地址与端口，库名沿用 agentscope（需提前建库）。
+  ## 若该实例不允许 root 远程连接，把 username/password 换成实际账号。
+  host: 25.51.200.24
+  port: 15001
+  username: "root"
+  ## .env 原值为 ENC(...)（由 CONFIG_DECRYPT_KEY 运行时解密）；
+  ## 若集群库密码与本地不同，直接填明文或新的 ENC(...) 值。
+  password: "ENC(pG2zysmmUsEAYFbf8jl1QK2LaI1P28egJ31+YqmCERM=)"
+  database: "agentscope"
+  ## 连接串追加参数（如 charset=utf8mb4），留空则不追加；
+  ## 仅在使用 DATABASE_URL 的应用里生效，本项目按 MYSQL_* 分段注入
+  params: ""
+
+###################################
+# External Redis（会话存储）
+# - 渲染成 REDIS_URL=redis://[:password@]host:port/db
+###################################
+externalRedis:
+  ## 直接指定完整连接串时优先使用，忽略下方分段配置
+  ## 例：redis://:password@host:6379/0
+  url: ""
+  host: "redis.redis.svc.cluster.local"
+  port: 6379
+  db: 0
+  # 密码中的特殊字符会自动做 URL 转义；无密码时留空
+  password: "difyai123456"
+  ## 连接串追加参数（如 "timeout=5"），留空则不追加
+  params: ""
+
+###################################
+# Langfuse（可观测性，密钥属敏感项）
+###################################
+langfuse:
+  baseUrl: "https://us.cloud.langfuse.com"
+  # 建议通过 api.existingSecret 注入，避免密钥随 values 入库
+  publicKey: "pk-lf-2a211ec6-cffc-4b41-9092-930d9ce27af3"
+  secretKey: "sk-lf-db172c06-4a17-4655-a816-6a0ca3b81a7e"

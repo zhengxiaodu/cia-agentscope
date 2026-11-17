@@ -1,0 +1,38 @@
+AgentScope 智能体服务（OIA-AGENTSCOPE）部署完成。
+
+{{- if and .Values.proxy.enabled (eq .Values.service.type "NodePort") }}
+
+1. 访问地址（前端，Nginx 同时反代 /api）:
+   http://<任一节点IP>:{{ .Values.service.nodePort }}
+{{- if and .Values.api.enabled (eq .Values.api.service.type "NodePort") }}
+
+2. 后端 API 直连地址（供其它系统调用，Swagger 在 /docs）:
+   http://<任一节点IP>:{{ .Values.api.service.nodePort }}
+{{- end }}
+
+  查看实际端口:
+   kubectl get svc -n {{ .Release.Namespace }}
+{{- else }}
+
+服务以 {{ .Values.service.type }} 方式暴露，执行下面命令查看地址:
+   kubectl get svc -n {{ .Release.Namespace }}
+{{- end }}
+
+资源清单:
+{{- if .Values.api.enabled }}
+  - 后端 Deployment/Service/ConfigMap : {{ template "oia-agentscope.api.fullname" . }}
+{{- end }}
+{{- if .Values.proxy.enabled }}
+  - 前端 Nginx Deployment/ConfigMap    : {{ .Release.Name }}
+  - 前端 Service                       : {{ .Release.Name }}-svc
+{{- end }}
+
+常用命令:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/instance={{ .Release.Name }},component=api --tail=200
+
+提醒：
+  - 生产环境请设置 api.existingSecret，把 CONFIG_DECRYPT_KEY / JWT_SECRET / MYSQL_PASSWORD /
+    REDIS_URL / LANGFUSE_* / OPENSANDBOX_API_KEY / REGULATIONS_KB_INTERNAL_TOKEN /
+    MINERU_API_KEY / BOCHA_API_KEY 移出 ConfigMap。
+  - 若修改了 api-config ConfigMap，Pod 会因 checksum 注解自动滚动更新。

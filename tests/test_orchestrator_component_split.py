@@ -85,9 +85,10 @@ def _make_service(workspace_manager=None) -> OrchestratorService:
     }
     svc._intent_client = object()
     svc._intent_model_cfg = {"model": "qwen-plus"}
+    svc._explicit_only_agents = set()
+    svc._agent_bound_tools = {}
     svc._workspace_manager = workspace_manager
     svc._create_model_fn = None
-    svc._last_success = True
     return svc
 
 

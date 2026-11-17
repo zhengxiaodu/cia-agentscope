@@ -100,9 +100,25 @@ if orchestrator_service is not None:
 "tokens": real_tokens if real_tokens > 0 else _estimate_tokens(final_output),
 ```
 
-- **user 消息 tokens 保持估算不变**（L243）：input_tokens 已含完整 prompt，本轮 LLM 总消耗记在 assistant 消息上
+- **user 消息 tokens 保持估算不变**：本轮真实 LLM 消耗（输入+输出）统一记在 assistant 消息上，user 行只作为该条用户消息的长度标记
 - 中断路径（chat_service L751-757 finally aborted 落库）自动生效
 - int() + try/except 兜底：MagicMock 测试环境（int(MagicMock) 抛 TypeError）自动回退估算，现有测试不被破坏
+
+**口径说明（重要，避免误读）**：
+
+`messages.tokens` 只有一个数值列，含义按行不同：
+
+| 行 | 含义 | 来源 |
+|----|------|------|
+| assistant | 本轮**所有模型调用**的 `输入+输出` 之和 | 接口 usage 的 `prompt_tokens + completion_tokens`（经 MODEL_CALL_END 累加） |
+| user | 该条用户消息的**长度估算** | 本地 `_estimate_tokens`，**非接口值** |
+
+两点已知局限：
+
+1. 表内**不区分输入/输出**，无法从表里单独取到真实输入 token；
+2. 无模型调用轮次（纯文件轮 `file_only_round`、`orchestrator_service=None`、异常降级）的 assistant 行会**回退文本估算**。
+
+若日后需要分离输入/输出口径，可改为 `user 行 = Σinput_tokens`、`assistant 行 = Σoutput_tokens`（制度问答服务 `policy_qa_service` 已采用该口径）。注意历史数据会新旧口径混存，统计时需留意分界。
 
 ### 3. 测试（新建 tests/test_orchestrator_token_capture.py）
 
@@ -128,7 +144,7 @@ if orchestrator_service is not None:
 1. **改造点 1 零改动**：分享接口已有 files/upload_files 且测试覆盖
 2. **采用用户建议的 SSE 流拦截方案**（相对原 TaskResult 方案少改 2 个文件）：不动 agent_event_tracer.py（无需解耦 langfuse 门控）、不动 base.py（无需 TaskResult 加字段）；单点拦截同时覆盖单 agent + 编排所有模式
 3. **子串快速判断 + type 校验双层过滤**：`"MODEL_CALL_END" in ev` 避免每条事件 json.loads（事件流高频，性能几乎零开销）；误命中由 `payload.get("type") == "MODEL_CALL_END"` 排除
-4. **token 总和记在 assistant 消息**，user 消息保持估算（input_tokens 已含完整 prompt）
+4. **token 总和记在 assistant 消息**，user 消息保持估算（口径与局限见上文「口径说明」）
 5. **意图识别 / 查询改写 / parallel 汇总 / policy_qa 自有 LLM 不经事件流，不被捕捉**（回退估算）——用户要求限定"事件流中的 tokens"，不扩展
 6. **helper 内异常静默容错**：token 统计是旁路功能，绝不影响事件流转发主流程
 7. **重置点在 `_run_with_ws_task` 开头**：两条路径公共入口一次重置，避免上一轮残留

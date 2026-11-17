@@ -11,16 +11,21 @@ from agentscope.tool import FunctionTool
 from agentscope.tool._response import ToolChunk, TextBlock
 
 from app.services.opensandbox_adapter import OpenSandboxToolAdapter
+from app.utils.event_serialization import sanitize_text
 
 logger = logging.getLogger(__name__)
 
 
 def _text_chunk(text: str) -> ToolChunk:
-    """构造文本结果的 ToolChunk。"""
-    return ToolChunk(content=[TextBlock(text=text)])
+    """构造文本结果的 ToolChunk。传入文本先做 JSON 安全清洗——
+    OpenSandbox bash 的 stdout/stderr 可能包含控制字符（null 字节、
+    ANSI 码被 SDK 截断、二进制片段等），若不经清洗直接混入 LLM
+    请求 messages，会触发 Python 3.13 JSON 解析器 "Unterminated string"
+    400 错误，导致整轮对话中断。"""
+    return ToolChunk(content=[TextBlock(text=sanitize_text(text))])
 
 
-def create_opensandbox_tools(adapter: OpenSandboxToolAdapter) -> list:
+def create_opensandbox_tools(adapter: OpenSandboxToolAdapter, checkpoint=None) -> list:
     """创建与 agentscope 内置工具等价的 OpenSandbox FunctionTool 列表。
 
     Args:
@@ -30,6 +35,11 @@ def create_opensandbox_tools(adapter: OpenSandboxToolAdapter) -> list:
         [bash_tool, read_tool, write_tool, edit_tool, glob_tool, grep_tool]
     """
 
+    async def run_writer(operation, *args, **kwargs):
+        if checkpoint is None:
+            return await operation(*args, **kwargs)
+        return await checkpoint.run(operation, *args, **kwargs)
+
     async def opensandbox_bash(command: str, timeout: int = 120000) -> ToolChunk:
         """Executes a bash command in the OpenSandbox sandbox and returns its output.
 
@@ -37,7 +47,7 @@ def create_opensandbox_tools(adapter: OpenSandboxToolAdapter) -> list:
             command: The bash command to execute.
             timeout: Optional timeout in milliseconds (default: 120000).
         """
-        result = await adapter.bash(command, timeout=timeout // 1000)
+        result = await run_writer(adapter.bash, command, timeout=timeout // 1000)
         output_parts = []
         if result["stdout"]:
             output_parts.append(result["stdout"])
@@ -67,13 +77,8 @@ def create_opensandbox_tools(adapter: OpenSandboxToolAdapter) -> list:
             content: The content to write to the file.
         """
         try:
-            # 确保父目录存在
-            # parent = file_path.rsplit("/", 1)[0] if "/" in file_path else "."
-            parent = adapter._workdir
-            await adapter.ensure_dir(parent)
-            filename = file_path.rsplit("/", 1)[1] if "/" in file_path else file_path
-            file_path = parent + "/" + filename
-            await adapter.write(file_path, content)
+            file_path = await adapter.workspace_file_target(file_path, create_parent=True)
+            await run_writer(adapter.write, file_path, content)
             return _text_chunk(f"Successfully wrote to {file_path}")
         except Exception as e:
             return _text_chunk(f"Error writing file: {e}")
@@ -87,10 +92,8 @@ def create_opensandbox_tools(adapter: OpenSandboxToolAdapter) -> list:
             new_text: The replacement text.
         """
         try:
-            parent = adapter._workdir
-            filename = file_path.rsplit("/", 1)[1] if "/" in file_path else file_path
-            file_path = parent + "/" + filename
-            await adapter.edit(file_path, old_text, new_text)
+            file_path = await adapter.workspace_file_target(file_path)
+            await run_writer(adapter.edit, file_path, old_text, new_text)
             return _text_chunk(f"Successfully edited {file_path}")
         except Exception as e:
             return _text_chunk(f"Error editing file: {e}")

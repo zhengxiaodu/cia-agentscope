@@ -1,5 +1,11 @@
 """pytest 公共配置。"""
+import os
+import secrets
+
 import pytest
+
+# 测试进程使用临时签名密钥，子进程继承同一值。
+os.environ.setdefault("JWT_SECRET", secrets.token_hex(32))
 
 # pytest-asyncio 配置：自动为 async test 添加 event loop
 pytest_plugins = ("pytest_asyncio",)

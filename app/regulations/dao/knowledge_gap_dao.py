@@ -112,23 +112,32 @@ class KnowledgeGapDAO:
         self,
         gap_ids: list[str] | None = None,
         kb_id: str | None = None,
+        allowed_kb_ids: list[str] | None = None,
     ) -> int:
         """把 open 缺口置为 resolved，返回影响行数。
 
         gap_ids 提供时按 gap_id IN (...) 批量关闭；否则按 kb_id
         关闭该库全部 open 缺口；两者均未提供时不做任何操作。
+
+        安全：allowed_kb_ids 提供时，gap_ids 分支强制附加
+        kb_id IN (allowed_kb_ids) 归属约束，防止跨库闭合他人缺口。
         """
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 if gap_ids:
                     placeholders = ", ".join(["%s"] * len(gap_ids))
-                    await cur.execute(
+                    sql = (
                         "UPDATE knowledge_gaps "
                         "SET status = 'resolved', resolved_at = NOW(), "
                         "updated_at = NOW() "
-                        f"WHERE status = 'open' AND gap_id IN ({placeholders})",
-                        tuple(gap_ids),
+                        f"WHERE status = 'open' AND gap_id IN ({placeholders})"
                     )
+                    params = list(gap_ids)
+                    if allowed_kb_ids:
+                        kb_placeholders = ", ".join(["%s"] * len(allowed_kb_ids))
+                        sql += f" AND kb_id IN ({kb_placeholders})"
+                        params.extend(allowed_kb_ids)
+                    await cur.execute(sql, tuple(params))
                 elif kb_id is not None:
                     await cur.execute(
                         "UPDATE knowledge_gaps "

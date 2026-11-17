@@ -56,6 +56,17 @@ async def lifespan(app: FastAPI):
     model_config = load_model_config(MODEL_CONFIG_PATH)
     app.state.model_config = model_config
 
+    # ---- Redis（多副本共享沙箱映射，保留用于其他需求） ----
+    # 需在 workspace_manager 之前初始化：manager 依赖它做用户→沙箱映射共享
+    redis_client = aioredis.from_url(
+        REDIS_URL,
+        decode_responses=False,
+    )
+    app.state.redis_client = redis_client
+    from app.services.feedback_service import configure_feedback
+    configure_feedback(redis_client)
+    logger.info("Redis client initialized (%s)", REDIS_URL)
+
     # ---- 工作区管理器（OpenSandbox，唯一后端） ----
     from datetime import timedelta
     from opensandbox.config import ConnectionConfig
@@ -77,6 +88,7 @@ async def lifespan(app: FastAPI):
         ready_timeout=timedelta(seconds=120),
         pool_size=OPENSANDBOX_POOL_SIZE,
         pool_refill=OPENSANDBOX_POOL_REFILL,
+        redis_client=redis_client,
     )
     logger.info(
         "Workspace manager initialized [opensandbox] "
@@ -92,14 +104,6 @@ async def lifespan(app: FastAPI):
         model_config, workspace_manager
     )
     logger.info("Orchestrator service initialized (multi-agent + multi-intent)")
-
-    # ---- Redis（保留，用于其他需求） ----
-    redis_client = aioredis.from_url(
-        REDIS_URL,
-        decode_responses=False,
-    )
-    app.state.redis_client = redis_client
-    logger.info("Redis client initialized (%s)", REDIS_URL)
 
     # ---- MySQL 连接池（会话持久化） ----
     mysql_pool = await aiomysql.create_pool(
@@ -160,8 +164,8 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Langfuse service disabled (credentials not configured)")
 
-    # 会话取消标志注册表：session_id → asyncio.Event（/chat/stop 触发 set，生成器检测后中断）
-    app.state.chat_tasks: dict[str, asyncio.Event] = {}
+    # 当前 Pod 的会话运行注册表；跨 Pod 互斥与停止由 Redis 协调。
+    app.state.chat_tasks: dict = {}  # session_id -> 本 Pod 持有的 ChatRun
 
     yield
 
@@ -172,7 +176,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Regulations KB client close failed", exc_info=True)
 
-    # 关闭工作区管理器（停清扫 + 销毁全部容器）
+    # Redis 共享沙箱不能随某个后端 Pod 退出而销毁；只关闭本地连接。
     await workspace_manager.stop_sweeper()
     await workspace_manager.close_all()
     logger.info("Workspace manager closed")

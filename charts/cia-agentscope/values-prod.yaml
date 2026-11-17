@@ -1,0 +1,120 @@
+# 生产环境示例 values
+# 用法: helm upgrade --install oia-agentscope . -n oia -f values.yaml -f values-prod.yaml
+#
+# 与通用版 oia-config 的差异：本文件只覆盖"上线部署"需要调整的部分，
+# 镜像仓库、拉取密钥、nodeSelector、存储类等集群约定已在 values.yaml 中固化。
+# 应用运行时变量（JWT / OpenSandbox / 制度问答 / MinerU / 博查 等）沿用 values.yaml
+# 中从应用 .env 拆解的默认值，这里只列出生产环境通常要改的项。
+
+image:
+  api:
+    tag: 1.0.0
+    pullPolicy: IfNotPresent
+  proxy:
+    tag: 1.0.0
+    pullPolicy: IfNotPresent
+
+api:
+  replicas: 2
+
+  # ---- 生产环境建议覆盖的运行时配置 ----
+  # 登录校验接真实系统（values.yaml 默认 AUTH_MOCK=true 走模拟数据）
+  auth:
+    mock: false
+    apiUrl: "https://example.com/api/auth/verify"
+  log:
+    level: "INFO"
+  # 预热池：生产可提前创建空闲沙箱，降低首次请求延迟（0=不启用）
+  opensandbox:
+    poolSize: 0
+
+  # 敏感项全部走集群中已存在的 Secret，避免明文入库
+  # kubectl -n oia create secret generic oia-agentscope-secret \
+  #   --from-literal=CONFIG_DECRYPT_KEY='<加密主密钥>' \
+  #   --from-literal=JWT_SECRET='ENC(...)' \
+  #   --from-literal=MYSQL_PASSWORD='ENC(...)' \
+  #   --from-literal=REDIS_URL='redis://:password@host:6379/0' \
+  #   --from-literal=LANGFUSE_PUBLIC_KEY='pk-lf-xxx' \
+  #   --from-literal=LANGFUSE_SECRET_KEY='sk-lf-xxx' \
+  #   --from-literal=OPENSANDBOX_API_KEY='<沙箱密钥>' \
+  #   --from-literal=MINERU_API_KEY='<MinerU 密钥>' \
+  #   --from-literal=BOCHA_API_KEY='<博查密钥>'
+  existingSecret: "oia-agentscope-secret"
+  existingSecretKeys:
+    configDecryptKey: "CONFIG_DECRYPT_KEY"
+    jwtSecret: "JWT_SECRET"
+    mysqlPassword: "MYSQL_PASSWORD"
+    redisUrl: "REDIS_URL"
+    langfusePublicKey: "LANGFUSE_PUBLIC_KEY"
+    langfuseSecretKey: "LANGFUSE_SECRET_KEY"
+    opensandboxApiKey: "OPENSANDBOX_API_KEY"
+    kbInternalToken: ""
+    regulationsLangfusePublicKey: ""
+    regulationsLangfuseSecretKey: ""
+    mineruApiKey: "MINERU_API_KEY"
+    bochaApiKey: "BOCHA_API_KEY"
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+  persistence:
+    logs:
+      persistentVolumeClaim:
+        size: 50Gi
+    sessionFiles:
+      persistentVolumeClaim:
+        size: 50Gi
+    # 外部技能目录走宿主机 SFS，供其它命名空间的服务共同读写
+    externalSkills:
+      enabled: true
+      type: hostPath
+      hostPath:
+        path: "/app/dify/sfs"
+        type: DirectoryOrCreate
+        subPath: "agentscope-external-skills"
+      # 若确实要在单一命名空间内用 PVC，改为 type: pvc 并配置下面这段
+      # type: pvc
+      # persistentVolumeClaim:
+      #   storageClass: nfs-client
+      #   accessModes: ReadWriteMany
+      #   size: 10Gi
+
+  service:
+    type: NodePort
+    nodePort: 30713
+
+proxy:
+  replicas: 2
+  clientMaxBodySize: 50m
+  proxyReadTimeout: 300
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+service:
+  type: NodePort
+  nodePort: 30102
+
+# 生产库：与 oia-config 同一实例，库名 agentscope
+externalMysql:
+  host: 25.51.200.24
+  port: 15001
+  username: "root"
+  password: "ENC(pG2zysmmUsEAYFbf8jl1QK2LaI1P28egJ31+YqmCERM=)"
+  database: "agentscope"
+
+externalRedis:
+  url: ""
+  host: "redis.redis.svc.cluster.local"
+  port: 6379
+  db: 0
+  password: "difyai123456"

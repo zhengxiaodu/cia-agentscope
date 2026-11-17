@@ -2,9 +2,11 @@
 
 无现成 routes 层测试基建（test_upload_query.py 自建最小 app），沿用其做法：
 最小 FastAPI app 仅挂被测路由，override current_user 依赖，monkeypatch
-app.routes.files.SESSION_FILES_PERSIST_DIR 为 tmp_path。
+app.routes.files.SESSION_FILES_PERSIST_DIR 为 tmp_path，app.state 挂 mock
+session_service（属主校验默认放行）。
 覆盖：200 下载（含中文文件名 RFC 5987 编码与子目录路径）、404、403 穿越
-（path 含 .. / session_id 为 ..）、503 未配置、mode=inline 文本预览。
+（path 含 .. / session_id 为 ..）、403 非属主/已删除/会话不存在、
+503 未配置、mode=inline 文本预览。
 """
 from urllib.parse import quote
 
@@ -16,10 +18,24 @@ import app.routes.files as files_route
 from app.dependencies import current_user
 
 
-def _make_app() -> FastAPI:
+class _StubSessionService:
+    """属主校验桩：accessible 集合外的 session 一律 403。"""
+
+    def __init__(self, accessible=None, users=("u1",)):
+        self.accessible = {"s1", "s2"} if accessible is None else set(accessible)
+        self.users = set(users)
+        self.calls = []
+
+    async def session_files_accessible(self, session_id, user_id):
+        self.calls.append((session_id, user_id))
+        return session_id in self.accessible and user_id in self.users
+
+
+def _make_app(session_service=None) -> FastAPI:
     app = FastAPI()
     app.include_router(files_route.router)
     app.dependency_overrides[current_user] = lambda: {"user_id": "u1"}
+    app.state.session_service = session_service or _StubSessionService()
     return app
 
 
@@ -147,3 +163,66 @@ def test_download_default_mode_is_attachment(client, tmp_path, monkeypatch):
 
     assert resp.status_code == 200
     assert resp.headers["content-disposition"].startswith("attachment;")
+
+
+# ---------------------------------------------------------------------------
+# 403：属主校验（P1-1）
+# ---------------------------------------------------------------------------
+
+def test_download_403_when_not_session_owner(tmp_path, monkeypatch):
+    """登录用户访问他人会话文件 → 403（校验先于文件存在性判断）。"""
+    monkeypatch.setattr(files_route, "SESSION_FILES_PERSIST_DIR", str(tmp_path))
+    stub = _StubSessionService(accessible=set())  # 任何会话都判非属主
+    client = TestClient(_make_app(stub))
+    # 预置他人文件，证明 403 先于任何文件读取
+    target = tmp_path / "s1" / "secret.txt"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"secret")
+
+    resp = client.get("/persist-files/s1/secret.txt")
+
+    assert resp.status_code == 403
+    assert stub.calls == [("s1", "u1")]
+
+
+def test_download_403_when_session_service_missing(tmp_path, monkeypatch):
+    """app.state 未挂 session_service（配置异常）→ 403 拒绝而非放行。"""
+    monkeypatch.setattr(files_route, "SESSION_FILES_PERSIST_DIR", str(tmp_path))
+    client = TestClient(_make_app(session_service=None))
+    app = client.app
+    if hasattr(app.state, "session_service"):
+        del app.state.session_service  # 模拟未初始化
+
+    resp = client.get("/persist-files/s1/a.txt")
+
+    assert resp.status_code == 403
+
+
+def test_download_403_takes_precedence_over_404(tmp_path, monkeypatch):
+    """属主不匹配时即使文件存在也 403，且不泄露会话是否存在。"""
+    monkeypatch.setattr(files_route, "SESSION_FILES_PERSIST_DIR", str(tmp_path))
+    stub = _StubSessionService(accessible={"s2"})  # s1 不属于 u1
+    client = TestClient(_make_app(stub))
+    target = tmp_path / "s1" / "exists.txt"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x")
+
+    resp = client.get("/persist-files/s1/exists.txt")
+
+    assert resp.status_code == 403
+
+
+def test_download_200_after_ownership_check(tmp_path, monkeypatch):
+    """属主校验通过后正常下载（校验参数含当前用户）。"""
+    monkeypatch.setattr(files_route, "SESSION_FILES_PERSIST_DIR", str(tmp_path))
+    stub = _StubSessionService(accessible={"s1"})
+    client = TestClient(_make_app(stub))
+    target = tmp_path / "s1" / "mine.txt"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"ok")
+
+    resp = client.get("/persist-files/s1/mine.txt")
+
+    assert resp.status_code == 200
+    assert resp.content == b"ok"
+    assert stub.calls == [("s1", "u1")]

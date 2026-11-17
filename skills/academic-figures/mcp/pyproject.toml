@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "academic-figures-mcp"
+version = "1.0.0"
+description = "academic-figures MCP server — 23 publication-grade academic chart types via FastMCP (local render, deterministic, zero-key)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "SorSor" }]
+dependencies = [
+    "matplotlib>=3.5",
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "pymupdf>=1.20",
+    "fastmcp>=2.0",
+]
+
+[project.scripts]
+academic-figures-mcp = "server:main"
+
+[tool.setuptools]
+py-modules = ["server"]
+packages = ["af_engine"]
+
+[tool.setuptools.package-data]
+af_engine = ["journal/*.json", "changelog.md"]

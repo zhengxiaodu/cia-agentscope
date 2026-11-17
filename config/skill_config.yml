@@ -1,16 +1,31 @@
 skills:
   - name: bocha_search
     directory: ./skills/bocha_search
-    description: "使用博查搜索引擎获取网上的知识和最新信息。适用于查询新闻、科技资讯、天气预报、股票行情等需要实时数据的场景。"
+    description: '使用博查搜索引擎获取网上的知识和最新信息。适用于查询新闻、科技资讯、天气预报、股票行情等需要实时数据的场景。'
   - name: chart_renderer
     directory: ./skills/chart_renderer
-    description: "智能图表渲染技能，根据数据特征自动选择最合适的图表类型并通过工具渲染。"
+    description: '智能图表渲染技能，根据数据特征自动选择最合适的图表类型并通过工具渲染。'
   - name: card_interaction
     directory: ./skills/card_interaction
-    description: "个性化交互卡片技能，用于展示需要用户交互的个性化卡片组件。"
+    description: '个性化交互卡片技能，用于展示需要用户交互的个性化卡片组件。'
   - name: policy_qa
     directory: ./skills/policy_qa
-    description: "根据公司内部制度文件知识库回答问题"
+    description: '根据公司内部制度文件知识库回答问题'
   - name: feedback_confirm
     directory: ./skills/feedback_confirm
-    description: "二选一确认卡片技能：渲染 feedback_confirm 交互卡片并暂停等待用户选择，收到反馈后同轮继续处理。"
+    description: '二选一确认卡片技能：渲染 feedback_confirm 交互卡片并暂停等待用户选择，收到反馈后同轮继续处理。'
+  - name: excel-xlsx
+    directory: ./skills/excel-xlsx
+    description: 'Excel/XLSX 工作簿处理：创建、检查、编辑表格文件，保障公式、日期、类型与格式可靠。'
+  - name: word-docx
+    directory: ./skills/word-docx
+    description: 'Word/DOCX 文档处理：创建、检查、编辑 Word 文档，保障样式、编号、修订与版式不漂移。'
+  - name: smart-charts
+    directory: ./skills/smart-charts
+    description: '智能交互图表：由数据文件生成可交互的 ECharts 图表 HTML（含中国/世界地图、词云），完全离线。'
+  - name: unclecheng-reduce-ai-perception
+    directory: ./skills/unclecheng-reduce-ai-perception
+    description: '去 AI 味润色：降低文本的 AI 生成痕迹，使用词、句式、结构更接近真人表达。'
+  - name: ydxc0511
+    directory: ./skills/ydxc0511
+    description: '公文材料写作：发言稿、心得体会、宣传通讯等机关材料写作模板与范文参考。'

@@ -1,0 +1,42 @@
+# 沙箱镜像离线安装锁定清单
+# 由 wheels/ 目录内实际 wheel 文件名生成；同名包只保留最高版本
+#（目录里同时存在 manylinux2014 与 manylinux_2_28 两套 glibc 变体，
+#  python:3.13-slim 为 Debian trixie / glibc 2.41，装新版即可）
+#
+# 覆盖：
+#   - requirements.txt 声明的 8 个技能直接依赖
+#   - pyyaml：smart-charts 代码实际 import yaml，其 requirements.txt 漏声明
+#   - onnxruntime / networkx / psutil / tabulate：下载目录自带，一并装入
+#   - 全部传递依赖（matplotlib / pandas / onnxruntime 所需）
+
+contourpy==1.4.0
+cycler==0.12.1
+et-xmlfile==2.0.0
+flatbuffers==25.12.19
+fonttools==4.67.0
+kiwisolver==1.5.1
+lxml==6.1.3
+matplotlib==3.11.2
+networkx==3.7
+numpy==2.5.4
+onnxruntime==1.31.1
+openpyxl==3.1.5
+packaging==26.3
+pandas==3.1.0
+pillow==13.0.0
+protobuf==7.36.2
+psutil==7.2.2
+pymupdf==2.0
+pymupdf4llm==2.0
+pymupdf-layout==2.0
+pyparsing==3.3.3
+python-dateutil==3.0.0
+python-docx==1.2.0
+pytz==2026.5
+pyyaml==6.0.3
+scipy==1.18.1
+six==1.17.0
+tabulate==0.10.0
+typing-extensions==4.16.0
+tzdata==2026.5
+xlrd==2.0.2

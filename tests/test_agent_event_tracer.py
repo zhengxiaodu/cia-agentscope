@@ -210,3 +210,19 @@ def test_bocha_sum_and_citations_coexist_in_same_metadata(monkeypatch):
     assert t.consume_citations() == cites
     assert t.consume_bocha_sum() == []
     assert t.consume_citations() == []
+
+
+def test_bocha_sum_same_url_not_deduplicated_across_events(monkeypatch):
+    """同一 URL 的 bocha_sum 经两个 ToolResultEndEvent 到达：原样拼接累积
+    （不去重，URL 去重与编号由工具侧请求级来源表统一负责）。"""
+    import app.utils.agent_event_tracer as m
+    monkeypatch.setattr(m, "ToolResultEndEvent", FakeToolEnd)
+    t, _ = _tracer()
+    entry1 = {"name": "标题", "url": "https://example.com/same",
+              "summary": "摘要", "citation_id": 1}
+    entry2 = dict(entry1)  # 同 URL 同编号的快照副本（另一事件携带）
+    t.on_event(FakeToolEnd("c1", "ok", metadata={"bocha_sum": [entry1]}))
+    t.on_event(FakeToolEnd("c2", "ok", metadata={"bocha_sum": [entry2]}))
+    consumed = t.consume_bocha_sum()
+    assert consumed == [entry1, entry2]  # 两次事件的条目均保留、按序拼接
+    assert len(consumed) == 2

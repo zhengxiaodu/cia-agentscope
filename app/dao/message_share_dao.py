@@ -77,6 +77,7 @@ class MessageShareDAO:
                         "SELECT content FROM messages "
                         f"WHERE user_id = %s AND session_id = %s "
                         f"AND message_pair_id IN ({placeholders}) "
+                        "AND deleted_at IS NULL "
                         "AND role = 'user' ORDER BY id ASC LIMIT 1",
                         [user_id, session_id] + list(message_pair_ids),
                     )

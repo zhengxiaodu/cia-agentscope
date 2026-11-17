@@ -1,5 +1,5 @@
 """智能体定义数据结构。"""
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -17,3 +17,7 @@ class AgentDefinition(BaseModel):
     name: str
     skills: List[str] = Field(default_factory=list)
     system_prompt: str = ""
+    # mng 下发的 MCP 客户端配置（agent_access 项的 mcpClientConfig 原样透传：
+    # authorization/code/query_params/transport_type/transport_url），
+    # None 表示该智能体无 MCP
+    mcp_client_config: Optional[dict] = None

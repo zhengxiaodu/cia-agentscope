@@ -1,8 +1,10 @@
-version: "3.8"
-
 services:
   app:
-    build: .
+    image: ${APP_IMAGE:-registry.ccdc.cn:5000/cia-agentscope:latest}
+    build:
+      context: .
+      args:
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-registry.ccdc.cn:5000/python:3.13-slim}
     ports:
       - "7010:7010"
     env_file:
@@ -21,7 +23,7 @@ services:
     restart: unless-stopped
 
   mysql:
-    image: mysql:8.0
+    image: ${MYSQL_IMAGE:-registry.ccdc.cn:5000/mysql:8.0}
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-zxdzxd.123}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-agentscope}
@@ -37,7 +39,7 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: ${REDIS_IMAGE:-registry.ccdc.cn:5000/redis:7-alpine}
     ports:
       - "6379:6379"
     volumes:

@@ -1,21 +1,30 @@
-# ---- 构建阶段 ----
-FROM python:3.13-slim AS builder
+ARG PYTHON_BASE_IMAGE=registry.ccdc.cn:5000/python:3.13-slim
+
+# ---- 构建阶段：仅使用随项目分发的离线 wheel ----
+FROM ${PYTHON_BASE_IMAGE} AS builder
 
 WORKDIR /build
 
-# 先拷贝依赖文件，利用 Docker 缓存层
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt -t /build/deps
+COPY offline-bundle/manifests/requirements-resolved.txt ./requirements-resolved.txt
+COPY offline-bundle/python/wheels/ /opt/offline-wheels/
+
+RUN python -m pip install \
+        --no-cache-dir \
+        --no-index \
+        --find-links=/opt/offline-wheels \
+        --requirement requirements-resolved.txt \
+        --target /build/deps
 
 # ---- 运行阶段 ----
-FROM python:3.13-slim
+FROM ${PYTHON_BASE_IMAGE}
 
 LABEL maintainer="zhengxiaodu"
 
-# 安装运行时系统依赖（Docker 客户端等）
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends docker.io && \
-    rm -rf /var/lib/apt/lists/*
+# Debian 13 (trixie) / amd64 的 docker.io、docker-cli 及递归运行依赖。
+# dpkg 一次性解包并配置全部本地文件，构建期间不会访问 Debian 软件源。
+COPY offline-bundle/apt/debs/ /opt/offline-debs/
+RUN DEBIAN_FRONTEND=noninteractive dpkg -i /opt/offline-debs/*.deb && \
+    rm -rf /opt/offline-debs /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -32,9 +41,7 @@ COPY scripts/ ./scripts/
 # 创建工作区目录
 RUN mkdir -p /data/docker-workspaces
 
-# 暴露端口
 EXPOSE 7010
 
 # .env 通过 --env-file 或 volume 挂载注入，不打入镜像
-# 启动命令
 CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7010"]

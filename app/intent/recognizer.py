@@ -86,19 +86,25 @@ class IntentRecognizer:
         self,
         user_input: str,
         history: Optional[List[dict]] = None,
+        file_context: Optional[str] = None,
     ) -> Tuple[List[Intent], dict]:
         """第一次 LLM 调用：识别 intents 列表（不决策关系）。
 
         Args:
             user_input: 用户输入（已改写或原始）
             history: 历史对话上下文
+            file_context: 本轮上传文件清单提示（可选）。给定后拼入 prompt，
+                约束子 query 的文件指代只能用本轮清单中的文件名，防止
+                LLM 从历史上下文脑补旧文件名（如"润色下<上轮失败文件>"）。
 
         Returns:
             (识别出的意图列表, {"system_prompt": ..., "user_prompt": ...})；
             失败降级为 (单条 general_chat, {})。
         """
         try:
-            raw_json, prompts = await self._call_recognition_llm(user_input, history)
+            raw_json, prompts = await self._call_recognition_llm(
+                user_input, history, file_context
+            )
             return self._parse_intents(raw_json, user_input), prompts
         except Exception:
             logger.exception("[IntentRecognizer] 意图识别失败，降级为 general_chat")
@@ -106,8 +112,13 @@ class IntentRecognizer:
                 Intent(id="general_chat", query=user_input, agent="general_agent")
             ], {}
 
-    def _build_recognition_prompt(self, user_input: str, history: Optional[List[dict]]) -> str:
-        """拼接意图识别 prompt（填 {{intents}} + 历史上下文 + 用户输入）。"""
+    def _build_recognition_prompt(
+        self,
+        user_input: str,
+        history: Optional[List[dict]],
+        file_context: Optional[str] = None,
+    ) -> str:
+        """拼接意图识别 prompt（填 {{intents}} + 历史上下文 + 文件清单 + 用户输入）。"""
         prompt = self._recognition_prompt.replace("{{intents}}", self._intents_desc)
 
         user_msg = f"【用户输入】\n{user_input}"
@@ -117,13 +128,19 @@ class IntentRecognizer:
                 [f"  {m.get('role', 'user')}: {m.get('content', '')}" for m in recent]
             )
             user_msg = f"【历史上下文】\n{context_str}\n\n{user_msg}"
-
+        if file_context:
+            user_msg = f"{file_context}\n\n{user_msg}"
         return prompt + user_msg
 
-    async def _call_recognition_llm(self, user_input: str, history: Optional[List[dict]]) -> Tuple[dict, dict]:
+    async def _call_recognition_llm(
+        self,
+        user_input: str,
+        history: Optional[List[dict]],
+        file_context: Optional[str] = None,
+    ) -> Tuple[dict, dict]:
         """调用 LLM 识别 intents，返回解析后的 JSON dict 和提示词。"""
         system_prompt = "你是一个严格输出 JSON 的意图识别引擎，不要输出任何非 JSON 内容。"
-        user_prompt = self._build_recognition_prompt(user_input, history)
+        user_prompt = self._build_recognition_prompt(user_input, history, file_context)
         raw_text = await chat_complete(
             self._client,
             self._model_config,

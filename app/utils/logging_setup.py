@@ -49,6 +49,19 @@ class TraceJsonFormatter(logging.Formatter):
             return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+class CrossContextDetachFilter(logging.Filter):
+    """仅过滤 OTel 已捕获的跨 Context detach 错误，保留其他 ERROR。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "opentelemetry.context" or record.getMessage() != "Failed to detach context":
+            return True
+        exc = record.exc_info[1] if record.exc_info else None
+        return not (
+            isinstance(exc, ValueError)
+            and "was created in a different Context" in str(exc)
+        )
+
+
 def setup_logging() -> None:
     """在 lifespan 最开始调用。控制台保留可读文本，文件输出 JSON。"""
     level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
@@ -77,5 +90,10 @@ def setup_logging() -> None:
     except Exception:
         root.warning("JSON 日志文件初始化失败，仅保留控制台输出", exc_info=True)
 
-    for noisy in ("httpx", "httpcore", "urllib3", "docker"):
+    # WARNING 不会屏蔽 ERROR。OTel 在 detach 内捕获后自行记日志，外层
+    # except 无法拦截该日志；仅精确过滤已知跨 Context 错误作为兜底。
+    otel_logger = logging.getLogger("opentelemetry.context")
+    if not any(isinstance(f, CrossContextDetachFilter) for f in otel_logger.filters):
+        otel_logger.addFilter(CrossContextDetachFilter())
+    for noisy in ("httpx", "httpcore", "urllib3", "docker", "opentelemetry.context"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

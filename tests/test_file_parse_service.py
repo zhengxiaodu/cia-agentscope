@@ -63,11 +63,17 @@ class _FakeClient:
 
     async def post(self, url, **kwargs):
         self.post_calls.append((url, kwargs))
-        return self._posts.pop(0)
+        response = self._posts.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
     async def get(self, url, **kwargs):
         self.get_calls.append((url, kwargs))
-        return self._gets.pop(0)
+        response = self._gets.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 @pytest.fixture(autouse=True)
@@ -95,6 +101,64 @@ async def test_mineru_success():
     assert kwargs["files"]["file"][0] == "a.pdf"
     assert kwargs["files"]["file"][1] == b"fake-pdf"
     assert kwargs["data"]["output_formats"] == "md"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disconnects", [1, 2, 3])
+async def test_mineru_poll_disconnect_retries_same_task_with_limit(monkeypatch, disconnects):
+    """查询偶发断连可恢复；连续三次断连停止，不能重新提交文件。"""
+    disconnected = httpx.RemoteProtocolError("Server disconnected without sending a response")
+    completed = _FakeResponse(200, {
+        "status": "completed", "result": {"md_content": "# recovered"},
+    })
+    client = _FakeClient(
+        [_FakeResponse(201, {"id": "task-1"})],
+        [disconnected] * disconnects + [completed],
+    )
+    monkeypatch.setattr(fps.asyncio, "sleep", AsyncMock())
+    with patch.object(fps.httpx, "AsyncClient", return_value=client):
+        result = await fps.parse_document_with_mineru(b"x", "a.pdf")
+    if disconnects < 3:
+        assert result == "# recovered"
+    else:
+        assert result.startswith("解析失败")
+        assert "Server disconnected" in result
+    assert len(client.post_calls) == 1
+    assert len(client.get_calls) == min(disconnects + 1, 3)
+    assert all(url == "http://mineru.example/tasks/task-1/result" for url, _ in client.get_calls)
+
+
+@pytest.mark.asyncio
+async def test_mineru_poll_retry_respects_poll_budget(monkeypatch):
+    client = _FakeClient(
+        [_FakeResponse(201, {"id": "task-1"})],
+        [httpx.RemoteProtocolError("disconnected")],
+    )
+    monkeypatch.setattr(fps, "UPLOAD_PARSE_TIMEOUT", 2)
+    monkeypatch.setattr(fps.asyncio, "sleep", AsyncMock())
+    with patch.object(fps.httpx, "AsyncClient", return_value=client):
+        result = await fps.parse_document_with_mineru(b"x", "a.pdf")
+    assert result == fps._MINERU_TIMEOUT_MSG
+    assert len(client.get_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_mineru_submit_disconnect_not_retried():
+    client = _FakeClient([httpx.RemoteProtocolError("disconnected")], [])
+    with patch.object(fps.httpx, "AsyncClient", return_value=client):
+        result = await fps.parse_document_with_mineru(b"x", "a.pdf")
+    assert result.startswith("解析失败")
+    assert len(client.post_calls) == 1
+    assert not client.get_calls
+
+
+@pytest.mark.asyncio
+async def test_mineru_poll_http_failure_not_retried():
+    client = _FakeClient([_FakeResponse(201, {"id": "task-1"})], [_FakeResponse(401)])
+    with patch.object(fps.httpx, "AsyncClient", return_value=client):
+        result = await fps.parse_document_with_mineru(b"x", "a.pdf")
+    assert "HTTP 401" in result
+    assert len(client.get_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -153,18 +217,22 @@ async def test_transcribe_audio_success(monkeypatch):
     monkeypatch.setattr(
         "app.services.chat_service.load_model_config", lambda path=None: cfg
     )
-    resp = _FakeResponse(200, {"text": "测试语音"})
+    resp = _FakeResponse(
+        200, {"choices": [{"message": {"role": "assistant", "content": "测试语音"}}]}
+    )
     client = _FakeClient([resp], [])
     with patch.object(fps.httpx, "AsyncClient", return_value=client):
-        result = await fps.transcribe_audio(b"fake-audio", "t.m4a")
+        result = await fps.transcribe_audio(b"fake-audio", "t.m4a", 7)
     assert result == "测试语音"
     url, kwargs = client.post_calls[0]
-    assert url == "http://asr.example/v1/audio/transcriptions"
+    assert url == "http://asr.example/v1/chat/completions"
     assert kwargs["headers"]["Authorization"] == "Bearer sk-test"
-    assert kwargs["data"]["model"] == "Qwen3-ASR-1.7B"
-    assert kwargs["data"]["prompt"] == "解析音频"
-    assert kwargs["data"]["language"] == "zh"
-    assert kwargs["files"]["file"][0] == "t.m4a"
+    assert kwargs["headers"]["app_serial_number"] == "OIA-AGENTSCOPE-UPLOAD-7"
+    body = kwargs["json"]
+    assert body["model"] == "Qwen3-ASR-1.7B"
+    part = body["messages"][0]["content"][0]
+    assert part["type"] == "audio_url"
+    assert part["audio_url"]["url"].startswith("data:audio/mp4;base64,")
 
 
 @pytest.mark.asyncio

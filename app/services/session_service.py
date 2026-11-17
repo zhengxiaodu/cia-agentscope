@@ -1,8 +1,10 @@
 import logging
+import re
 import uuid
 from typing import List, Optional
 
 from agentscope.state import AgentState
+from fastapi import HTTPException
 
 from app.models.session import (
     SessionMeta,
@@ -13,6 +15,10 @@ from app.models.session import (
 )
 
 logger = logging.getLogger(__name__)
+
+# session_id 入口格式约束：宽松字符集兼容历史 ID，同时阻断
+# 路径穿越（/ \ ..）与 shell 注入元字符
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 class SessionService:
@@ -29,10 +35,35 @@ class SessionService:
         self.upload_file_dao = upload_file_dao
 
     async def get_or_create_session(self, session_id: Optional[str], user_id: str) -> str:
-        """获取已有 session_id 或创建新会话。"""
-        if session_id:
-            return session_id
-        return uuid.uuid4().hex
+        """获取已有 session_id 或创建新会话。
+
+        安全：入口校验 session_id 格式（防路径穿越/注入）；已存在时校验归属，
+        非本人会话 → 403；已删除会话 → 403，防止通过他人会话 ID 加载/污染其对话历史。
+        """
+        if session_id and not _SESSION_ID_RE.fullmatch(session_id):
+            logger.warning(f"[session] session_id 格式非法拒绝: {session_id!r}")
+            raise HTTPException(status_code=400, detail="session_id 格式非法")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="缺少用户身份")
+        session_id = session_id or uuid.uuid4().hex
+        try:
+            owner_status = await self.dao.reserve_session(session_id, str(user_id))
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail="无权访问该会话") from exc
+        if not owner_status or str(owner_status.get("user_id") or "") != str(user_id):
+            raise HTTPException(status_code=403, detail="无权访问该会话")
+        if owner_status.get("deleted_at") is not None:
+            raise HTTPException(status_code=403, detail="会话已删除")
+        return session_id
+
+    async def session_files_accessible(self, session_id: str, user_id: str) -> bool:
+        """持久化文件下载授权：会话存在、属主匹配且未软删。"""
+        owner_status = await self.dao.get_session_owner_status(session_id)
+        return bool(
+            owner_status
+            and owner_status.get("deleted_at") is None
+            and str(owner_status.get("user_id") or "") == str(user_id)
+        )
 
     async def load_agent_state(self, session_id: str, agent_id: str = "general_agent") -> Optional[dict]:
         """从 PostgreSQL 加载 AgentState 原始数据。"""
@@ -55,15 +86,21 @@ class SessionService:
         return await self.dao.load_messages(session_id)
 
     async def append_messages(
-        self, session_id: str, user_id: str, messages: list[dict]
+        self, session_id: str, user_id: str, messages: list[dict],
+        name_hint: str = "",
     ) -> Optional[dict]:
         """向会话历史追加消息（用户输入 + 智能体输出）。
+
+        name_hint：纯文件轮（用户只上传文件、无文本）的会话名回退提示，
+        由上层用本轮消费的文件名构建；非纯文件轮为空串。
 
         Returns:
             {"user_message_id": int|None, "assistant_message_id": int|None}
             （MySQL DAO 返回；供上传文件回填 message_id 与生成文件关联 assistant 消息）。
         """
-        return await self.dao.append_messages(session_id, user_id, messages)
+        return await self.dao.append_messages(
+            session_id, user_id, messages, name_hint=name_hint
+        )
 
     async def append_session_files(self, session_id: str, files: list[dict]) -> None:
         """持久化本轮生成的文件元信息（按 (session_id, path) UPSERT 去重）。"""
@@ -119,7 +156,7 @@ class SessionService:
         if deleted == 0:
             return {"deleted": 0, "session_deleted": False}
 
-        # 删空（会话中已无剩余消息）→ 整删会话（CASCADE 清理关联表）
+        # 删空（会话中已无剩余消息）→ 整删会话（逻辑删除：子表数据保留）
         if await self.dao.count_messages(session_id) == 0:
             await self.dao.delete_session(session_id, user_id)
             return {"deleted": deleted, "session_deleted": True}

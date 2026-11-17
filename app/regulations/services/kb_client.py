@@ -205,5 +205,75 @@ class KBClient:
 
             return merge_retrieval_results(rows, rerank_top_k)
 
+    async def query_documents(
+        self,
+        kb_ids: list[str],
+        page: int = 1,
+        page_size: int = 20,
+        search: str = "",
+        category_id: str | None = None,
+    ) -> dict:
+        """调用 POST /api/v1/internal/documents/query（kb_app 文档列表接口）。
+
+        返回响应 data（items/total/page/page_size）；业务失败（code≠0）抛
+        KBClientError。列文档为浏览场景，不做重试，失败直接上抛由路由转 502。
+        """
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+            "X-Request-ID": str(uuid.uuid4()),
+        }
+        if serial := get_serial():
+            headers["app_serial_number"] = serial
+        payload = {
+            "kb_ids": kb_ids,
+            "page": page,
+            "page_size": page_size,
+            "search": search,
+        }
+        if category_id:
+            payload["category_id"] = category_id
+        try:
+            resp = await self.client.post(
+                "/api/v1/internal/documents/query",
+                json=payload, headers=headers,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            raise KBClientError(
+                f"文档列表查询失败: {e}", code="documents_query_error",
+            ) from e
+        if body.get("code", -1) != 0:
+            req_id = body.get("request_id", "")
+            raise KBClientError(
+                f"[{req_id}] {body.get('message', 'unknown error')}",
+                code="documents_query_error",
+                request_id=req_id,
+            )
+        return body.get("data") or {}
+
+    async def get_document_file(self, doc_id: str) -> httpx.Response:
+        """调用 GET /api/v1/internal/documents/{doc_id}/file（原始文件流）。
+
+        httpx 常规 get 全量读回（制度文档 MB 级）；状态码原样返回，由调用方
+        决定透传（200）或转换（404）；仅网络/传输异常抛 KBClientError。
+        """
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "X-Request-ID": str(uuid.uuid4()),
+        }
+        if serial := get_serial():
+            headers["app_serial_number"] = serial
+        try:
+            return await self.client.get(
+                f"/api/v1/internal/documents/{doc_id}/file",
+                headers=headers,
+            )
+        except httpx.RequestError as e:
+            raise KBClientError(
+                f"源文档获取失败: {e}", code="document_file_error",
+            ) from e
+
     async def close(self) -> None:
         await self.client.aclose()

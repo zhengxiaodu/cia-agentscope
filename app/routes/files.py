@@ -1,10 +1,12 @@
 import logging
 import mimetypes
 import os
+import re
+from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 
 from app.config import SESSION_FILES_PERSIST_DIR
 from app.dependencies import current_user
@@ -118,7 +120,7 @@ async def download_persisted_file(
     """
     try:
         # 越权校验：session_id 拒绝 . / .. / 含斜杠
-        if session_id in (".", "..") or "/" in session_id or "\\" in session_id:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id):
             raise HTTPException(status_code=403, detail="无权访问该路径")
 
         # 越权校验：规范化相对路径，禁止 .. 和绝对路径（与 /files 一致）
@@ -126,17 +128,45 @@ async def download_persisted_file(
         if os.path.isabs(path) or rel.startswith("..") or "/.." in rel or rel == "..":
             raise HTTPException(status_code=403, detail="无权访问该路径")
 
+        # 属主校验：会话存在、本人、且未软删（历史回溯按 pair 过滤，不经此路由）
+        session_service = getattr(request.app.state, "session_service", None)
+        if session_service is None or not await session_service.session_files_accessible(
+            session_id, user.get("user_id", "")
+        ):
+            raise HTTPException(status_code=403, detail="无权访问该路径")
+
         if not SESSION_FILES_PERSIST_DIR:
             raise HTTPException(status_code=503, detail="持久化目录未配置")
 
         full_path = os.path.join(SESSION_FILES_PERSIST_DIR, session_id, rel)
+        session_root = Path(SESSION_FILES_PERSIST_DIR).resolve() / session_id
+        if not Path(full_path).resolve().is_relative_to(session_root):
+            raise HTTPException(status_code=403, detail="无权访问该路径")
         if not os.path.isfile(full_path):
             raise HTTPException(status_code=404, detail="文件不存在")
 
         media_type = mimetypes.guess_type(rel)[0] or "application/octet-stream"
-        with open(full_path, "rb") as f:
-            content = f.read()
-        return _build_file_response(content, rel, media_type, mode)
+        basename = os.path.basename(rel) or rel
+        # 全部走 FileResponse 流式响应：按块异步发送，避免大文件整读进
+        # 内存、同步 read 阻塞事件循环拖垮其他并发请求
+        if mode != "inline":
+            return FileResponse(
+                full_path,
+                media_type=media_type,
+                headers={"Content-Disposition": _content_disposition(basename)},
+            )
+        is_text = media_type.startswith("text/") or OpenSandboxWorkspaceManager._is_text_rel(rel)
+        is_image = media_type.startswith("image/")
+        if is_text:
+            ct = media_type if "charset=" in media_type else f"{media_type}; charset=utf-8"
+            return FileResponse(
+                full_path, media_type=ct, headers={"Content-Disposition": "inline"}
+            )
+        if is_image:
+            return FileResponse(
+                full_path, media_type=media_type, headers={"Content-Disposition": "inline"}
+            )
+        raise HTTPException(status_code=415, detail="暂不支持预览，请下载")
     except HTTPException:
         raise
     except Exception as e:

@@ -190,6 +190,7 @@ async def test_dao_get_first_user_message_sql_and_args():
         "SELECT content FROM messages "
         "WHERE user_id = %s "
         "AND message_pair_id IN (%s, %s) "
+        "AND deleted_at IS NULL "
         "AND role = 'user' ORDER BY id ASC LIMIT 1"
     )
     assert args == ["u1", "p1", "p2"]

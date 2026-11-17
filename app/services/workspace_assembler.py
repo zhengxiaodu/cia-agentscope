@@ -3,15 +3,50 @@
 从 orchestrator_service.py 外移。延迟导入（chart/md/policy/bocha 工具、
 adapter、bridge）保持函数内导入，避免模块级循环依赖。
 """
+import logging
 from contextlib import contextmanager
-from typing import Any, Iterator, List, Optional
+from typing import Any, Iterator, List, Optional, Set
 
 from app.agents.base import AgentDefinition
 from app.agents.factory import AgentFactory
 from app.agents.registry import AgentRegistry
 
+logger = logging.getLogger(__name__)
+
 # 联网搜索技能名（与 skill_config.yml / agent_config.yml 中的 name 一致）
 _SEARCH_SKILL_NAME = "bocha_search"
+
+
+async def _load_skill_blacklist(redis_client, user_id: str) -> Set[str]:
+    """从 Redis 用户权限读取 skill_blacklist 的 code 集合。
+
+    安全：请求级附加技能（extra_skill_names）的越权过滤依据。
+    Redis 未配置 / 无权限缓存 / 解析失败均返回空集合（退化为不过滤，
+    与融合阶段 mng_service 的失败语义一致），异常仅告警不阻断。
+    """
+    if redis_client is None or not user_id:
+        return set()
+    try:
+        from app.services.auth_service import get_user_permissions
+        cached = await get_user_permissions(redis_client, user_id)
+        if not cached:
+            return set()
+        blacklist = (cached.get("permissions") or {}).get("skill_blacklist") or []
+        codes: Set[str] = set()
+        for item in blacklist:
+            if isinstance(item, dict):
+                code = item.get("code")
+            else:
+                code = item
+            if code:
+                codes.add(code)
+        return codes
+    except Exception:
+        logger.warning(
+            "[workspace_assembler] 读取用户 skill_blacklist 失败，"
+            "本轮附加技能不做黑名单过滤", exc_info=True,
+        )
+        return set()
 
 
 @contextmanager
@@ -30,12 +65,16 @@ async def assemble_workspace_components(
     session_id_safe: str,
     search_enabled: bool = True,
     skills: Optional[List[str]] = None,
+    knowledge_bases: Optional[List[str]] = None,
     langfuse_service: Optional[Any] = None,
+    agent_bound_tools: Optional[dict] = None,
+    session_service: Optional[Any] = None,
+    round_state: Optional[Any] = None,
 ) -> tuple:
     """获取/创建工作区并组装注册表与工厂（依赖沙箱，可与意图链路并行）。
 
     含 workspace-load 环节埋点。本函数会被 run() 放进 asyncio.create_task，
-    因此不得读写请求级状态（_last_agent_ids / _last_success 等）。
+    请求级恢复签名通过显式传入的 round_state 记录，不写全局状态。
 
     Returns:
         (registry, agent_factory)
@@ -90,8 +129,13 @@ async def assemble_workspace_components(
         FunctionTool(render_metric_card), FunctionTool(render_confirm_action),
         FunctionTool(render_indicator_table), FunctionTool(render_selectable_list),
     ]
-    # 制度问答工具（宿主侧 FunctionTool，知识库 ID 由用户权限自动映射，不依赖工作区后端）
-    policy_qa_tool = create_policy_qa_tool(user_id=user_id, redis_client=redis_client)
+    # 制度问答工具（宿主侧 FunctionTool，知识库 ID 由用户权限自动映射，
+    # 不依赖工作区后端；knowledge_bases 为前端所选知识库名，空 = 全选）
+    policy_qa_tool = create_policy_qa_tool(
+        user_id=user_id,
+        redis_client=redis_client,
+        knowledge_bases=knowledge_bases,
+    )
     # 卡片反馈工具（同轮暂停-恢复，闭包注入 session_id）
     feedback_tool = create_feedback_tool(session_id=session_id_safe)
 
@@ -123,11 +167,32 @@ async def assemble_workspace_components(
                 f"stderr={result['stderr']}"
             )
 
-    md_tools = create_md_export_tools(_sandbox_read_file, _sandbox_write_file)
+    from app.config import SESSION_FILES_PERSIST_DIR
+    from app.services.sandbox_file_checkpoint import SandboxFileCheckpoint
+
+    checkpoint = None
+    if SESSION_FILES_PERSIST_DIR and round_state is not None and session_service is not None:
+        checkpoint = SandboxFileCheckpoint(adapter.artifact_signatures, round_state.completed_files)
+
+    async def write_export(rel_path: str, data: bytes) -> None:
+        if checkpoint is None:
+            await _sandbox_write_file(rel_path, data)
+        else:
+            await checkpoint.run(_sandbox_write_file, rel_path, data)
+
+    md_tools = create_md_export_tools(_sandbox_read_file, write_export)
     all_tools = (
-        create_opensandbox_tools(adapter) + _chart_tools
+        create_opensandbox_tools(adapter, checkpoint) + _chart_tools
         + [policy_qa_tool, feedback_tool] + md_tools
     )
+    if session_service is not None and user_id and session_id_safe:
+        from app.services.historical_file_service import HistoricalFileService
+        from tools.history_file_tools import create_history_file_tools
+        history_service = HistoricalFileService(
+            session_service, adapter, user_id, session_id_safe, SESSION_FILES_PERSIST_DIR,
+            restored_files=round_state.restored_files if round_state is not None else None,
+        )
+        all_tools.extend(create_history_file_tools(history_service))
     # 联网搜索工具受请求开关控制：关闭时不注入
     # （Toolkit 的 tools 对所有 agent 全局可见，需与技能过滤同步收口）
     if search_enabled:
@@ -157,6 +222,17 @@ async def assemble_workspace_components(
     extra_skills = list(skills or [])
     if search_enabled:
         extra_skills.append(_SEARCH_SKILL_NAME)
+    # 安全：附加技能统一过 skill_blacklist（融合阶段仅过滤 agent 绑定技能，
+    # extra 若不过滤，前端传入（或后端追加的 bocha_search）可绕过黑名单越权使用）
+    blacklist = await _load_skill_blacklist(redis_client, user_id)
+    if blacklist:
+        filtered = [s for s in extra_skills if s not in blacklist]
+        if len(filtered) != len(extra_skills):
+            logger.info(
+                "[workspace_assembler] 已过滤黑名单附加技能 "
+                f"user={user_id} 命中={[s for s in extra_skills if s in blacklist]}"
+            )
+        extra_skills = filtered
 
     registry = AgentRegistry(
         definitions=agent_defs,
@@ -165,6 +241,7 @@ async def assemble_workspace_components(
         all_skills_meta=all_skills_meta,
         create_model_fn=create_model_fn,
         extra_skill_names=extra_skills,
+        agent_bound_tools=agent_bound_tools,
     )
     agent_factory = AgentFactory(registry)
     return registry, agent_factory

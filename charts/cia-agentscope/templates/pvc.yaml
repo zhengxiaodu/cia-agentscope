@@ -1,0 +1,112 @@
+{{/* Nginx 日志 PVC */}}
+{{- if and .Values.proxy.enabled .Values.proxy.log.persistence.enabled (not .Values.proxy.log.persistence.persistentVolumeClaim.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}
+{{- with .Values.proxy.log.persistence.annotations }}
+  annotations:
+{{ toYaml . | indent 4 }}
+{{- end }}
+  labels:
+{{ include "oia-agentscope.labels" . | indent 4 }}
+spec:
+  accessModes:
+  - {{ .Values.proxy.log.persistence.persistentVolumeClaim.accessModes | quote }}
+  {{- if .Values.proxy.log.persistence.persistentVolumeClaim.storageClass }}
+    {{- if eq "-" .Values.proxy.log.persistence.persistentVolumeClaim.storageClass }}
+  storageClassName: ""
+    {{- else }}
+  storageClassName: {{ .Values.proxy.log.persistence.persistentVolumeClaim.storageClass }}
+    {{- end }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.proxy.log.persistence.persistentVolumeClaim.size }}
+{{- end }}
+
+{{/* 后端日志 PVC（LOG_DIR） */}}
+{{- if and .Values.api.enabled .Values.api.persistence.logs.enabled (not .Values.api.persistence.logs.persistentVolumeClaim.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "oia-agentscope.api.logsPvcName" . }}
+{{- with .Values.api.persistence.logs.annotations }}
+  annotations:
+{{ toYaml . | indent 4 }}
+{{- end }}
+  labels:
+{{ include "oia-agentscope.labels" . | indent 4 }}
+spec:
+  accessModes:
+  - {{ .Values.api.persistence.logs.persistentVolumeClaim.accessModes | quote }}
+  {{- if .Values.api.persistence.logs.persistentVolumeClaim.storageClass }}
+    {{- if eq "-" .Values.api.persistence.logs.persistentVolumeClaim.storageClass }}
+  storageClassName: ""
+    {{- else }}
+  storageClassName: {{ .Values.api.persistence.logs.persistentVolumeClaim.storageClass }}
+    {{- end }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.api.persistence.logs.persistentVolumeClaim.size }}
+{{- end }}
+
+{{/* 生成文件持久化目录 PVC（SESSION_FILES_PERSIST_DIR） */}}
+{{- if and .Values.api.enabled .Values.api.persistence.sessionFiles.enabled (not .Values.api.persistence.sessionFiles.persistentVolumeClaim.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "oia-agentscope.api.sessionFilesPvcName" . }}
+{{- with .Values.api.persistence.sessionFiles.annotations }}
+  annotations:
+{{ toYaml . | indent 4 }}
+{{- end }}
+  labels:
+{{ include "oia-agentscope.labels" . | indent 4 }}
+spec:
+  accessModes:
+  - {{ .Values.api.persistence.sessionFiles.persistentVolumeClaim.accessModes | quote }}
+  {{- if .Values.api.persistence.sessionFiles.persistentVolumeClaim.storageClass }}
+    {{- if eq "-" .Values.api.persistence.sessionFiles.persistentVolumeClaim.storageClass }}
+  storageClassName: ""
+    {{- else }}
+  storageClassName: {{ .Values.api.persistence.sessionFiles.persistentVolumeClaim.storageClass }}
+    {{- end }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.api.persistence.sessionFiles.persistentVolumeClaim.size }}
+{{- end }}
+
+{{/* 外部技能目录 PVC：仅 type=pvc 时创建（默认走宿主机 SFS 的 hostPath，见 README 5.5） */}}
+{{- $skillsType := .Values.api.persistence.externalSkills.type | default "hostPath" }}
+{{- if and .Values.api.enabled .Values.api.persistence.externalSkills.enabled (eq $skillsType "pvc") (not .Values.api.persistence.externalSkills.persistentVolumeClaim.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "oia-agentscope.api.externalSkillsPvcName" . }}
+{{- with .Values.api.persistence.externalSkills.annotations }}
+  annotations:
+{{ toYaml . | indent 4 }}
+{{- end }}
+  labels:
+{{ include "oia-agentscope.labels" . | indent 4 }}
+spec:
+  accessModes:
+  - {{ .Values.api.persistence.externalSkills.persistentVolumeClaim.accessModes | quote }}
+  {{- if .Values.api.persistence.externalSkills.persistentVolumeClaim.storageClass }}
+    {{- if eq "-" .Values.api.persistence.externalSkills.persistentVolumeClaim.storageClass }}
+  storageClassName: ""
+    {{- else }}
+  storageClassName: {{ .Values.api.persistence.externalSkills.persistentVolumeClaim.storageClass }}
+    {{- end }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.api.persistence.externalSkills.persistentVolumeClaim.size }}
+{{- end }}

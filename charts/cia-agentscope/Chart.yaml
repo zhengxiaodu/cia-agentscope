@@ -1,0 +1,10 @@
+apiVersion: v2
+name: agentscope
+description: AgentScope 智能体服务（OIA-AGENTSCOPE）
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.19.0-0"
+annotations:
+  # 实测环境：Kubernetes 1.23.14 / Helm v3.10.1
+  tested: "k8s-1.23.14/helm-3.10.1"

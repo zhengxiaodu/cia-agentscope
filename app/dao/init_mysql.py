@@ -16,7 +16,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     latest_trace_id VARCHAR(255),
     is_pinned    TINYINT(1) NOT NULL DEFAULT 0,
     pinned_at    TIMESTAMP NULL,
-    agent_ids    JSON NULL DEFAULT NULL
+    agent_ids    JSON NULL DEFAULT NULL,
+    -- 逻辑删除标记：NULL=活跃；非 NULL=已删除（删除时间）。子表数据保留
+    deleted_at   TIMESTAMP NULL DEFAULT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE INDEX idx_sessions_user_id ON sessions(user_id);
@@ -46,6 +48,13 @@ CREATE TABLE IF NOT EXISTS messages (
     message_pair_id VARCHAR(64) NULL DEFAULT NULL,
     citations       JSON NULL,
     bocha_sum       JSON NULL,
+    content_parts   JSON NULL,
+    -- 点赞点踩：1=赞 0=踩 NULL=未反馈（仅 assistant 行；按 message_pair_id 定位本轮回复）
+    feedback       TINYINT(1) NULL DEFAULT NULL,
+    -- 反馈评价内容（点踩后用户填写的文字说明，随 feedback 一同覆盖更新）
+    feedback_comment VARCHAR(1024) NULL DEFAULT NULL,
+    -- 逻辑删除标记：NULL=活跃；非 NULL=已删除（删除时间）。物理行保留
+    deleted_at      TIMESTAMP NULL DEFAULT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -164,21 +173,28 @@ CREATE INDEX idx_gaps_question_hash ON knowledge_gaps(question_hash);
 CREATE INDEX idx_gaps_status ON knowledge_gaps(status);
 
 -- 兼容已存在表：追加 agent_ids 列（MySQL 8 支持 IF NOT EXISTS）
-ALTER TABLE sessions ADD COLUMN IF NOT EXISTS (agent_ids JSON NULL DEFAULT NULL);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (agent_ids JSON NULL DEFAULT NULL);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (user_id VARCHAR(64) NOT NULL DEFAULT '');
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (success TINYINT(1) NOT NULL DEFAULT 1);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (tokens INT NOT NULL DEFAULT 0);
-ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (user_id VARCHAR(64) NOT NULL DEFAULT '');
-ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (file_size BIGINT NOT NULL DEFAULT 0);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL DEFAULT NULL);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (citations JSON NULL);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (bocha_sum JSON NULL);
-ALTER TABLE session_files ADD COLUMN IF NOT EXISTS (message_id BIGINT NULL);
-ALTER TABLE session_files ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL);
-ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL);
-ALTER TABLE message_shares ADD COLUMN IF NOT EXISTS (title VARCHAR(255) NOT NULL DEFAULT '');
-ALTER TABLE message_favorites ADD COLUMN IF NOT EXISTS (title VARCHAR(255) NOT NULL DEFAULT '');
+ALTER TABLE sessions ADD COLUMN (agent_ids JSON NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (agent_ids JSON NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (user_id VARCHAR(64) NOT NULL DEFAULT '');
+ALTER TABLE messages ADD COLUMN (success TINYINT(1) NOT NULL DEFAULT 1);
+ALTER TABLE messages ADD COLUMN (tokens INT NOT NULL DEFAULT 0);
+ALTER TABLE upload_files ADD COLUMN (user_id VARCHAR(64) NOT NULL DEFAULT '');
+ALTER TABLE upload_files ADD COLUMN (file_size BIGINT NOT NULL DEFAULT 0);
+ALTER TABLE messages ADD COLUMN (message_pair_id VARCHAR(64) NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (citations JSON NULL);
+ALTER TABLE messages ADD COLUMN (bocha_sum JSON NULL);
+-- 有序内容片段（text / custom_component / feedback_component），前端刷新后按序渲染
+ALTER TABLE messages ADD COLUMN (content_parts JSON NULL);
+ALTER TABLE messages ADD COLUMN (feedback TINYINT(1) NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (feedback_comment VARCHAR(1024) NULL DEFAULT NULL);
+ALTER TABLE session_files ADD COLUMN (message_id BIGINT NULL);
+ALTER TABLE session_files ADD COLUMN (message_pair_id VARCHAR(64) NULL);
+ALTER TABLE upload_files ADD COLUMN (message_pair_id VARCHAR(64) NULL);
+ALTER TABLE message_shares ADD COLUMN (title VARCHAR(255) NOT NULL DEFAULT '');
+ALTER TABLE message_favorites ADD COLUMN (title VARCHAR(255) NOT NULL DEFAULT '');
+-- 逻辑删除标记（存量表升级；重复列报 1060 被下方兼容逻辑忽略）
+ALTER TABLE sessions ADD COLUMN (deleted_at TIMESTAMP NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (deleted_at TIMESTAMP NULL DEFAULT NULL);
 
 -- 存量回填：按所属会话反查上传者（幂等；会话已删除的孤儿记录保持空串，不误归属）
 UPDATE upload_files uf
@@ -240,3 +256,4 @@ def _split_statements(sql: str) -> list:
         if remaining:
             statements.append(remaining)
     return statements
+
