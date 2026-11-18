@@ -29,3 +29,6 @@ test.py
 docker-compose.yml
 Dockerfile
 .dockerignore
+
+# 本地交付压缩包不进入镜像构建上下文
+dist

@@ -9,6 +9,7 @@ import json
 import pytest
 
 from app.services.orchestrator_service import OrchestratorService
+from app.services.round_state import RoundState
 from app.intent.models import Intent
 
 MESSAGES = [{"role": "user", "content": "帮我查一下今天的新闻"}]
@@ -67,12 +68,34 @@ class _FakeRegistry:
         return object()
 
 
+@pytest.mark.asyncio
+async def test_orchestrator_only_stages_child_states():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    svc = _make_service([], ws_delay=0)
+    orchestrator = _FakeOrchestrator()
+    children = {"a": {"summary": "part A"}, "b": {"summary": "part B"}}
+    orchestrator._last_results = [
+        SimpleNamespace(agent_id=aid, success=True, final_state=state)
+        for aid, state in children.items()
+    ]
+    svc._create_orchestrator = lambda mode, factory: orchestrator
+    service = SimpleNamespace(load_agent_state=AsyncMock(return_value=None), save_agent_state=AsyncMock())
+    round_state = RoundState()
+    async for _ in svc.run(MESSAGES, session_service=service, session_id="s1",
+                           user_id="u1", round_state=round_state):
+        pass
+    assert round_state.final_states == children
+    service.save_agent_state.assert_not_awaited()
+
+
 def _make_service(marks: list, ws_delay: float = 0.3, ws_error: Exception | None = None):
     """构造只保留 run() 编排逻辑的服务实例，三个装配方法全部打桩。"""
     svc = OrchestratorService.__new__(OrchestratorService)
-    svc._last_orchestrator = None
-    svc._last_agent_ids = []
-    svc._last_success = True
+    # run() 会把 self._workspace_manager 传给 persist_upload_files_to_workspace
+    # （request 为 None 时函数内部提前返回，属性只需存在）
+    svc._workspace_manager = None
     svc._orchestrator_params = {
         "parallel_timeout": 60, "pipeline_step_timeout": 60, "react_max_steps": 8,
     }
@@ -136,8 +159,9 @@ async def test_workspace_failure_yields_error_after_intent_events():
     """工作区失败 → 意图事件先出、error 事件后出，且不向上抛异常。"""
     marks: list = []
     svc = _make_service(marks, ws_delay=0.05, ws_error=RuntimeError("sandbox unreachable"))
+    rs = RoundState()
 
-    events = _events([c async for c in svc.run(MESSAGES)])
+    events = _events([c async for c in svc.run(MESSAGES, round_state=rs)])
 
     types = [e["type"] for e in events]
     assert "query_rewritten" in types
@@ -145,7 +169,7 @@ async def test_workspace_failure_yields_error_after_intent_events():
     assert types[-1] == "error"
     assert events[-1]["message"] == "环境准备失败: sandbox unreachable"
     assert types.index("query_rewritten") < types.index("error")
-    assert svc._last_success is False
+    assert rs.success is False
 
 
 @pytest.mark.asyncio

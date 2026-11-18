@@ -47,11 +47,12 @@ class SessionDAO:
     # ================================================================
 
     async def session_exists(self, session_id: str) -> bool:
-        """检查会话是否存在。"""
+        """检查会话是否存在且未删除（活跃）。"""
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
-                    "SELECT 1 FROM sessions WHERE session_id = %s",
+                    "SELECT 1 FROM sessions "
+                    "WHERE session_id = %s AND deleted_at IS NULL",
                     (session_id,),
                 )
                 row = await cur.fetchone()
@@ -101,12 +102,20 @@ class SessionDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await conn.begin()
                 try:
-                    # 1) 确保 sessions 行存在
+                    # 1) 确保 sessions 行存在（感知软删：已删会话跳过写入，
+                    #    防止 INSERT 主键冲突与"复活"已删会话）
                     await cur.execute(
-                        "SELECT 1 FROM sessions WHERE session_id = %s",
+                        "SELECT deleted_at FROM sessions WHERE session_id = %s",
                         (session_id,),
                     )
                     existing = await cur.fetchone()
+                    if existing is not None and existing.get("deleted_at") is not None:
+                        await conn.rollback()
+                        logger.warning(
+                            "[mysql_dao] 会话已删除，跳过 agent_state 保存: %s",
+                            session_id,
+                        )
+                        return
                     if not existing:
                         name = self._extract_name_from_state(state_dict)
                         await cur.execute(
@@ -118,17 +127,18 @@ class SessionDAO:
                     else:
                         await cur.execute(
                             "UPDATE sessions SET updated_at = %s "
-                            "WHERE session_id = %s",
+                            "WHERE session_id = %s AND deleted_at IS NULL",
                             (now, session_id),
                         )
 
                     # 2) UPSERT agent_states（ON DUPLICATE KEY UPDATE）
+                    # 行别名语法替代 VALUES(col)（MySQL 8.0.20+ 已弃用）
                     await cur.execute(
                         "INSERT INTO agent_states "
                         "(session_id, agent_id, state, updated_at) "
-                        "VALUES (%s, %s, %s, %s) "
+                        "VALUES (%s, %s, %s, %s) AS new "
                         "ON DUPLICATE KEY UPDATE "
-                        "state = VALUES(state), updated_at = VALUES(updated_at)",
+                        "state = new.state, updated_at = new.updated_at",
                         (session_id, agent_id, state_json, now),
                     )
 
@@ -147,9 +157,11 @@ class SessionDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT role, content, timestamp, agent_ids, user_id, "
-                    "success, tokens, message_pair_id, citations, bocha_sum "
+                    "success, tokens, message_pair_id, citations, bocha_sum, "
+                    "content_parts, feedback, feedback_comment "
                     "FROM messages "
-                    "WHERE session_id = %s ORDER BY id ASC",
+                    "WHERE session_id = %s AND deleted_at IS NULL "
+                    "ORDER BY id ASC",
                     (session_id,),
                 )
                 rows = await cur.fetchall()
@@ -170,6 +182,13 @@ class SessionDAO:
                         "message_pair_id": r.get("message_pair_id"),
                         "citations": _parse_json_list(r.get("citations")),
                         "bocha_sum": _parse_json_list(r.get("bocha_sum")),
+                        "content_parts": _parse_json_list(r.get("content_parts")),
+                        "feedback": (
+                            int(r["feedback"])
+                            if r.get("feedback") is not None
+                            else None
+                        ),
+                        "feedback_comment": r.get("feedback_comment"),
                     }
                     for r in rows
                 ]
@@ -179,6 +198,7 @@ class SessionDAO:
         session_id: str,
         user_id: str,
         new_messages: list[dict],
+        name_hint: str = "",
     ) -> Optional[dict]:
         """向 messages 表插入消息 + 更新 sessions 元信息。
 
@@ -208,22 +228,38 @@ class SessionDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await conn.begin()
                 try:
-                    # 1) 确保 sessions 行存在（同时读取旧 agent_ids 用于合并）
+                    # 1) 确保 sessions 行存在（同时读取旧 agent_ids 用于合并；
+                    #    感知软删：已删会话跳过写入，防主键冲突与"复活"）
                     await cur.execute(
-                        "SELECT name, agent_ids FROM sessions WHERE session_id = %s",
+                        "SELECT name, agent_ids, deleted_at "
+                        "FROM sessions WHERE session_id = %s",
                         (session_id,),
                     )
                     row = await cur.fetchone()
+                    if row is not None and row.get("deleted_at") is not None:
+                        await conn.rollback()
+                        logger.warning(
+                            "[mysql_dao] 会话已删除，跳过消息持久化: %s",
+                            session_id,
+                        )
+                        return None
 
-                    if not row:
-                        name = ""
+                    # 从本轮 user 消息提取会话名（首条非空 user 文本前 50
+                    # 字符）；纯文件轮 user 文本为空，回退 name_hint
+                    # （由 chat_service 用本轮消费的文件名构建）
+                    def _first_user_name() -> str:
                         for msg in new_messages:
                             if msg.get("role") == "user":
                                 raw_text = msg.get("content", "")
-                                name = (
-                                    raw_text[:50] if len(raw_text) > 50 else raw_text
-                                )
-                                break
+                                if raw_text:
+                                    return (
+                                        raw_text[:50] if len(raw_text) > 50
+                                        else raw_text
+                                    )
+                        return name_hint[:50] if name_hint else ""
+
+                    if not row:
+                        name = _first_user_name()
                         agent_ids_init = (
                             json.dumps(agent_ids_all, ensure_ascii=False)
                             if agent_ids_all else None
@@ -234,6 +270,17 @@ class SessionDAO:
                             "VALUES (%s, %s, %s, %s, %s, %s)",
                             (session_id, user_id, name, now, now, agent_ids_init),
                         )
+                    elif not (row.get("name") or "").strip():
+                        # 会话行已存在但 name 为空（如 save_agent_state 先建的
+                        # 空名行），用本轮 user 消息补写，避免会话名永远停留在
+                        # "未命名对话"。仅空名补写，不改用户已命名的会话。
+                        backfill_name = _first_user_name()
+                        if backfill_name:
+                            await cur.execute(
+                                "UPDATE sessions SET name = %s, updated_at = %s "
+                                "WHERE session_id = %s AND (name IS NULL OR name = '')",
+                                (backfill_name, now, session_id),
+                            )
 
                     # 2) 插入消息（含 agent_ids），记录本轮 user/assistant
                     #    消息的自增 id
@@ -268,17 +315,25 @@ class SessionDAO:
                             if isinstance(bocha_sum, list) and bocha_sum
                             else None
                         )
+                        content_parts = msg.get("content_parts")
+                        content_parts_json = (
+                            json.dumps(content_parts, ensure_ascii=False)
+                            if isinstance(content_parts, list) and content_parts
+                            else None
+                        )
                         await cur.execute(
                             "INSERT INTO messages "
                             "(session_id, role, content, timestamp, agent_ids, "
-                            "user_id, success, tokens, message_pair_id, citations, bocha_sum) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                            "user_id, success, tokens, message_pair_id, citations, "
+                            "bocha_sum, content_parts) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                             (session_id, msg.get("role", "user"),
                              msg.get("content", ""), ts, agent_ids_json,
                              msg.get("user_id", ""),
                              int(bool(msg.get("success", True))),
                              int(msg.get("tokens", 0) or 0),
-                             msg_pair_id, citations_json, bocha_sum_json),
+                             msg_pair_id, citations_json, bocha_sum_json,
+                             content_parts_json),
                         )
                         if msg.get("role") == "user" and user_message_id is None:
                             user_message_id = cur.lastrowid
@@ -288,10 +343,10 @@ class SessionDAO:
                         ):
                             assistant_message_id = cur.lastrowid
 
-                    # 3) 更新 sessions 元信息
+                    # 3) 更新 sessions 元信息（message_count 只统计活跃消息）
                     await cur.execute(
                         "SELECT COUNT(*) AS cnt FROM messages "
-                        "WHERE session_id = %s",
+                        "WHERE session_id = %s AND deleted_at IS NULL",
                         (session_id,),
                     )
                     count_row = await cur.fetchone()
@@ -349,7 +404,8 @@ class SessionDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "UPDATE sessions SET latest_trace_id = %s, "
-                    "updated_at = NOW() WHERE session_id = %s",
+                    "updated_at = NOW() WHERE session_id = %s "
+                    "AND deleted_at IS NULL",
                     (trace_id, session_id),
                 )
                 await conn.commit()
@@ -367,19 +423,105 @@ class SessionDAO:
                 await cur.execute(
                     "UPDATE messages SET success = 0 "
                     "WHERE session_id = %s AND user_id = %s AND role = 'assistant' "
+                    "AND deleted_at IS NULL "
                     "AND timestamp = ("
                     "  SELECT max_ts FROM ("
                     "    SELECT MAX(timestamp) AS max_ts FROM messages "
-                    "    WHERE session_id = %s AND user_id = %s AND role = 'assistant'"
+                    "    WHERE session_id = %s AND user_id = %s AND role = 'assistant' "
+                    "    AND deleted_at IS NULL"
                     "  ) AS t"
                     ")",
                     (session_id, user_id, session_id, user_id),
                 )
                 await conn.commit()
 
+    async def update_message_feedback(
+        self,
+        session_id: str,
+        user_id: str,
+        message_pair_id: str,
+        feedback: int,
+        comment: Optional[str] = None,
+    ) -> int:
+        """点赞点踩落库：按 (session_id, message_pair_id) 定位本轮 assistant
+        消息行写入 feedback（1=赞 0=踩）与 feedback_comment（评价内容）。
+        行级 user_id 条件防越权。覆盖语义：本次提交的 comment 覆盖旧值
+        （未填则清空）。
+
+        多智能体一轮产生多条 assistant 行时全部更新（本轮回复整体反馈）。
+        返回更新行数；0 表示消息不存在或不属于当前用户。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "UPDATE messages SET feedback = %s, feedback_comment = %s "
+                    "WHERE session_id = %s AND user_id = %s "
+                    "AND message_pair_id = %s AND role = 'assistant' "
+                    "AND deleted_at IS NULL",
+                    (int(feedback), comment, session_id, user_id, message_pair_id),
+                )
+                updated = cur.rowcount
+                await conn.commit()
+                return updated
+
     # ================================================================
     # Session 元信息
     # ================================================================
+
+    async def reserve_session(self, session_id: str, user_id: str) -> dict:
+        """通过主键冲突串行化首次使用，不覆盖已登记属主或软删状态。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await conn.begin()
+                try:
+                    now = datetime.now(_BEIJING_TZ)
+                    await cur.execute(
+                        "INSERT INTO sessions (session_id, user_id, name, created_at, updated_at) "
+                        "VALUES (%s, %s, '', %s, %s) "
+                        "ON DUPLICATE KEY UPDATE session_id = sessions.session_id",
+                        (session_id, user_id, now, now),
+                    )
+                    created = cur.rowcount == 1
+                    await cur.execute(
+                        "SELECT user_id, deleted_at FROM sessions WHERE session_id = %s FOR UPDATE",
+                        (session_id,),
+                    )
+                    owner = await cur.fetchone()
+                    if created:
+                        # 兼容部署前仅上传、还未建会话的记录；存在其他属主则拒绝认领。
+                        await cur.execute(
+                            "SELECT id FROM upload_files WHERE session_id = %s "
+                            "AND user_id <> %s LIMIT 1",
+                            (session_id, user_id),
+                        )
+                        if await cur.fetchone():
+                            raise PermissionError("该会话已有其他用户的上传记录")
+                    await conn.commit()
+                    return owner
+                except BaseException:
+                    await conn.rollback()
+                    raise
+
+    async def get_session_owner_status(self, session_id: str) -> Optional[dict]:
+        """查询会话属主与删除状态（不过滤软删）。
+
+        供入口区分『已删除』与『不存在』，并为持久化文件下载做属主校验。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT user_id, deleted_at FROM sessions "
+                    "WHERE session_id = %s",
+                    (session_id,),
+                )
+                row = await cur.fetchone()
+                await conn.commit()
+                if row is None:
+                    return None
+                return {
+                    "user_id": row["user_id"],
+                    "deleted_at": row["deleted_at"],
+                }
 
     async def get_session_meta(self, session_id: str) -> Optional[dict]:
         """获取会话元信息。"""
@@ -388,7 +530,8 @@ class SessionDAO:
                 await cur.execute(
                     "SELECT session_id, user_id, name, created_at, "
                     "updated_at, message_count, latest_trace_id, is_pinned, "
-                    "agent_ids FROM sessions WHERE session_id = %s",
+                    "agent_ids FROM sessions "
+                    "WHERE session_id = %s AND deleted_at IS NULL",
                     (session_id,),
                 )
                 row = await cur.fetchone()
@@ -436,6 +579,9 @@ class SessionDAO:
                     "updated_at, message_count, latest_trace_id, is_pinned, "
                     "agent_ids FROM sessions "
                     "WHERE user_id = %s AND is_pinned = 1 "
+                    "AND deleted_at IS NULL "
+                    # 属主登记（reserve_session）会先建行，过滤仅上传未发消息的空会话
+                    "AND message_count > 0 "
                     "ORDER BY pinned_at DESC "
                     "LIMIT %s",
                     (user_id, pinned_limit),
@@ -463,7 +609,9 @@ class SessionDAO:
                 # 非置顶会话总数（分页元数据）
                 await cur.execute(
                     "SELECT COUNT(*) AS cnt FROM sessions "
-                    "WHERE user_id = %s AND is_pinned = 0",
+                    "WHERE user_id = %s AND is_pinned = 0 "
+                    "AND deleted_at IS NULL "
+                    "AND message_count > 0",
                     (user_id,),
                 )
                 cnt_row = await cur.fetchone()
@@ -476,6 +624,8 @@ class SessionDAO:
                     "updated_at, message_count, latest_trace_id, is_pinned, "
                     "agent_ids FROM sessions "
                     "WHERE user_id = %s AND is_pinned = 0 "
+                    "AND deleted_at IS NULL "
+                    "AND message_count > 0 "
                     "ORDER BY updated_at DESC "
                     "LIMIT %s OFFSET %s",
                     (user_id, page_size, offset),
@@ -514,7 +664,8 @@ class SessionDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "UPDATE sessions SET is_pinned = 1, pinned_at = %s, "
-                    "updated_at = %s WHERE session_id = %s AND user_id = %s",
+                    "updated_at = %s WHERE session_id = %s AND user_id = %s "
+                    "AND deleted_at IS NULL",
                     (now, now, session_id, user_id),
                 )
                 await conn.commit()
@@ -525,7 +676,8 @@ class SessionDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "UPDATE sessions SET is_pinned = 0, pinned_at = NULL, "
-                    "updated_at = NOW() WHERE session_id = %s AND user_id = %s",
+                    "updated_at = NOW() WHERE session_id = %s AND user_id = %s "
+                    "AND deleted_at IS NULL",
                     (session_id, user_id),
                 )
                 await conn.commit()
@@ -541,7 +693,8 @@ class SessionDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "UPDATE sessions SET name = %s "
-                    "WHERE session_id = %s AND user_id = %s",
+                    "WHERE session_id = %s AND user_id = %s "
+                    "AND deleted_at IS NULL",
                     (name, session_id, user_id),
                 )
                 await conn.commit()
@@ -552,12 +705,17 @@ class SessionDAO:
     # ================================================================
 
     async def delete_session(self, session_id: str, user_id: str) -> None:
-        """删除会话（CASCADE 自动清理 agent_states 和 messages）。"""
+        """逻辑删除会话：置 deleted_at，子表数据（agent_states/messages/
+        session_files 等）全部保留（CASCADE 仅物理删除时触发）。
+
+        仅对活跃会话生效（deleted_at IS NULL），重复删除幂等。
+        """
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
-                    "DELETE FROM sessions "
-                    "WHERE session_id = %s AND user_id = %s",
+                    "UPDATE sessions SET deleted_at = NOW() "
+                    "WHERE session_id = %s AND user_id = %s "
+                    "AND deleted_at IS NULL",
                     (session_id, user_id),
                 )
                 await conn.commit()
@@ -565,8 +723,9 @@ class SessionDAO:
     async def delete_messages_by_pair(
         self, session_id: str, message_pair_ids: List[str]
     ) -> int:
-        """删除会话中指定 message_pair_id 的消息（多轮，一批），返回删除行数。
+        """逻辑删除会话中指定 message_pair_id 的消息（多轮，一批），返回删除行数。
 
+        置 deleted_at，物理行保留。仅对活跃消息生效，重复删除幂等。
         空列表不发 SQL 直接返回 0。
         """
         if not message_pair_ids:
@@ -575,9 +734,10 @@ class SessionDAO:
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
-                    "DELETE FROM messages "
+                    "UPDATE messages SET deleted_at = NOW() "
                     "WHERE session_id = %s "
-                    f"AND message_pair_id IN ({placeholders})",
+                    f"AND message_pair_id IN ({placeholders}) "
+                    "AND deleted_at IS NULL",
                     [session_id] + list(message_pair_ids),
                 )
                 deleted = cur.rowcount
@@ -585,12 +745,12 @@ class SessionDAO:
                 return deleted
 
     async def count_messages(self, session_id: str) -> int:
-        """统计会话剩余消息数（判断删空后是否整删会话）。"""
+        """统计会话剩余活跃消息数（判断删空后是否整删会话）。"""
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT COUNT(*) AS cnt FROM messages "
-                    "WHERE session_id = %s",
+                    "WHERE session_id = %s AND deleted_at IS NULL",
                     (session_id,),
                 )
                 row = await cur.fetchone()
@@ -621,12 +781,12 @@ class SessionDAO:
                             "INSERT INTO session_files "
                             "(session_id, name, path, url, size, media_type, "
                             "message_id, message_pair_id) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) AS new "
                             "ON DUPLICATE KEY UPDATE "
-                            "name = VALUES(name), url = VALUES(url), "
-                            "size = VALUES(size), media_type = VALUES(media_type), "
-                            "message_id = VALUES(message_id), "
-                            "message_pair_id = VALUES(message_pair_id), "
+                            "name = new.name, url = new.url, "
+                            "size = new.size, media_type = new.media_type, "
+                            "message_id = new.message_id, "
+                            "message_pair_id = new.message_pair_id, "
                             "updated_at = NOW()",
                             (
                                 session_id,
@@ -697,7 +857,8 @@ class SessionDAO:
                     "FROM sessions s "
                     "LEFT JOIN agent_states a "
                     "ON a.session_id = s.session_id AND a.agent_id = %s "
-                    "WHERE s.session_id = %s AND s.user_id = %s",
+                    "WHERE s.session_id = %s AND s.user_id = %s "
+                    "AND s.deleted_at IS NULL",
                     (agent_id, session_id, user_id),
                 )
                 row = await cur.fetchone()
@@ -734,12 +895,20 @@ class SessionDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await conn.begin()
                 try:
-                    # 确保 sessions 行存在
+                    # 确保 sessions 行存在（感知软删：已删会话跳过写入，
+                    # 防止 INSERT 主键冲突与"复活"已删会话）
                     await cur.execute(
-                        "SELECT 1 FROM sessions WHERE session_id = %s",
+                        "SELECT deleted_at FROM sessions WHERE session_id = %s",
                         (session_id,),
                     )
                     existing = await cur.fetchone()
+                    if existing is not None and existing.get("deleted_at") is not None:
+                        await conn.rollback()
+                        logger.warning(
+                            "[mysql_dao] 会话已删除，跳过 session_state 更新: %s",
+                            session_id,
+                        )
+                        return
                     if not existing:
                         await cur.execute(
                             "INSERT INTO sessions "
@@ -748,14 +917,14 @@ class SessionDAO:
                             "VALUES (%s, %s, '', %s, %s)",
                             (session_id, user_id, now, now),
                         )
-                    # UPSERT agent_states
+                    # UPSERT agent_states（行别名语法，VALUES(col) 已弃用）
                     await cur.execute(
                         "INSERT INTO agent_states "
                         "(session_id, agent_id, state, updated_at) "
-                        "VALUES (%s, %s, %s, %s) "
+                        "VALUES (%s, %s, %s, %s) AS new "
                         "ON DUPLICATE KEY UPDATE "
-                        "state = VALUES(state), "
-                        "updated_at = VALUES(updated_at)",
+                        "state = new.state, "
+                        "updated_at = new.updated_at",
                         (session_id, agent_id, state_json, now),
                     )
                     await conn.commit()

@@ -54,6 +54,33 @@ async def test_no_langfuse_does_not_crash():
 
 
 @pytest.mark.asyncio
+async def test_serial_injected_when_set():
+    """对话链路内（ContextVar 已设置）请求携带 app_serial_number 头。"""
+    from app.services.trace_serial import set_serial
+    client = _mock_client(_mock_openai_response("ok"))
+    set_serial("OIA-AGENTSCOPE-testpair")
+    try:
+        await chat_complete(client, {"model_name": "m"},
+                            system_prompt="s", user_prompt="u")
+    finally:
+        set_serial("")
+    kwargs = client.chat.completions.create.call_args.kwargs
+    assert kwargs["extra_headers"] == {"app_serial_number": "OIA-AGENTSCOPE-testpair"}
+
+
+@pytest.mark.asyncio
+async def test_serial_omitted_when_not_set():
+    """非对话链路（ContextVar 为空）不带该头，保持原行为。"""
+    from app.services.trace_serial import set_serial
+    client = _mock_client(_mock_openai_response("ok"))
+    set_serial("")
+    await chat_complete(client, {"model_name": "m"},
+                        system_prompt="s", user_prompt="u")
+    kwargs = client.chat.completions.create.call_args.kwargs
+    assert "extra_headers" not in kwargs
+
+
+@pytest.mark.asyncio
 async def test_exception_records_error_level():
     client = MagicMock()
     client.chat.completions.create = AsyncMock(side_effect=ValueError("boom"))

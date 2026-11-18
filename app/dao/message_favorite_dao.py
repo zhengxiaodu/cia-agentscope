@@ -51,6 +51,7 @@ class MessageFavoriteDAO:
             "m.citations, m.bocha_sum "
             f"FROM messages m WHERE m.user_id = %s "
             f"AND m.message_pair_id IN ({placeholders}) "
+            "AND m.deleted_at IS NULL "
             "ORDER BY m.id ASC"
         )
         args = [favorite_id, title, user_id] + list(message_pair_ids)
@@ -79,6 +80,7 @@ class MessageFavoriteDAO:
                         "SELECT content FROM messages "
                         f"WHERE user_id = %s "
                         f"AND message_pair_id IN ({placeholders}) "
+                        "AND deleted_at IS NULL "
                         "AND role = 'user' ORDER BY id ASC LIMIT 1",
                         [user_id] + list(message_pair_ids),
                     )
@@ -169,7 +171,7 @@ class MessageFavoriteDAO:
 
         GROUP BY favorite_id 一条 SQL 完成：title（组内同值取 MAX）、
         message_count（组内消息数）、first_message_time（组内最早消息时间）。
-        ORDER BY MIN(id)：id 序 = 收藏先后顺序。
+        ORDER BY MIN(id) DESC：最新收藏在前。
 
         Returns:
             (total, summaries)：total 为该用户收藏组总数（不分页），
@@ -193,7 +195,7 @@ class MessageFavoriteDAO:
                     "FROM message_favorites "
                     "WHERE user_id = %s "
                     "GROUP BY favorite_id "
-                    "ORDER BY MIN(id) ASC "
+                    "ORDER BY MIN(id) DESC "
                     "LIMIT %s OFFSET %s",
                     (user_id, page_size, offset),
                 )

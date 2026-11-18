@@ -8,10 +8,12 @@ from typing import Any, Optional
 
 from agentscope.state import AgentState
 
+from app.utils.event_serialization import sanitize_text_recursive
+
 logger = logging.getLogger(__name__)
 
-# 历史上下文保留条数（3 轮 = 6 条 user/assistant 消息），用于截断 AgentState.context
-_HISTORY_KEEP_LAST = 6
+# 历史上下文保留条数（6 轮 = 12 条 user/assistant 消息），用于截断 AgentState.context
+_HISTORY_KEEP_LAST = 12
 
 
 def migrate_legacy_enum_values(state_dict: dict) -> dict:
@@ -70,7 +72,17 @@ async def load_agent_state(
         )
         return None
     if not state_dict:
+        logger.info(
+            "[agent_state_store] 无历史状态 session=%s agent=%s",
+            session_id, agent_id,
+        )
         return None
+
+    ctx_len = len(state_dict.get("context") or [])
+    logger.info(
+        "[agent_state_store] 加载状态 session=%s agent=%s context_len=%d",
+        session_id, agent_id, ctx_len,
+    )
 
     # 历史脏数据迁移：修正 "PermissionMode.BYPASS" → "bypass" 等
     state_dict = migrate_legacy_enum_values(state_dict)
@@ -96,6 +108,12 @@ async def persist_agent_state(
     """保存单个 agent 的 AgentState（带非空校验与异常兜底）。"""
     if not (session_service and session_id and user_id and state_dict):
         return
+    # 全链路清洗：state.context 含模型原始输出 + 工具结果，
+    # 流式 chunk 切断的 emoji（孤立代理）和 bash 输出的控制字符
+    # （null/ANSI/二进制片段）都会导致 DAO 层（MySQL/Redis）
+    # UTF-8 编码失败、state 丢失。升级为 sanitize_text_recursive，
+    # 两类问题一起兜住
+    state_dict = sanitize_text_recursive(state_dict)
     try:
         await session_service.save_agent_state(
             session_id, user_id, agent_id, state_dict,

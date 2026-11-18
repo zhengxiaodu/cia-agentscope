@@ -13,6 +13,7 @@ import pytest
 
 from app.routes.auth import (
     _MERGED_REGULATIONS_AGENT,
+    _build_agent_access,
     _build_auth_success,
     _enrich_agent_access,
     _merge_regulations_agents,

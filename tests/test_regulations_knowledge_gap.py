@@ -270,7 +270,9 @@ async def test_resolve_gaps_delegates_to_dao():
     dao.resolve_gaps = AsyncMock(return_value=3)
     n = await svc.resolve_gaps(gap_ids=["g1", "g2"], kb_id=None)
     assert n == 3
-    dao.resolve_gaps.assert_awaited_once_with(gap_ids=["g1", "g2"], kb_id=None)
+    dao.resolve_gaps.assert_awaited_once_with(
+        gap_ids=["g1", "g2"], kb_id=None, allowed_kb_ids=None,
+    )
 
 
 # ---- KnowledgeGapDAO SQL 路径（假 pool） ----

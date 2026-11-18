@@ -47,7 +47,7 @@ class _FakeCursor:
         sql = self.executed[-1][0] if self.executed else ""
         if "COUNT(*)" in sql:
             return self._count_row
-        if sql.startswith("SELECT name, agent_ids FROM sessions"):
+        if sql.startswith("SELECT name, agent_ids, deleted_at FROM sessions"):
             return self._session_row
         return None
 
@@ -128,18 +128,20 @@ async def test_append_messages_writes_pair_id_and_citations():
     ]
     assert len(msg_inserts) == 2
     for sql, _ in msg_inserts:
-        # SQL 列清单含三个扩展列，占位符扩到 11 个
-        assert "message_pair_id, citations, bocha_sum" in sql
-        assert sql.count("%s") == 11
+        # SQL 列清单含四个扩展列，占位符扩到 12 个
+        assert "message_pair_id, citations, bocha_sum, content_parts" in sql
+        assert sql.count("%s") == 12
 
     user_sql, user_args = msg_inserts[0]
     asst_sql, asst_args = msg_inserts[1]
-    # user/assistant 共享同一 message_pair_id（倒数第三个参数）
-    assert user_args[-3] == "pair-1"
-    assert asst_args[-3] == "pair-1"
-    # user 消息不带 citations/bocha_sum → None；assistant 序列化写库
+    # user/assistant 共享同一 message_pair_id（倒数第四个参数）
+    assert user_args[-4] == "pair-1"
+    assert asst_args[-4] == "pair-1"
+    # user 消息不带 citations/bocha_sum/content_parts → None；assistant citations 序列化写库
+    assert user_args[-3] is None
+    assert asst_args[-3] == json.dumps(_CITATIONS, ensure_ascii=False)
     assert user_args[-2] is None
-    assert asst_args[-2] == json.dumps(_CITATIONS, ensure_ascii=False)
+    assert asst_args[-2] is None
     assert user_args[-1] is None
     assert asst_args[-1] is None
     # 事务提交
@@ -167,8 +169,8 @@ async def test_append_messages_empty_citations_written_as_none():
         if sql.startswith("INSERT INTO messages")
     ]
     assert len(msg_inserts) == 2
-    assert msg_inserts[0][1][-2] is None
-    assert msg_inserts[1][1][-2] is None
+    assert msg_inserts[0][1][-3] is None
+    assert msg_inserts[1][1][-3] is None
 
 
 @pytest.mark.asyncio
@@ -200,12 +202,12 @@ async def test_append_messages_writes_bocha_sum():
     ]
     assert len(msg_inserts) == 4
     # user 消息（不带 bocha_sum 键）写 None
-    assert msg_inserts[0][1][-1] is None
+    assert msg_inserts[0][1][-2] is None
     # assistant 非空 bocha_sum 序列化写库
-    assert msg_inserts[1][1][-1] == json.dumps(_BOCHA_SUM, ensure_ascii=False)
+    assert msg_inserts[1][1][-2] == json.dumps(_BOCHA_SUM, ensure_ascii=False)
     # 空列表与 None 均写 NULL
-    assert msg_inserts[2][1][-1] is None
-    assert msg_inserts[3][1][-1] is None
+    assert msg_inserts[2][1][-2] is None
+    assert msg_inserts[3][1][-2] is None
 
 
 @pytest.mark.asyncio
@@ -316,14 +318,20 @@ def _patch_recommended_questions(monkeypatch):
     monkeypatch.setattr(chat_service_module, "_emit_recommended_questions", fake_emit_rq)
 
 
-def _make_orch(events, run_body=None):
-    """orchestrator mock：run 为依次 yield 指定事件的 async 生成器。"""
+def _make_orch(events, run_body=None, consumed_upload_ids=None):
+    """orchestrator mock：run 为依次 yield 指定事件的 async 生成器。
+
+    consumed_upload_ids 非空时模拟本轮消费的上传文件（对齐真实 run()
+    写入 round_state.consumed_upload_ids 的回填方式）。
+    """
     orch = MagicMock()
 
     if run_body is not None:
         fake_run = run_body
     else:
         async def fake_run(*args, **kwargs):
+            if consumed_upload_ids is not None:
+                kwargs["round_state"].consumed_upload_ids = consumed_upload_ids
             for ev in events:
                 yield ev
 
@@ -367,7 +375,7 @@ async def test_generate_response_collects_citations_and_persists_pair(monkeypatc
     _patch_sensitive(monkeypatch)
     _patch_recommended_questions(monkeypatch)
 
-    orch = _make_orch(_CITE_EVENTS)
+    orch = _make_orch(_CITE_EVENTS, consumed_upload_ids=[7])
     session_service = _make_session_service()
     upload_dao = MagicMock()
     upload_dao.bind_message_id = AsyncMock(return_value=1)
@@ -399,9 +407,9 @@ async def test_generate_response_collects_citations_and_persists_pair(monkeypatc
     # user 消息不带 citations 键（仅 assistant 携带）
     assert "citations" not in user_msg
 
-    # bind_message_id 三参：session_id + user_message_id + 本轮 pair id
+    # bind_message_id 四参：session_id + user_message_id + 本轮 pair id + 消费文件 ids
     upload_dao.bind_message_id.assert_awaited_once_with(
-        "sess-1", 101, user_msg["message_pair_id"]
+        "sess-1", 101, user_msg["message_pair_id"], [7]
     )
 
 
@@ -443,6 +451,8 @@ async def test_generate_response_abort_persists_pair_and_citations(monkeypatch):
     cancel_event = asyncio.Event()
 
     async def fake_run(*args, **kwargs):
+        # 模拟本轮已注入消费的上传文件（真实 run() 写入 round_state）
+        kwargs["round_state"].consumed_upload_ids = [7]
         yield 'data: {"type": "policy_qa_citations", "citations": [{"title": "中断前引用", "url": "http://c"}]}\n\n'
         yield 'data: {"type": "react_final", "conclusion": "中断前的结论"}\n\n'
         cancel_event.set()
@@ -477,8 +487,11 @@ async def test_generate_response_abort_persists_pair_and_citations(monkeypatch):
     assert asst_msg["citations"] == [{"title": "中断前引用", "url": "http://c"}]
     # 中断补 UPDATE：最新 assistant 消息 success 置 0
     session_service.mark_last_assistant_failed.assert_awaited_once_with("sess-1", "u1")
-    # finally 路径不传 upload_file_dao → 不回填
-    upload_dao.bind_message_id.assert_not_awaited()
+    # 中断轮同样回填上传文件 message_id：本轮已注入消费的文件若不绑定，
+    # 下一轮会与新上传文件一起重复注入（多轮上传串答的根因之一）
+    upload_dao.bind_message_id.assert_awaited_once_with(
+        "sess-1", 101, user_msg["message_pair_id"], [7]
+    )
     # 前端收到 user_abort 事件
     parsed = [json.loads(e[6:].strip()) for e in events if e.startswith("data: ")]
     assert "user_abort" in [p["type"] for p in parsed]

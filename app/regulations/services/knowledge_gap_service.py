@@ -81,9 +81,16 @@ class KnowledgeGapService:
         self,
         gap_ids: list[str] | None = None,
         kb_id: str | None = None,
+        allowed_kb_ids: list[str] | None = None,
     ) -> int:
-        """标记 open 缺口为 resolved（按 gap_ids 或 kb_id 批量）。返回影响行数。"""
-        return await self.dao.resolve_gaps(gap_ids=gap_ids, kb_id=kb_id)
+        """标记 open 缺口为 resolved（按 gap_ids 或 kb_id 批量）。返回影响行数。
+
+        allowed_kb_ids：调用方（路由层）传入的授权知识库范围，
+        用于 gap_ids 分支的归属约束，防止跨库闭合他人缺口。
+        """
+        return await self.dao.resolve_gaps(
+            gap_ids=gap_ids, kb_id=kb_id, allowed_kb_ids=allowed_kb_ids,
+        )
 
     async def summarize_question_type(self, question: str) -> str:
         """用 LLM 把空检索问题概括成 ≤10 字主题短语；失败/空返回空串。

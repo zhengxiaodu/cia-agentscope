@@ -1,0 +1,10 @@
+{{- if .Values.api.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ template "oia-agentscope.api.fullname" . }}
+  labels:
+{{ include "oia-agentscope.labels" . | indent 4 }}
+data:
+  {{- include "oia-agentscope.api.config" . | nindent 2 }}
+{{- end }}

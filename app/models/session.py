@@ -14,6 +14,12 @@ class SessionMessage(BaseModel):
     message_pair_id: Optional[str] = None
     citations: List[Any] = []
     bocha_sum: List[Any] = []
+    # 点赞点踩：1=赞 0=踩 None=未反馈（前端据此渲染按钮选中态）
+    feedback: Optional[int] = None
+    # 反馈评价内容（点踩后用户填写的文字说明）
+    feedback_comment: Optional[str] = None
+    # 有序内容片段（text / custom_component / feedback_component），前端按序渲染
+    content_parts: List[Any] = []
 
 
 class SessionFile(BaseModel):

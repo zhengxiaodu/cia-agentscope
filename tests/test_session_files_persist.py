@@ -103,8 +103,8 @@ async def test_append_session_files_writes_message_id_and_pair_id():
     assert len(inserts) == 2
     for sql, _ in inserts:
         assert "message_id, message_pair_id" in sql
-        assert "message_id = VALUES(message_id)" in sql
-        assert "message_pair_id = VALUES(message_pair_id)" in sql
+        assert "message_id = new.message_id" in sql
+        assert "message_pair_id = new.message_pair_id" in sql
 
     _, args1 = inserts[0]
     assert args1 == ("s1", "a.md", "a.md", "/persist-files/s1/a.md", 12,
@@ -311,3 +311,36 @@ async def test_detect_and_emit_files_only_new_files_persisted(monkeypatch, tmp_p
     # 只有新文件 b.md 落盘
     assert not (tmp_path / "s1" / "a.md").exists()
     assert (tmp_path / "s1" / "b.md").read_bytes() == b"hello"
+
+
+@pytest.mark.asyncio
+async def test_detect_and_emit_files_filters_process_files(monkeypatch, tmp_path):
+    """文档、图片及指定代码文件返回并持久化，svg/log 等过程文件被过滤。"""
+    monkeypatch.setattr(chat_service_module, "SESSION_FILES_PERSIST_DIR", str(tmp_path))
+    ws = _make_ws(list_files=[
+        "chart.svg", "run.log", "data.json", "README",               # JSON 已纳入白名单
+        "report.docx", "plot.png", "图表.xlsx",                        # 白名单文件
+        "index.html", "style.css", "app.js", "script.py",             # 代码文件
+    ])
+    session_service = MagicMock()
+    session_service.append_session_files = AsyncMock()
+
+    events = await _consume_detect("s1", set(), session_service, ws)
+
+    payload = _parse_event(events[0])
+    # 仅白名单文件下发（diff 按路径升序），svg/log 等被屏蔽
+    expected_paths = [
+        "app.js", "data.json", "index.html", "plot.png", "report.docx", "script.py", "style.css", "图表.xlsx"
+    ]
+    assert [f["path"] for f in payload["files"]] == expected_paths
+    # 被屏蔽文件不 stat / 不读字节流
+    stat_names = [c.args[2] for c in ws.stat_session_file.await_args_list]
+    assert stat_names == expected_paths
+    assert ws.read_session_file.await_count == len(expected_paths)  # 仅白名单文件读字节流
+    # 持久化目录仅白名单文件落盘
+    assert sorted(p.name for p in (tmp_path / "s1").rglob("*") if p.is_file()) == expected_paths
+    for name in ("index.html", "style.css", "app.js", "script.py"):
+        assert (tmp_path / "s1" / name).read_bytes() == b"hello"
+    # 落库元信息同样仅白名单
+    files_arg = session_service.append_session_files.await_args[0][1]
+    assert [f["path"] for f in files_arg] == expected_paths

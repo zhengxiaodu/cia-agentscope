@@ -12,6 +12,12 @@ import aiomysql
 
 logger = logging.getLogger(__name__)
 
+# 会话属主以已登记的 sessions 为准，隔离历史遗留的异属主附件。
+_OWNER_SCOPE = (
+    "AND user_id = (SELECT s.user_id FROM sessions s "
+    "WHERE s.session_id = upload_files.session_id AND s.deleted_at IS NULL) "
+)
+
 
 class UploadFileDAO:
     """上传文件数据访问层"""
@@ -81,14 +87,52 @@ class UploadFileDAO:
 
         解析失败/超时的记录 parsed_content 为提示文案，同样返回——
         让 agent 诚实告知用户该文件解析失败。
+        id 一并返回：供轮末 bind_message_id 精确绑定本轮消费的文件。
         """
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
-                    "SELECT filename, parsed_content FROM upload_files "
-                    "WHERE session_id = %s AND message_id IS NULL "
+                    "SELECT id, filename, parsed_content FROM upload_files "
+                    "WHERE session_id = %s " + _OWNER_SCOPE + "AND message_id IS NULL "
                     "AND parsed_content IS NOT NULL AND parsed_content != '' "
                     "ORDER BY id",
+                    (session_id,),
+                )
+                rows = await cur.fetchall()
+                await conn.commit()
+                return [dict(r) for r in rows]
+
+    async def get_filenames_by_ids(
+        self, session_id: str, file_ids: List[int]
+    ) -> List[str]:
+        """按 id 查询本轮消费文件的文件名（供纯文件轮的会话命名提示）。"""
+        if not file_ids:
+            return []
+        placeholders = ",".join(["%s"] * len(file_ids))
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT filename FROM upload_files "
+                    "WHERE session_id = %s " + _OWNER_SCOPE +
+                    f"AND id IN ({placeholders}) ORDER BY id",
+                    (session_id, *file_ids),
+                )
+                rows = await cur.fetchall()
+                await conn.commit()
+                return [r["filename"] for r in rows]
+
+    async def load_session_file_index(self, session_id: str) -> List[dict]:
+        """查询该会话全部上传文件的名录（轻量：仅状态与绑定信息，不含解析全文）。
+
+        返回键：filename / status / message_id。供两个用途：
+        - 意图识别的"本轮新上传文件"提示构建（防止 LLM 从历史回复脑补文件名）
+        - agent 上下文的"会话历史文件档案"（历史文件指路沙箱 uploads/ 副本）
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT filename, status, message_id FROM upload_files "
+                    "WHERE session_id = %s " + _OWNER_SCOPE + "ORDER BY id ASC",
                     (session_id,),
                 )
                 rows = await cur.fetchall()
@@ -105,8 +149,24 @@ class UploadFileDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT filename, parse_type FROM upload_files "
-                    "WHERE session_id = %s AND message_id IS NULL "
+                    "WHERE session_id = %s " + _OWNER_SCOPE + "AND message_id IS NULL "
                     "AND status IN ('pending', 'parsing') "
+                    "ORDER BY id",
+                    (session_id,),
+                )
+                rows = await cur.fetchall()
+                await conn.commit()
+                return [dict(r) for r in rows]
+
+    async def load_all_parsed(self, session_id: str) -> List[dict]:
+        """查询该会话全部解析完成的文件（含已绑定），用于沙箱重建后的缺失补写。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT filename, parsed_content, message_id "
+                    "FROM upload_files "
+                    "WHERE session_id = %s " + _OWNER_SCOPE +
+                    "AND parsed_content IS NOT NULL AND parsed_content != '' "
                     "ORDER BY id",
                     (session_id,),
                 )
@@ -119,19 +179,27 @@ class UploadFileDAO:
         session_id: str,
         message_id: int,
         message_pair_id: str = None,
+        file_ids: Optional[List[int]] = None,
     ) -> int:
-        """把该会话全部未绑定的上传文件绑定到本轮 user 消息，返回影响行数。
+        """把本轮实际消费的上传文件绑定到本轮 user 消息，返回影响行数。
 
-        message_pair_id 与 message_id 一并回填（本轮问答的配对标识）。
+        只绑定 file_ids 指定且当前未绑定的文件：解析中（parsed_content
+        还没写入）与流式回复期间新上传的文件不在列表内即不绑定，留给
+        下一轮正常消费——避免"绑定了却从未注入"的永久孤儿。
+        file_ids 为空直接返回 0（不做全量 NULL 绑定）。
         """
+        if not file_ids:
+            return 0
+        placeholders = ",".join(["%s"] * len(file_ids))
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
-                    "UPDATE upload_files "
-                    "SET message_id = %s, message_pair_id = %s, "
-                    "updated_at = NOW() "
-                    "WHERE session_id = %s AND message_id IS NULL",
-                    (message_id, message_pair_id, session_id),
+                    f"UPDATE upload_files "
+                    f"SET message_id = %s, message_pair_id = %s, "
+                    f"updated_at = NOW() "
+                    "WHERE session_id = %s " + _OWNER_SCOPE + "AND message_id IS NULL "
+                    f"AND id IN ({placeholders})",
+                    (message_id, message_pair_id, session_id, *file_ids),
                 )
                 affected = cur.rowcount
                 await conn.commit()
@@ -147,7 +215,7 @@ class UploadFileDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT 1 FROM upload_files "
-                    "WHERE session_id = %s AND message_id IS NULL LIMIT 1",
+                    "WHERE session_id = %s " + _OWNER_SCOPE + "AND message_id IS NULL LIMIT 1",
                     (session_id,),
                 )
                 row = await cur.fetchone()
@@ -222,7 +290,7 @@ class UploadFileDAO:
                 await cur.execute(
                     "SELECT filename, media_type, file_size, created_at, "
                     "message_id, message_pair_id FROM upload_files "
-                    "WHERE session_id = %s ORDER BY id ASC",
+                    "WHERE session_id = %s " + _OWNER_SCOPE + "ORDER BY id ASC",
                     (session_id,),
                 )
                 rows = await cur.fetchall()

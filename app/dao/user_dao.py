@@ -13,7 +13,8 @@
             "skill_blacklist": [{"id","name","code"}, ...],
         },
     }
-验证失败时仅返回 {"verification": False}。
+验证失败时（mng 模式）返回 {"verification": False, "code": <mng 业务码或 HTTP 状态码>, "message": <mng 消息>}；
+AUTH_MOCK 模拟失败时仅返回 {"verification": False}（路由层回退 401）。
 """
 import asyncio
 import logging
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 # 模拟账号数据（含 permissions，结构与 mng 返回保持一致）
 _MOCK_USERS = {
     "zhangsan": {
-        "password": "207cf410532f92a47dee245ce9b11ff71f578ebd763eb3bbea44ebd043d018fb",
+        "password": "397731625acdd3d293b020187543b3d7c950b299588f41d0cc5f09d2dbff63f7",
         "verification": True,
         "user_info": {
             "id": "123",
@@ -40,7 +41,20 @@ _MOCK_USERS = {
         "permissions": {
             "agent_whitelist": [
                 {"id": "123", "name": "制度问答", "show": 1},
-                {"id": "999", "name": "生成PPT智能体", "show": 0},
+                {
+                    "id": "999",
+                    "name": "生成PPT智能体",
+                    "show": 0,
+                    # mcpClientConfig 示例（联调时替换为真实 MCP 服务地址）
+                    "mcpClientConfig": {
+                        "code": "ppt_mcp",
+                        "transport_type": "streamable_http",
+                        "transport_url": "http://localhost:8000/mcp",
+                        "query_params": {"demo": "1"},
+                        "authorization": "Bearer demo-token",
+                    },
+                },
+                
             ],
             "skill_blacklist": [
                 {"id": "456", "name": "博查搜索", "code": "bocha_search"},
@@ -48,7 +62,7 @@ _MOCK_USERS = {
         },
     },
     "admin": {
-        "password": "207cf410532f92a47dee245ce9b11ff71f578ebd763eb3bbea44ebd043d018fb",
+        "password": "397731625acdd3d293b020187543b3d7c950b299588f41d0cc5f09d2dbff63f7",
         "verification": True,
         "user_info": {
             "id": "1",
@@ -60,7 +74,31 @@ _MOCK_USERS = {
         "permissions": {
             "agent_whitelist": [
                 {"id": "123", "name": "制度问答", "show": "1"},
-                {"id": "999", "name": "生成PPT智能体", "show": 0},
+                {
+                    "id": "999",
+                    "name": "生成PPT智能体",
+                    "show": 0,
+                    # mcpClientConfig 示例（联调时替换为真实 MCP 服务地址）
+                    "mcpClientConfig": {
+                        "code": "ppt_mcp",
+                        "transport_type": "streamable_http",
+                        "transport_url": "http://localhost:8000/mcp",
+                        "query_params": {"demo": "1"},
+                        "authorization": "Bearer demo-token",
+                    },
+                },
+                {
+                    "id": "1000",
+                    "name": "联网搜索智能体",
+                    "show": 0,
+                    # 百度千帆 AI Search MCP（真实服务，联调用）
+                    "mcpClientConfig": {
+                        "code": "aisearch_mcp",
+                        "transport_type": "streamable_http",
+                        "transport_url": "https://qianfan.baidubce.com/v2/ai_search/mcp",
+                        "authorization": "Bearer xxx",
+                    },
+                },
             ],
             "skill_blacklist": [],
         },
@@ -73,10 +111,12 @@ async def verify_login_via_mng(username: str, password: str) -> dict:
 
     请求 POST {MNG_AUTH_URL}/api/auth/user/login，body: {"username", "password"}
     成功时解析 mng 返回并标准化为内部结构。
+    失败时透传 mng 的 code/message（响应体无业务码时回退 HTTP 状态码），
+    供路由层原样返回前端。
     """
     if not MNG_AUTH_URL:
         logger.error("[user_dao] MNG_AUTH_URL 未配置，无法调用 mng 登录")
-        return {"verification": False}
+        return {"verification": False, "code": 500, "message": "MNG_AUTH_URL 未配置"}
 
     url = f"{MNG_AUTH_URL}/api/auth/user/login"
     try:
@@ -85,25 +125,35 @@ async def verify_login_via_mng(username: str, password: str) -> dict:
                 url,
                 json={"username": username, "password": password},
             )
-            if resp.status_code != 200:
-                logger.warning(f"[user_dao] mng 登录返回非 200: {resp.status_code}")
-                return {"verification": False}
 
-            body = resp.json()
+            # 尽力解析响应体（非 JSON/空体时按空字典处理）
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+
             # mng 返回: {"code":200, "message":"登录成功", "data":{...}}
-            if body.get("code") != 200:
-                logger.warning(f"[user_dao] mng 登录业务失败: {body.get('message')}")
-                return {"verification": False}
+            if resp.status_code == 200 and body.get("code") == 200:
+                data = body.get("data", {}) or {}
+                return {
+                    "verification": True,
+                    "user_info": data.get("user_info", {}),
+                    "permissions": data.get("permissions", {}),
+                }
 
-            data = body.get("data", {}) or {}
-            return {
-                "verification": True,
-                "user_info": data.get("user_info", {}),
-                "permissions": data.get("permissions", {}),
-            }
+            # 失败：mng 返回什么 code/message 就透传什么
+            code = body.get("code")
+            if code is None:
+                code = resp.status_code
+            message = body.get("message") or "登录失败"
+            logger.warning(
+                f"[user_dao] mng 登录失败: status={resp.status_code} "
+                f"code={code} message={message}"
+            )
+            return {"verification": False, "code": code, "message": message}
     except Exception as e:
         logger.exception(f"[user_dao] 调用 mng 登录服务失败: {e}")
-        return {"verification": False}
+        return {"verification": False, "code": 500, "message": "登录服务异常"}
 
 
 async def verify_login(username: str, password: str) -> dict:
@@ -248,10 +298,10 @@ async def update_department_via_mng(jwt_token: str, department: str) -> dict:
         return {"success": False, "message": "修改部门服务异常"}
 
 
-async def update_password_via_mng(jwt_token: str, old_password: str, new_password: str) -> dict:
+async def update_password_via_mng(jwt_token: str, old_password: str, new_password: str,repeat_new_password: str) -> dict:
     """调用 mng 修改密码。
 
-    请求 PUT {MNG_AUTH_URL}/api/auth/me/password，body: {"old_password","new_password"}，需带 Authorization（本系统 JWT）。
+    请求 PUT {MNG_AUTH_URL}/api/auth/me/password，body: {"old_password","new_password","repeat_new_password"}，需带 Authorization（本系统 JWT）。
     成功返回 {"success": True}，失败返回 {"success": False, "message": ...}。
     """
     if not MNG_AUTH_URL:
@@ -263,7 +313,7 @@ async def update_password_via_mng(jwt_token: str, old_password: str, new_passwor
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.put(
                 url,
-                json={"old_password": old_password, "new_password": new_password},
+                json={"old_password": old_password, "new_password": new_password,"repeat_new_password":repeat_new_password},
                 headers={"Authorization": f"Bearer {jwt_token}"},
             )
             if resp.status_code != 200:

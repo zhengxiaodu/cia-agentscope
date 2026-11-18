@@ -12,6 +12,7 @@
 """
 import asyncio
 import json
+from contextlib import aclosing
 import logging
 import time
 from typing import Any, AsyncGenerator, Dict, Optional, Union
@@ -155,15 +156,16 @@ class ReActOrchestrator(BaseOrchestrator):
 
             # 执行智能体（实时透传事件 + 提取 observation）
             observation = ""
-            async for item in self._execute_action(
+            async with aclosing(self._execute_action(
                 action_name, action_args, intent_result, session_id, agent_states,
                 langfuse_service,
-            ):
-                if isinstance(item, TaskResult):
-                    observation = item.output if item.success else f"执行失败: {item.output}"
-                else:
-                    # 实时透传 SSE 事件
-                    yield item
+            )) as stream:
+                async for item in stream:
+                    if isinstance(item, TaskResult):
+                        observation = item.output if item.success else f"执行失败: {item.output}"
+                    else:
+                        # 实时透传 SSE 事件
+                        yield item
 
             # Observe：追加到 scratch
             step_record = (
@@ -286,17 +288,18 @@ class ReActOrchestrator(BaseOrchestrator):
 
             agent_state = (agent_states or {}).get(agent_id)
             result = None
-            async for item in self._run_single_agent(
+            async with aclosing(self._run_single_agent(
                 intent,
                 session_id=session_id,
                 agent_state=agent_state,
                 langfuse_service=langfuse_service,
-            ):
-                if isinstance(item, TaskResult):
-                    result = item
-                else:
-                    # 实时透传 SSE 事件
-                    yield item
+            )) as stream:
+                async for item in stream:
+                    if isinstance(item, TaskResult):
+                        result = item
+                    else:
+                        # 实时透传 SSE 事件
+                        yield item
             if result is None:
                 # 理论上不会，兜底
                 yield TaskResult(

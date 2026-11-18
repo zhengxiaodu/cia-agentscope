@@ -1,3 +1,4 @@
+import logging
 import uuid
 from typing import Optional
 
@@ -5,11 +6,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, 
 
 from app.dependencies import current_user
 from app.services.file_service import FileService
-from app.config import UPLOAD_MAX_SIZE_MB, UPLOAD_ALLOWED_MEDIA_TYPES
+from app.config import (
+    UPLOAD_MAX_SIZE_MB,
+    UPLOAD_AV_MAX_SIZE_MB,
+    UPLOAD_ALLOWED_MEDIA_TYPES,
+)
 from app.models.upload import UploadResponse, UploadErrorResponse
-from app.services.file_parse_service import start_background_parse
+from app.services.file_parse_service import acquire_upload_slot, classify_parse_type, start_background_parse
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -25,19 +32,24 @@ async def upload_file(
     - 图片/文档/pdf/表格 → MinerU；音频 → 音频转写模型；纯文本直接读取
     - 不再写入沙箱/宿主机工作区：问答时解析内容经提示词注入给 agent
     """
-    # Validate file size
-    content = await file.read()
-    if not FileService.validate_file_size(content, UPLOAD_MAX_SIZE_MB):
+    # Validate file size：音视频（走转写解析，体积大）单独放宽
+    media_type = file.content_type or "application/octet-stream"
+    limit_mb = (
+        UPLOAD_AV_MAX_SIZE_MB
+        if media_type.startswith(("audio/", "video/"))
+        else UPLOAD_MAX_SIZE_MB
+    )
+    # 已知大小先预检（UploadFile.size 来自落盘临时文件），超限直接 413，
+    # 避免超大文件整读进内存后才发现超限
+    if file.size is not None and file.size > limit_mb * 1024 * 1024:
         raise HTTPException(
             status_code=413,
             detail=UploadErrorResponse(
                 code=413,
-                msg=f"文件大小超过限制（最大 {UPLOAD_MAX_SIZE_MB}MB）",
+                msg=f"文件大小超过限制（最大 {limit_mb}MB）",
             ).model_dump(),
         )
-
     # Validate media type
-    media_type = file.content_type or "application/octet-stream"
     if not FileService.validate_media_type(media_type, UPLOAD_ALLOWED_MEDIA_TYPES):
         raise HTTPException(
             status_code=415,
@@ -46,17 +58,40 @@ async def upload_file(
                 msg="不支持的文件类型",
             ).model_dump(),
         )
+    if classify_parse_type(media_type, file.filename or "unknown") == "none":
+        logger.warning(
+            "[upload] 拒绝不可解析文件 media_type=%s filename=%s",
+            media_type, file.filename,
+        )
+        raise HTTPException(
+            status_code=415,
+            detail=UploadErrorResponse(
+                code=415,
+                msg="不支持的文件类型",
+            ).model_dump(),
+        )
 
-    user_id = user.get("user_id")
-    if not session_id:
-        session_service = request.app.state.session_service
-        session_id = await session_service.get_or_create_session(None, user_id)
-
-    # 后台异步解析：立即返回 file_id，解析结果稍后写入 upload_files 表
+    admission = acquire_upload_slot()
     filename = file.filename or "unknown"
-    file_id = await start_background_parse(
-        request, session_id, user_id, filename, media_type, content
-    )
+    transferred = False
+    try:
+        user_id = user.get("user_id")
+        session_id = await request.app.state.session_service.get_or_create_session(
+            session_id, user_id
+        )
+        # 即使 size 缺失也最多读到上限 + 1，避免兜底检查前无界分配。
+        content = await file.read(limit_mb * 1024 * 1024 + 1)
+        if not FileService.validate_file_size(content, limit_mb):
+            raise HTTPException(status_code=413, detail=UploadErrorResponse(
+                code=413, msg=f"文件大小超过限制（最大 {limit_mb}MB）",
+            ).model_dump())
+        file_id = await start_background_parse(
+            request, session_id, user_id, filename, media_type, content, admission=admission,
+        )
+        transferred = True
+    finally:
+        if not transferred:
+            admission.release()
 
     return UploadResponse(
         code=200,

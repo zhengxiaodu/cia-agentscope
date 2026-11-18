@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 import httpx
 
 from app.config import MNG_INTENT_URL
@@ -68,3 +69,45 @@ async def proxy_custom_component_configs(request: Request, user: dict = Depends(
             headers={"Authorization": f"Bearer {jwt_token}"},
         )
         return resp.json()
+
+
+@router.post("/systemFeedbacks/add")
+async def proxy_system_feedback_add(request: Request, user: dict = Depends(current_user)):
+    """系统反馈提交：前端 POST /api/systemFeedbacks/add → mng POST /api/feedbacks。"""
+    if not MNG_INTENT_URL:
+        # 本地开发兜底：仅 AUTH_MOCK=true 时直接返回成功；生产（AUTH_MOCK=false）维持 500
+        if _is_auth_mock():
+            return {"success": True, "message": None, "data": None}
+        raise HTTPException(status_code=500, detail="MNG_INTENT_URL not configured")
+    jwt_token = await _get_jwt_from_header(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    # follow_redirects：mng 部分路由注册带尾部斜杠会 307，同源重定向会保留 Authorization 头
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        resp = await client.post(
+            f"{MNG_INTENT_URL}/api/feedbacks",
+            headers={"Authorization": f"Bearer {jwt_token}"},
+            json=body,
+        )
+        return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+
+@router.get("/api/portal/notifications")
+async def proxy_public_active(request: Request, user: dict = Depends(current_user)):
+    """通知接口透传：前端 GET /api/portal/notifications → mng GET api/notifications/public/active，响应原样返回。"""
+    if not MNG_INTENT_URL:
+        # 本地开发兜底：仅 AUTH_MOCK=true 时读 mock（文件缺失返回空数据封包）；生产维持 500
+        if _is_auth_mock():
+            return _load_mock_response("public_active.json")
+        raise HTTPException(status_code=500, detail="MNG_INTENT_URL not configured")
+    jwt_token = await _get_jwt_from_header(request)
+    # follow_redirects：mng 部分路由注册带尾部斜杠会 307，同源重定向会保留 Authorization 头
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        resp = await client.get(
+            f"{MNG_INTENT_URL}/api/notifications/public/active",
+            headers={"Authorization": f"Bearer {jwt_token}"},
+            params=dict(request.query_params),
+        )
+        return JSONResponse(content=resp.json(), status_code=resp.status_code)

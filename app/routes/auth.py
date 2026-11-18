@@ -27,6 +27,7 @@ from app.services.auth_service import (
     save_user_permissions,
     get_user_permissions,
 )
+from tools.policy_qa_tools import resolve_user_kb_names
 from app.config import JWT_EXPIRE_HOURS, JWT_REFRESH_EXPIRE_DAYS
 
 router = APIRouter()
@@ -35,30 +36,30 @@ router = APIRouter()
 # 文档/音频解析已改为上传时后台完成（见 file_parse_service），不再作为可选技能
 _OPTIONAL_SKILLS = [
     {
-        "name": "policy_qa",
-        "nickname": "制度问答",
-        "description": "根据公司内部制度文件知识库回答问题。",
+        "name": "excel-xlsx",
+        "nickname": "Excel 表格处理",
+        "description": "创建、检查、编辑 Excel 工作簿，保障公式、日期、数据类型与格式可靠。",
     },
     {
-        "name": "deep-research",
-        "nickname": "深度调研",
-        "description": "用于系统性研究、竞品分析、方案对比、趋势分析或事实核查等等",
+        "name": "word-docx",
+        "nickname": "Word 文档处理",
+        "description": "创建、检查、编辑 Word 文档，保障样式、编号、修订与版式在编辑后不漂移。",
     },
     {
-        "name": "internal-comms",
-        "nickname": "撰写公司内部报告",
-        "description": "撰写各类内部通讯的技能。",
+        "name": "smart-charts",
+        "nickname": "智能交互图表",
+        "description": "根据数据生成可交互的 ECharts 图表（含中国/世界地图、词云），完全离线可用。",
     },
     {
-        "name": "sn-da-excel-workflow",
-        "nickname": "表格分析处理",
-        "description": "Excel分析/数据清洗/数据统计/数据筛选等等",
+        "name": "unclecheng-reduce-ai-perception",
+        "nickname": "去 AI 味润色",
+        "description": "降低文本的 AI 生成痕迹，使用词、句式、结构更接近真人表达。",
     },
     {
-        "name": "chart_renderer",
-        "nickname": "可视化图表",
-        "description": "智能图表渲染技能，根据数据特征自动选择最合适的图表类型并通过工具渲染。",
-    }
+        "name": "ydxc0511",
+        "nickname": "公文材料写作",
+        "description": "发言稿、心得体会、宣传通讯等机关材料的写作模板与范文参考。",
+    },
 ]
 
 
@@ -132,10 +133,13 @@ def _merge_regulations_agents(agent_whitelist: list) -> list:
 
 
 def _normalize_agent_access(agent_access: list) -> list:
-    """返回前端前的 agent_access 统一格式：去掉 show 字段，description 兜底空串。
+    """返回前端前的 agent_access 统一格式。
+
+    去掉 show 字段与 mcpClientConfig 字段（后者含 authorization 鉴权凭证，
+    不下发前端），description 兜底空串。
 
     仅作用于响应构造层；Redis permissions 保持原始结构
-    （含 show，供权限过滤/知识库映射使用）。非 dict 项原样保留。
+    （含 show/mcpClientConfig，供权限融合/MCP 注册使用）。非 dict 项原样保留。
     """
     if not isinstance(agent_access, list):
         return agent_access
@@ -144,10 +148,32 @@ def _normalize_agent_access(agent_access: list) -> list:
         if not isinstance(item, dict):
             normalized.append(item)
             continue
-        cleaned = {k: v for k, v in item.items() if k != "show"}
+        cleaned = {
+            k: v
+            for k, v in item.items()
+            if k not in ("show", "mcpClientConfig")
+        }
         cleaned["description"] = item.get("description") or ""
         normalized.append(cleaned)
     return normalized
+
+
+def _build_agent_access(permissions: dict) -> list:
+    """agent_access 统一构造：合并制度问答项 → 清洗 → 注入可选知识库名。
+
+    在合并出的 regulations_agent 项上追加 knowledge_bases（用户可访问的
+    知识库名列表，即 POLICY_QA_KB_MAP 匹配键，供前端渲染知识库选择器）；
+    无制度问答合并项时原样返回（非制度问答用户零感知）。
+    登录/注册与 refresh/改资料响应共用，保证结构逐字段一致。
+    """
+    agent_access = _normalize_agent_access(
+        _merge_regulations_agents(permissions.get("agent_whitelist", []))
+    )
+    for item in agent_access:
+        if isinstance(item, dict) and item.get("id") == "regulations_agent":
+            item["knowledge_bases"] = resolve_user_kb_names(permissions)
+            break
+    return agent_access
 
 
 async def _build_auth_success(result: dict, request: Request) -> dict:
@@ -219,9 +245,7 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
         "refresh_token": refresh_token,
         "refresh_expires_in": JWT_REFRESH_EXPIRE_DAYS * 86400,
         "user_info": user_info,
-        "agent_access": _normalize_agent_access(
-            _merge_regulations_agents(permissions["agent_whitelist"])
-        ),
+        "agent_access": _build_agent_access(permissions),
         "skill_blacklist": permissions["skill_blacklist"],
         "optional_skills": _OPTIONAL_SKILLS,
     })
@@ -231,7 +255,11 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
 async def login(request: Request, login_req: LoginRequest):
     result = await verify_login(login_req.username, login_req.password)
     if not result.get("verification"):
-        return error_response(401, "用户名或密码错误")
+        # mng 模式下透传 mng 的 code/message；mock 失败回退 401
+        return error_response(
+            result.get("code", 401),
+            result.get("message", "用户名或密码错误"),
+        )
     return await _build_auth_success(result, request)
 
 
@@ -296,9 +324,7 @@ async def _build_update_response(request: Request, user: dict, updates: dict) ->
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
-        "agent_access": _normalize_agent_access(
-            _merge_regulations_agents(permissions.get("agent_whitelist", []))
-        ),
+        "agent_access": _build_agent_access(permissions),
         "skill_blacklist": permissions.get("skill_blacklist", []),
         "optional_skills": _OPTIONAL_SKILLS,
     })
@@ -325,7 +351,7 @@ async def update_department(request: Request, body: UpdateDepartmentRequest, use
 @router.put("/api/auth/me/password")
 async def update_password(request: Request, body: UpdatePasswordRequest, user: dict = Depends(current_user)):
     jwt_token = await _require_jwt_from_header(request)
-    result = await update_password_via_mng(jwt_token, body.old_password, body.new_password)
+    result = await update_password_via_mng(jwt_token, body.old_password, body.new_password,body.repeat_new_password)
     if not result.get("success"):
         return error_response(400, result.get("message", "修改密码失败"))
     return await _build_update_response(request, user, {})
@@ -371,9 +397,7 @@ async def refresh_token(request: Request, body: RefreshRequest):
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
-        "agent_access": _normalize_agent_access(
-            _merge_regulations_agents(permissions.get("agent_whitelist", []))
-        ),
+        "agent_access": _build_agent_access(permissions),
         "skill_blacklist": permissions.get("skill_blacklist", []),
         "optional_skills": _OPTIONAL_SKILLS,
     })

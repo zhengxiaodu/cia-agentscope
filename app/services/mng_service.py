@@ -3,6 +3,7 @@
 提供从 mng 系统获取外部意图配置的能力，配合用户权限进行过滤。
 """
 import logging
+import os
 from typing import List, Optional
 
 import httpx
@@ -13,6 +14,41 @@ logger = logging.getLogger(__name__)
 
 # mng 系统意图接口
 _MNG_INTENTS_PATH = "/api/intents"
+
+# AUTH_MOCK=true 时的内置外部意图（结构与 mng /api/intents 返回一致），
+# 用于本地无 mng 服务时联调：agent id=999/1000 与 user_dao._MOCK_USERS 白名单的
+# "生成PPT智能体"/"联网搜索智能体"项（均含 mcpClientConfig）匹配，
+# 可验证 MCP 配置全链路（1000 为百度千帆 AI Search 真实 MCP 服务）。
+_MOCK_EXTERNAL_INTENTS = [
+    {
+        "id": 9001,
+        "name": "生成PPT",
+        "intentCode": "generate_ppt",
+        "status": 1,
+        "definition": "根据用户需求生成PPT文档",
+        "agent": {
+            "id": "999",
+            "name": "生成PPT智能体",
+            "code": "agent_ppt",
+            "system_prompt": "你是PPT生成智能体，负责根据用户需求生成PPT。",
+        },
+        "skills": [],
+    },
+    {
+        "id": 9002,
+        "name": "联网搜索",
+        "intentCode": "web_search",
+        "status": 1,
+        "definition": "搜索实时信息，并使用大模型进行总结回复",
+        "agent": {
+            "id": "1000",
+            "name": "联网搜索智能体",
+            "code": "agent_search",
+            "system_prompt": "你是联网搜索智能体，负责搜索实时信息并总结回复。",
+        },
+        "skills": [],
+    },
+]
 
 
 async def fetch_external_intents(jwt_token: str) -> List[dict]:
@@ -44,6 +80,9 @@ async def fetch_external_intents(jwt_token: str) -> List[dict]:
         ]
         status=0 表示禁用（返回前已剔除）；字段缺失/None 视为启用。
     """
+    if os.getenv("AUTH_MOCK", "true").lower() == "true":
+        logger.info("[mng_service] AUTH_MOCK=true，返回内置 mock 外部意图")
+        return _MOCK_EXTERNAL_INTENTS
     if not MNG_INTENT_URL:
         logger.warning("[mng_service] MNG_INTENT_URL 未配置，跳过获取外部意图")
         return []
@@ -136,8 +175,32 @@ def _build_whitelist_codes(agent_whitelist: list) -> set:
     return codes
 
 
-def _build_blacklist_codes(skill_blacklist: list) -> set:
-    """从 skill_blacklist 列表中提取所有 code，转为集合用于快速查找。"""
+def _build_whitelist_mcp_map(agent_whitelist: list) -> dict:
+    """从 agent_whitelist 列表中提取 id → mcpClientConfig 映射。
+
+    仅收集 mcpClientConfig 非 null 的项：
+        {"<id>": mcpClientConfig, ...}
+    供 merge_external_into_memory 附加到白名单匹配的 merged agent。
+    """
+    mapping: dict = {}
+    if not isinstance(agent_whitelist, list):
+        return mapping
+    for item in agent_whitelist:
+        if not isinstance(item, dict):
+            continue
+        mcp_cfg = item.get("mcpClientConfig")
+        item_id = item.get("id")
+        if mcp_cfg and item_id:
+            mapping[item_id] = mcp_cfg
+    return mapping
+
+
+def build_blacklist_codes(skill_blacklist: list) -> set:
+    """从 skill_blacklist 列表中提取所有 code，转为集合用于快速查找。
+
+    公共函数：除融合层过滤外部技能外，orchestrator 亦用它做
+    内置技能（bocha_search 联网搜索）的 mng 权限校验。
+    """
     codes = set()
     if not isinstance(skill_blacklist, list):
         return codes
@@ -183,7 +246,10 @@ def merge_external_into_memory(
     agent_whitelist = _build_whitelist_codes(
         permissions.get("agent_whitelist", []) if permissions else []
     )
-    skill_blacklist = _build_blacklist_codes(
+    whitelist_mcp_map = _build_whitelist_mcp_map(
+        permissions.get("agent_whitelist", []) if permissions else []
+    )
+    skill_blacklist = build_blacklist_codes(
         permissions.get("skill_blacklist", []) if permissions else []
     )
 
@@ -293,6 +359,12 @@ def merge_external_into_memory(
                 "name": agent_name,
                 "skills": skill_codes,
                 "system_prompt": agent_prompt,
+                # 白名单项携带 mcpClientConfig 时附加到该智能体（键转 snake_case）
+                **(
+                    {"mcp_client_config": whitelist_mcp_map[agent_id]}
+                    if agent_id in whitelist_mcp_map
+                    else {}
+                ),
             })
 
     logger.info(

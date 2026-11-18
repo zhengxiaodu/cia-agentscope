@@ -102,7 +102,8 @@ async for event in _with_heartbeat(generate_response(...)):
 - 心跳格式用 SSE 注释行 `: ping\n\n`：符合 SSE 规范，EventSource/fetch-event-source/自研 `data:` 解析器均忽略，前端零改动
 - 默认 15s：对 nginx 默认 60s 读超时留 4 倍余量；可用环境变量调整或置 0 禁用
 - 异常不吞：源流异常照常抛给 Starlette（与现状一致），仅多一层队列透传
-- 客户端断开时行为不变：Starlette cancel `_with_heartbeat` → finally cancel pump → CancelledError 传入 generate_response → 751 分支落库收尾，与改造前完全一致
+- 客户端断开时行为（后续改造已更新）：Starlette cancel `_with_heartbeat` 且非用户停止时进入 detached 模式，pump 继续把本轮生成跑完并落库，收尾 `on_finish` 在 pump 结束时执行；用户主动停止仍走 cancel pump → CancelledError 传入 generate_response 的落库分支
+- `StreamingResponse` 的 `background` 收尾仅作"body 从未被消费"（极早断连/服务关闭）的兜底：`_with_heartbeat` 通过 `on_detach` 把接管生成的后台任务交给路由，后台收尾发现它仍在运行就让位，避免生成跑完前释放租约/移出运行表（否则同一会话可被并发开启新一轮）
 - 不动 chat_service.py、不动编排层
 
 ## Verification（按用户要求最小化）

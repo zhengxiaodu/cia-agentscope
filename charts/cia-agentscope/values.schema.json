@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "oia-agentscope values",
+  "description": "仅校验顶层键名，防止 --set 写错键时 Helm 静默创建无效字段（Helm 对未知键不报错）。子层结构不做限制。",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "global": {
+      "description": "Helm 保留键，子 chart 共享值"
+    },
+    "affinity": {
+      "description": "全局亲和性，可被 api/proxy 各自覆盖"
+    },
+    "annotations": {
+      "description": "全局额外注解"
+    },
+    "api": {
+      "description": "后端（AgentScope/FastAPI，端口 7012）配置，含 replicas、jwt、auth、session、upload、log、mng、opensandbox、regulations、mineru、sensitive、bocha、persistence 等"
+    },
+    "externalMysql": {
+      "description": "外部 MySQL 连接信息，渲染成 MYSQL_HOST/PORT/USER/PASSWORD/DATABASE"
+    },
+    "externalRedis": {
+      "description": "外部 Redis 连接信息，拼装成 REDIS_URL"
+    },
+    "extraConfigFiles": {
+      "description": "额外的配置文件挂载"
+    },
+    "fullnameOverride": {
+      "description": "完全覆盖资源名"
+    },
+    "image": {
+      "description": "镜像地址与拉取密钥，子键 api / proxy"
+    },
+    "labels": {
+      "description": "全局额外标签"
+    },
+    "langfuse": {
+      "description": "Langfuse 地址与密钥（敏感项，建议改用 api.existingSecret）"
+    },
+    "nameOverride": {
+      "description": "覆盖资源名前缀"
+    },
+    "nodeSelector": {
+      "description": "全局节点选择器，可被 api/proxy 各自覆盖"
+    },
+    "proxy": {
+      "description": "前端（Nginx）配置，含 replicas、log、probes、serviceAccount 等"
+    },
+    "service": {
+      "description": "前端 Service 配置（NodePort）"
+    },
+    "tolerations": {
+      "description": "全局污点容忍，可被 api/proxy 各自覆盖"
+    }
+  }
+}

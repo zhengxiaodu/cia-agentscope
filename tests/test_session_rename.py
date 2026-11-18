@@ -86,7 +86,8 @@ async def test_dao_rename_sql_and_args():
     sql, args = cur.executed[0]
     assert sql == (
         "UPDATE sessions SET name = %s "
-        "WHERE session_id = %s AND user_id = %s"
+        "WHERE session_id = %s AND user_id = %s "
+        "AND deleted_at IS NULL"
     )
     assert "updated_at" not in sql
     assert args == ("新名字", "s1", "u1")

@@ -188,7 +188,6 @@ async def test_persist_history_timestamp_string_beijing():
     )
 
     result = await _persist_conversation_history(
-        orchestrator_service=None,
         session_service=service,
         session_id="s1",
         user_id="u1",
