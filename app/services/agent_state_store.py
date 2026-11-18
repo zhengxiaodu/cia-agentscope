@@ -72,7 +72,17 @@ async def load_agent_state(
         )
         return None
     if not state_dict:
+        logger.info(
+            "[agent_state_store] 无历史状态 session=%s agent=%s",
+            session_id, agent_id,
+        )
         return None
+
+    ctx_len = len(state_dict.get("context") or [])
+    logger.info(
+        "[agent_state_store] 加载状态 session=%s agent=%s context_len=%d",
+        session_id, agent_id, ctx_len,
+    )
 
     # 历史脏数据迁移：修正 "PermissionMode.BYPASS" → "bypass" 等
     state_dict = migrate_legacy_enum_values(state_dict)

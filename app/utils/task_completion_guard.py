@@ -17,10 +17,10 @@ TASK_COMPLETION_GUIDANCE = (
     "用户确认时，如实说明已完成的部分、具体阻碍和需要用户提供的内容，不要虚构成功。"
 )
 
-_ACTION = r"(?:编写|撰写|写入|创建|生成|制作|导出|执行|运行|调用|读取|检查|查询|搜索|下载|上传|修改|保存)"
+_ACTION = r"(?:编写|撰写|写入|创建|生成|制作|导出|执行|运行|调用|读取|检查|查询|搜索|下载|上传|修改|保存|完成)"
 _PROMISE = re.compile(
     rf"(?:^|[。！？.!?\n])\s*(?:现在|接下来|下一步)?\s*"
-    rf"(?:我(?:将|会|要|来|准备|马上|现在|接下来)|现在(?:开始|就|继续)?|接下来(?:开始|继续)?)"
+    rf"(?:我(?:将|会|要|来|准备|马上|现在|接下来|继续)|现在(?:开始|就|继续)?|接下来(?:开始|继续)?|继续|接着)"
     rf"[^。！？\n]{{0,35}}{_ACTION}"
     r"|(?:^|[.!?\n])\s*(?:let me|i (?:will|shall|am going to|will now))\s+"
     r"(?:\w+\s+){0,5}(?:write|create|generate|build|export|execute|run|call|read|check|search|download|upload|save|modify)\b",

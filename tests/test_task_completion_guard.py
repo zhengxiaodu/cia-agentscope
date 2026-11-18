@@ -61,6 +61,10 @@ class DetectionTests(unittest.TestCase):
             "现在开始运行脚本。",
             "I will now generate the presentation.",
             "已经搜集资料。\n\n我现在来导出文件。",
+            "继续编写剩余页面。",
+            "继续生成PPT。",
+            "接着完成剩余步骤。",
+            "我继续写入剩余文件。",
         ]:
             with self.subTest(text=text):
                 self.assertTrue(guard.ends_with_execution_promise(text))

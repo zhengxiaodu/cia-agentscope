@@ -837,32 +837,42 @@ class OrchestratorService:
             if ws_err:
                 yield self._event({"type": "error", "message": ws_err})
                 return
-            # 输入围栏预检结果汇合（任务已与工作区准备并行执行）
-            if input_probe_task is not None and await input_probe_task:
-                yield self._event({"type": "input_llm_403"})
-                return
-            # 等待解析中的上传文件（向前端发 TOOL_CALL 事件对展示等待过程）
-            async for ev in wait_for_upload_parsing(request, session_id):
-                yield ev
-            persisted = await persist_upload_files_to_workspace(
-                request, session_id, user_id, self._workspace_manager
-            )
-            round_state.consumed_upload_ids = persisted["file_ids"]
-            upload_ctx = await load_upload_context(
-                request, session_id, persisted["sandbox_files"]
-            )
-            user_input = append_upload_context(user_input, upload_ctx)
-            async with aclosing(self._capture_tokens_from_stream(
-                self._run_single_agent_path(
-                    registry, agent_factory, agent_id, user_input,
-                    session_id, user_id, session_service, langfuse_service,
-                    round_state,
-                ),
-                round_state,
-            )) as stream:
-                async for ev in stream:
+            # 指定的 agent 不在当前注册表中（权限/mng 配置变更等），
+            # 回退到编排路径（意图识别重新选 agent），避免直接报错中断对话。
+            if not registry.get_definition(agent_id):
+                logger.warning(
+                    "[OrchestratorService] 指定的 agent_id=%s 不在注册表中，"
+                    "回退到编排路径 session=%s",
+                    agent_id, session_id,
+                )
+                agent_id = None
+            else:
+                # 输入围栏预检结果汇合（任务已与工作区准备并行执行）
+                if input_probe_task is not None and await input_probe_task:
+                    yield self._event({"type": "input_llm_403"})
+                    return
+                # 等待解析中的上传文件（向前端发 TOOL_CALL 事件对展示等待过程）
+                async for ev in wait_for_upload_parsing(request, session_id):
                     yield ev
-            return
+                persisted = await persist_upload_files_to_workspace(
+                    request, session_id, user_id, self._workspace_manager
+                )
+                round_state.consumed_upload_ids = persisted["file_ids"]
+                upload_ctx = await load_upload_context(
+                    request, session_id, persisted["sandbox_files"]
+                )
+                user_input = append_upload_context(user_input, upload_ctx)
+                async with aclosing(self._capture_tokens_from_stream(
+                    self._run_single_agent_path(
+                        registry, agent_factory, agent_id, user_input,
+                        session_id, user_id, session_service, langfuse_service,
+                        round_state,
+                    ),
+                    round_state,
+                )) as stream:
+                    async for ev in stream:
+                        yield ev
+                return
 
         # ③ 查询改写（联系上下文，失败降级为原始输入）。
         # 有未消费的上传文件时跳过改写：文件解析内容将在编排前注入 query，

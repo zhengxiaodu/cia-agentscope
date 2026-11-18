@@ -252,8 +252,9 @@ def _safe_update_span(span: Any, output_dict: dict) -> None:
 
 
 async def _load_history_messages(session_service: Any, session_id: Optional[str]) -> List[dict]:
-    """从 session 加载历史消息并截断为最近 3 轮（6 条）。
+    """从 session 加载历史消息，按 token 动态截断。
 
+    至少保留 40 条消息（20 轮），总 token 不超过上下文的 60%（24K）。
     加载失败返回空列表，不影响主流程。
     """
     if not (session_service and session_id):
@@ -261,12 +262,32 @@ async def _load_history_messages(session_service: Any, session_id: Optional[str]
     try:
         saved = await session_service.load_messages(session_id)
         history = [
-            {"role": m.get("role", "user"), "content": m.get("content", "")}
+            {
+                "role": m.get("role", "user"),
+                "content": m.get("content", ""),
+                # 保留 agent_ids 供 generate_response 推断本轮默认 agent_id
+                # （同一会话内保持 agent 一致，避免多轮上下文断裂）
+                "agent_ids": m.get("agent_ids", []) or [],
+            }
             for m in saved
             if m.get("content")
         ]
-        # 限制历史为最近 3 轮（6 条消息），避免超出模型 20K token 上下文
-        return history[-6:]
+        logger.info(
+            "[chat_service] 加载会话历史 session=%s db_rows=%s filtered=%s",
+            session_id, len(saved), len(history),
+        )
+        # 至少保留 40 条，再从前往后截断以控制 token 总量
+        min_keep = 40
+        max_tokens = 24000  # 40K 上下文的 60%
+        if len(history) <= min_keep:
+            return history
+        kept = history[-min_keep:]
+        total_tokens = sum(_estimate_tokens(m["content"]) for m in kept)
+        # 从最旧的开始丢弃，直到 token 总量在限制内
+        while total_tokens > max_tokens and len(kept) > 2:
+            removed = kept.pop(0)
+            total_tokens -= _estimate_tokens(removed["content"])
+        return kept
     except Exception:
         logger.exception("[chat_service] 加载会话历史失败")
         return []
@@ -913,6 +934,49 @@ async def generate_response(
     # ① 加载历史（限 3 轮）并合并当前输入
     history_messages = await _load_history_messages(session_service, session_id)
     full_messages = history_messages + messages
+
+    # 诊断日志：确认前端传入的 agent_id 与历史消息中记录的 agent_ids
+    last_assistant_agent_ids = None
+    for m in reversed(history_messages):
+        if m.get("role") == "assistant":
+            last_assistant_agent_ids = m.get("agent_ids") or []
+            break
+    logger.info(
+        "[chat_service] 本轮请求 agent_id=%r session=%s 历史assistant agent_ids=%r",
+        agent_id, session_id, last_assistant_agent_ids,
+    )
+
+    # 未显式指定 agent_id 时，从历史消息推断本会话最后一次使用的 agent_id，
+    # 保证同一会话内 agent 一致、多轮上下文连续。
+    # 背景：agent_states 表主键为 (session_id, agent_id)，若本轮 agent_id 与
+    # 上轮不同（如上轮走编排命中外部意图 agent=UUID、本轮意图识别为
+    # general_agent），则加载不到上轮状态，模型 context 为空、多轮对话断裂。
+    # 仅当上一轮是单 agent 时才推断；多 agent 编排轮次保留编排路径不变。
+    inferred_agent_id = None
+    for m in reversed(history_messages):
+        if m.get("role") == "assistant":
+            aids = m.get("agent_ids") or []
+            if len(aids) == 1:
+                inferred_agent_id = aids[0]
+            break
+
+    if inferred_agent_id:
+        if not agent_id:
+            agent_id = inferred_agent_id
+            logger.info(
+                "[chat_service] 未指定 agent_id，从历史推断为 %s session=%s",
+                agent_id, session_id,
+            )
+        elif agent_id != inferred_agent_id:
+            # 前端传来的 agent_id 与历史最后一轮不一致，强制对齐到历史 agent_id
+            # 以保证多轮上下文连续。如需切换 agent，请新建会话。
+            logger.warning(
+                "[chat_service] agent_id 不一致：前端传入=%s 历史最后一轮=%s，"
+                "强制对齐到历史 agent_id 以保持上下文连续 session=%s",
+                agent_id, inferred_agent_id, session_id,
+            )
+            agent_id = inferred_agent_id
+
     final_output_parts: List[str] = []
     # 制度问答引用（从编排流 policy_qa_citations 事件累积，随 assistant 消息落库）
     collected_citations: List[dict] = []
@@ -1300,14 +1364,21 @@ async def generate_response(
                     replace_event = build_message_replace_event(sens_result, stage="output")
                     yield f"data: {json.dumps(replace_event, ensure_ascii=False)}\n\n"
 
-                elif not model_blocked and sens_result.get("source") != "client-fallback":
+                elif not model_blocked:
                     # 检测过程中可能收到停止信号。上轮状态一直保留到本轮放行。
+                    # 注意：source=client-fallback（敏感服务不可用）不应阻止
+                    # agent_state 落库——否则模型下一轮 context 为空，多轮对话断裂。
+                    # 输出既已放行给用户，agent_state 理应同步保存。
                     if await _cancelled():
                         aborted = True
                         aborted_at_ms = int((time.perf_counter() - t0) * 1000)
                         raise asyncio.CancelledError()
                     for aid, snapshot in round_state.final_states.items():
                         await persist_agent_state(session_service, session_id, user_id, aid, snapshot)
+                    logger.info(
+                        "[chat_service] agent_state 已落库 session=%s agents=%s",
+                        session_id, list(round_state.final_states.keys()),
+                    )
             round_state.final_states.clear()
 
             # ⑤ 编排流结束立即生成推荐问题（前置，让前端尽快拿到）
